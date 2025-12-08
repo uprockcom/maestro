@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   wget \
   build-essential \
   locales \
+  ca-certificates \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Set up UTF-8 locale
@@ -150,6 +151,7 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/container-startup.sh
   echo "node ALL=(root) NOPASSWD: /usr/bin/tee /etc/resolv.conf" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /bin/chown" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /bin/chmod" >> /etc/sudoers.d/node && \
+  echo "node ALL=(root) NOPASSWD: /usr/sbin/update-ca-certificates" >> /etc/sudoers.d/node && \
   chmod 0440 /etc/sudoers.d/node
 
 USER node

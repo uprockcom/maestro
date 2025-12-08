@@ -54,17 +54,39 @@ type Config struct {
 	} `mapstructure:"tmux"`
 
 	Firewall struct {
-		AllowedDomains []string `mapstructure:"allowed_domains"`
+		AllowedDomains  []string `mapstructure:"allowed_domains"`
+		InternalDNS     string   `mapstructure:"internal_dns"`
+		InternalDomains []string `mapstructure:"internal_domains"`
 	} `mapstructure:"firewall"`
 
 	Sync struct {
 		AdditionalFolders []string `mapstructure:"additional_folders"`
 	} `mapstructure:"sync"`
 
+	SSH struct {
+		Enabled bool `mapstructure:"enabled"`
+	} `mapstructure:"ssh"`
+
+	Git struct {
+		UserName  string `mapstructure:"user_name"`
+		UserEmail string `mapstructure:"user_email"`
+	} `mapstructure:"git"`
+
 	GitHub struct {
 		Enabled    bool   `mapstructure:"enabled"`
 		ConfigPath string `mapstructure:"config_path"`
 	} `mapstructure:"github"`
+
+	AWS struct {
+		Enabled bool   `mapstructure:"enabled"`
+		Profile string `mapstructure:"profile"`
+		Region  string `mapstructure:"region"`
+	} `mapstructure:"aws"`
+
+	Bedrock struct {
+		Enabled bool   `mapstructure:"enabled"`
+		Model   string `mapstructure:"model"`
+	} `mapstructure:"bedrock"`
 
 	Daemon struct {
 		CheckInterval string `mapstructure:"check_interval"`
@@ -272,9 +294,23 @@ func initConfig() {
 		"sentry.io",
 		"statsig.anthropic.com",
 		"statsig.com",
+		// AWS Bedrock domains
+		"sts.amazonaws.com",
+		"bedrock.amazonaws.com",
+		"bedrock-runtime.amazonaws.com",
 	})
+	viper.SetDefault("firewall.internal_dns", "")
+	viper.SetDefault("firewall.internal_domains", []string{})
+	viper.SetDefault("ssh.enabled", false)
+	viper.SetDefault("git.user_name", "")
+	viper.SetDefault("git.user_email", "")
 	viper.SetDefault("github.enabled", false)
 	viper.SetDefault("github.config_path", paths.GitHubAuthDir())
+	viper.SetDefault("aws.enabled", false)
+	viper.SetDefault("aws.profile", "")
+	viper.SetDefault("aws.region", "")
+	viper.SetDefault("bedrock.enabled", false)
+	viper.SetDefault("bedrock.model", "")
 	viper.SetDefault("daemon.check_interval", "30m")
 	viper.SetDefault("daemon.show_nag", true)
 	viper.SetDefault("daemon.token_refresh.enabled", true)

@@ -115,6 +115,33 @@ echo "server=/.githubusercontent.com/8.8.8.8" >> "$DNSMASQ_CONF"
 echo "ipset=/.anthropic.com/allowed-domains" >> "$DNSMASQ_CONF"
 echo "server=/.anthropic.com/8.8.8.8" >> "$DNSMASQ_CONF"
 
+# Add wildcard entries for AWS (to catch region-specific subdomains like bedrock-runtime.eu-central-1.amazonaws.com)
+echo "ipset=/.amazonaws.com/allowed-domains" >> "$DNSMASQ_CONF"
+echo "server=/.amazonaws.com/8.8.8.8" >> "$DNSMASQ_CONF"
+echo "ipset=/.awsapps.com/allowed-domains" >> "$DNSMASQ_CONF"
+echo "server=/.awsapps.com/8.8.8.8" >> "$DNSMASQ_CONF"
+
+# Configure internal DNS for corporate networks (Zscaler, VPN, etc.)
+INTERNAL_DNS_FILE="/etc/internal-dns.txt"
+INTERNAL_DOMAINS_FILE="/etc/internal-domains.txt"
+if [ -f "$INTERNAL_DNS_FILE" ] && [ -f "$INTERNAL_DOMAINS_FILE" ]; then
+    INTERNAL_DNS=$(cat "$INTERNAL_DNS_FILE")
+    if [ -n "$INTERNAL_DNS" ]; then
+        echo "Configuring internal DNS server: $INTERNAL_DNS"
+        while read -r domain; do
+            [ -z "$domain" ] && continue
+            echo "  Routing $domain via internal DNS"
+            echo "ipset=/$domain/allowed-domains" >> "$DNSMASQ_CONF"
+            echo "server=/$domain/$INTERNAL_DNS" >> "$DNSMASQ_CONF"
+            # Also add wildcard for subdomains
+            echo "ipset=/.$domain/allowed-domains" >> "$DNSMASQ_CONF"
+            echo "server=/.$domain/$INTERNAL_DNS" >> "$DNSMASQ_CONF"
+        done < "$INTERNAL_DOMAINS_FILE"
+    fi
+elif [ -f "$INTERNAL_DNS_FILE" ]; then
+    echo "Warning: Internal DNS configured but no internal domains specified"
+fi
+
 # Start dnsmasq
 echo "Starting dnsmasq..."
 dnsmasq --conf-file="$DNSMASQ_CONF"

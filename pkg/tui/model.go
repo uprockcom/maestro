@@ -136,6 +136,11 @@ func isFirstRun() bool {
 		return true // No config file = first run
 	}
 
+	// Skip credential check if Bedrock is enabled (uses AWS auth instead)
+	if viper.GetBool("bedrock.enabled") {
+		return false
+	}
+
 	// Check if credentials exist
 	credPath := viper.GetString("claude.auth_path")
 	if credPath == "" {

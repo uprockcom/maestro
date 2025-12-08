@@ -124,6 +124,11 @@ func runNew(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize git branch: %w", err)
 	}
 
+	// Step 7.1: Configure git user if specified
+	if err := configureGitUser(containerName); err != nil {
+		fmt.Printf("Warning: Failed to configure git user: %v\n", err)
+	}
+
 	// Step 7.5: Convert SSH GitHub remotes to HTTPS for gh authentication
 	if err := setupGitHubRemote(containerName); err != nil {
 		// Don't fail container creation, just warn
@@ -430,7 +435,13 @@ func startContainer(containerName string) error {
 		configExists = true
 	}
 
-	if !credExists || !configExists {
+	// Skip credential checks when using Bedrock (uses AWS auth instead)
+	if config.Bedrock.Enabled {
+		if !configExists {
+			fmt.Println("⚠️  Warning: Missing .claude.json configuration.")
+			fmt.Println("Run 'maestro auth' to copy config from ~/.claude")
+		}
+	} else if !credExists || !configExists {
 		fmt.Println("⚠️  Warning: Claude authentication/configuration incomplete.")
 		if !credExists {
 			fmt.Println("  - Missing .credentials.json")
@@ -478,6 +489,62 @@ func startContainer(containerName string) error {
 		"-v", fmt.Sprintf("%s-uv:/home/node/.cache/uv", containerName),
 		"-v", fmt.Sprintf("%s-history:/commandhistory", containerName),
 	)
+
+	// Mount host SSL certificates for corporate proxies (Zscaler, etc.)
+	// This allows the container to use the same CA trust store as the host
+	if _, err := os.Stat("/etc/ssl/certs/ca-certificates.crt"); err == nil {
+		args = append(args,
+			"-v", "/etc/ssl/certs:/etc/ssl/certs:ro",
+			"-e", "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "NODE_OPTIONS=--use-openssl-ca",
+			"-e", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+		)
+	}
+
+	// Mount AWS config and credentials for Bedrock support
+	if config.AWS.Enabled || config.Bedrock.Enabled {
+		homeDir, _ := os.UserHomeDir()
+		awsDir := filepath.Join(homeDir, ".aws")
+		if _, err := os.Stat(awsDir); err == nil {
+			// Mount as read-write so SSO token refresh can work
+			args = append(args,
+				"-v", fmt.Sprintf("%s:/home/node/.aws", awsDir),
+			)
+		}
+
+		// Set AWS environment variables
+		if config.AWS.Profile != "" {
+			args = append(args, "-e", fmt.Sprintf("AWS_PROFILE=%s", config.AWS.Profile))
+		}
+		if config.AWS.Region != "" {
+			args = append(args, "-e", fmt.Sprintf("AWS_REGION=%s", config.AWS.Region))
+			args = append(args, "-e", fmt.Sprintf("AWS_DEFAULT_REGION=%s", config.AWS.Region))
+		}
+
+		// Set Bedrock environment variables
+		if config.Bedrock.Enabled {
+			args = append(args, "-e", "CLAUDE_CODE_USE_BEDROCK=1")
+			if config.Bedrock.Model != "" {
+				args = append(args, "-e", fmt.Sprintf("ANTHROPIC_MODEL=%s", config.Bedrock.Model))
+			}
+		}
+	}
+
+	// Mount SSH agent socket for git authentication (more secure than mounting keys)
+	// Only the agent socket is exposed - private keys stay on the host
+	if config.SSH.Enabled {
+		sshAuthSock := os.Getenv("SSH_AUTH_SOCK")
+		if sshAuthSock != "" {
+			args = append(args,
+				"-v", fmt.Sprintf("%s:/ssh-agent", sshAuthSock),
+				"-e", "SSH_AUTH_SOCK=/ssh-agent",
+			)
+		} else {
+			fmt.Println("Warning: SSH enabled but SSH_AUTH_SOCK not set. Run 'ssh-add' first.")
+		}
+	}
 
 	// Use version-synchronized image (or config override if set)
 	args = append(args, getDockerImage())
@@ -720,6 +787,22 @@ func initializeGitBranch(containerName, branchName string) error {
 	return cmd.Run()
 }
 
+func configureGitUser(containerName string) error {
+	if config.Git.UserName != "" {
+		cmd := exec.Command("docker", "exec", containerName, "git", "config", "--global", "user.name", config.Git.UserName)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to set git user.name: %w", err)
+		}
+	}
+	if config.Git.UserEmail != "" {
+		cmd := exec.Command("docker", "exec", containerName, "git", "config", "--global", "user.email", config.Git.UserEmail)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to set git user.email: %w", err)
+		}
+	}
+	return nil
+}
+
 func setupGitHubRemote(containerName string) error {
 	// Check if origin remote exists
 	getOriginCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
@@ -863,10 +946,18 @@ Please analyze this task and create a detailed implementation plan. Do not start
 	}
 
 	// Create a background script to send the initial prompt
-	// .claude.json is deleted before starting Claude to force fresh credential discovery
+	// First accepts the bypass permissions prompt, then sends the task
 	autoInputScript := fmt.Sprintf(`#!/bin/sh
-# Wait for Claude to fully start
-sleep 5
+# Wait for Claude to start and show the bypass permissions prompt
+sleep 3
+
+# Accept the bypass permissions prompt by pressing Down then Enter
+tmux send-keys -t main:0 Down 2>/dev/null
+sleep 0.3
+tmux send-keys -t main:0 Enter 2>/dev/null
+
+# Wait for Claude to fully initialize after accepting
+sleep 3
 
 # Send the task prompt
 cat > /tmp/prompt-input.txt << 'PROMPT_EOF'
@@ -957,6 +1048,25 @@ func initializeFirewall(containerName string) error {
 		fmt.Sprintf("echo '%s' > /etc/allowed-domains.txt", domainsList))
 	if err := writeDomainsCmd.Run(); err != nil {
 		return fmt.Errorf("failed to write allowed domains: %w", err)
+	}
+
+	// Write internal DNS config if configured (for corporate networks)
+	if config.Firewall.InternalDNS != "" {
+		writeInternalDNSCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
+			fmt.Sprintf("echo '%s' > /etc/internal-dns.txt", config.Firewall.InternalDNS))
+		if err := writeInternalDNSCmd.Run(); err != nil {
+			fmt.Printf("Warning: Failed to write internal DNS config: %v\n", err)
+		}
+	}
+
+	// Write internal domains if configured
+	if len(config.Firewall.InternalDomains) > 0 {
+		internalDomainsList := strings.Join(config.Firewall.InternalDomains, "\n")
+		writeInternalDomainsCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
+			fmt.Sprintf("echo '%s' > /etc/internal-domains.txt", internalDomainsList))
+		if err := writeInternalDomainsCmd.Run(); err != nil {
+			fmt.Printf("Warning: Failed to write internal domains config: %v\n", err)
+		}
 	}
 
 	// Run firewall initialization as root (with timeout in background)
@@ -1117,6 +1227,11 @@ func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConn
 	// Step 7: Initialize git branch in container
 	if err := initializeGitBranch(containerName, branchName); err != nil {
 		return fmt.Errorf("failed to initialize git branch: %w", err)
+	}
+
+	// Step 7.1: Configure git user if specified
+	if err := configureGitUser(containerName); err != nil {
+		fmt.Printf("Warning: Failed to configure git user: %v\n", err)
 	}
 
 	// Step 7.5: Convert SSH GitHub remotes to HTTPS for gh authentication
