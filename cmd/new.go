@@ -17,7 +17,9 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -683,6 +685,11 @@ PROMPT_EOF`)
 		}
 	}
 
+	// Copy and import SSL certificates for Java
+	if err := copySSLCertificates(containerName); err != nil {
+		fmt.Printf("Warning: Failed to install SSL certificates: %v\n", err)
+	}
+
 	// Initialize firewall
 	fmt.Println("Setting up firewall...")
 	if err := initializeFirewall(containerName); err != nil {
@@ -1087,6 +1094,112 @@ func initializeFirewall(containerName string) error {
 	}
 
 	return nil
+}
+
+func copySSLCertificates(containerName string) error {
+	certsPath := expandPath(config.SSL.CertificatesPath)
+	if certsPath == "" {
+		return nil // No certificates configured
+	}
+
+	// Check if certificates directory exists
+	if _, err := os.Stat(certsPath); err != nil {
+		return nil // No certificates to copy
+	}
+
+	// List certificate files
+	entries, err := os.ReadDir(certsPath)
+	if err != nil {
+		return fmt.Errorf("failed to read certificates directory: %w", err)
+	}
+
+	var certFiles []string
+	for _, entry := range entries {
+		if !entry.IsDir() && (filepath.Ext(entry.Name()) == ".crt" || filepath.Ext(entry.Name()) == ".pem") {
+			certFiles = append(certFiles, entry.Name())
+		}
+	}
+
+	if len(certFiles) == 0 {
+		return nil // No certificate files found
+	}
+
+	fmt.Printf("Installing %d SSL certificate(s) for Java...\n", len(certFiles))
+
+	// Create temporary directory in container for certificates
+	mkdirCmd := exec.Command("docker", "exec", "-u", "root", containerName, "mkdir", "-p", "/tmp/host-certs")
+	if err := mkdirCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create temp certs directory: %w", err)
+	}
+
+	// Copy each certificate and import into Java keystore
+	for _, certFile := range certFiles {
+		certPath := filepath.Join(certsPath, certFile)
+
+		// Copy certificate to container
+		copyCmd := exec.Command("docker", "cp", certPath, fmt.Sprintf("%s:/tmp/host-certs/%s", containerName, certFile))
+		if err := copyCmd.Run(); err != nil {
+			fmt.Printf("  ⚠  Failed to copy %s: %v\n", certFile, err)
+			continue
+		}
+
+		// Generate alias from filename (remove extension, replace special chars)
+		alias := certFile[:len(certFile)-len(filepath.Ext(certFile))]
+		alias = regexp.MustCompile(`[^a-zA-Z0-9_-]`).ReplaceAllString(alias, "_")
+
+		// Import into Java keystore (using keytool)
+		// The default cacerts password is 'changeit'
+		importCmd := exec.Command("docker", "exec", "-u", "root", containerName, "keytool",
+			"-importcert",
+			"-noprompt",
+			"-trustcacerts",
+			"-alias", alias,
+			"-file", fmt.Sprintf("/tmp/host-certs/%s", certFile),
+			"-keystore", "/usr/local/jdk-17.0.2/lib/security/cacerts",
+			"-storepass", "changeit",
+		)
+		output, err := importCmd.CombinedOutput()
+		if err != nil {
+			// Check if it's just a duplicate alias error (certificate already exists)
+			if !strings.Contains(string(output), "already exists") {
+				fmt.Printf("  ⚠  Failed to import %s: %v\n", certFile, err)
+			}
+			continue
+		}
+		fmt.Printf("  ✓ %s\n", certFile)
+	}
+
+	// Cleanup temp directory
+	cleanupCmd := exec.Command("docker", "exec", "-u", "root", containerName, "rm", "-rf", "/tmp/host-certs")
+	cleanupCmd.Run() // Ignore errors on cleanup
+
+	// Change keystore password from default 'changeit' to a random password
+	// This prevents the default password from being used to tamper with the keystore
+	newPassword := generateRandomPassword(32)
+	changePassCmd := exec.Command("docker", "exec", "-u", "root", containerName, "keytool",
+		"-storepasswd",
+		"-keystore", "/usr/local/jdk-17.0.2/lib/security/cacerts",
+		"-storepass", "changeit",
+		"-new", newPassword,
+	)
+	if err := changePassCmd.Run(); err != nil {
+		fmt.Printf("  ⚠  Failed to change keystore password: %v\n", err)
+	} else {
+		fmt.Println("  ✓ Keystore password randomized")
+	}
+
+	return nil
+}
+
+// generateRandomPassword generates a cryptographically random password
+func generateRandomPassword(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		b[i] = charset[n.Int64()]
+	}
+	return string(b)
 }
 
 func copyAppsToContainer(containerName string) error {

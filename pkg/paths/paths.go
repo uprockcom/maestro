@@ -63,6 +63,13 @@ func GitHubAuthDir() string {
 	return filepath.Join(GetConfigDir(), "gh")
 }
 
+// CertificatesDir returns the path to the SSL certificates directory.
+// Unix/macOS: ~/.maestro/certificates
+// Windows: %APPDATA%\maestro\certificates
+func CertificatesDir() string {
+	return filepath.Join(GetConfigDir(), "certificates")
+}
+
 // LegacyConfigFile returns the old config file path for migration detection.
 // Returns empty string on Windows (no legacy path on Windows).
 func LegacyConfigFile() string {

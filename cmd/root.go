@@ -67,6 +67,10 @@ type Config struct {
 		Enabled bool `mapstructure:"enabled"`
 	} `mapstructure:"ssh"`
 
+	SSL struct {
+		CertificatesPath string `mapstructure:"certificates_path"`
+	} `mapstructure:"ssl"`
+
 	Git struct {
 		UserName  string `mapstructure:"user_name"`
 		UserEmail string `mapstructure:"user_email"`
@@ -302,6 +306,7 @@ func initConfig() {
 	viper.SetDefault("firewall.internal_dns", "")
 	viper.SetDefault("firewall.internal_domains", []string{})
 	viper.SetDefault("ssh.enabled", false)
+	viper.SetDefault("ssl.certificates_path", paths.CertificatesDir())
 	viper.SetDefault("git.user_name", "")
 	viper.SetDefault("git.user_email", "")
 	viper.SetDefault("github.enabled", false)
