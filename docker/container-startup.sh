@@ -10,6 +10,13 @@ echo "Maestro container starting..."
 # Ensure proper ownership of home directory
 sudo chown -R node:node /home/node 2>/dev/null || true
 
+# Install custom CA certificate if mounted (for corporate proxies like Zscaler)
+if [ -f /usr/local/share/ca-certificates/custom-ca.crt ]; then
+    echo "Installing custom CA certificate..."
+    sudo update-ca-certificates 2>/dev/null || true
+    echo "✓ CA certificate installed"
+fi
+
 # Set container hostname in prompt
 export PS1="[maestro] \w $ "
 

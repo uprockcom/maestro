@@ -36,6 +36,7 @@ type Config struct {
 	NotifyOn           []string
 	QuietHoursStart    string
 	QuietHoursEnd      string
+	ContainerPrefix    string
 }
 
 // Daemon manages background monitoring and auto-refresh
@@ -118,15 +119,23 @@ func (d *Daemon) Start() error {
 			d.logInfo("Continuing without notifications...")
 		} else {
 			// Log notification configuration
-			if d.hasTerminalNotifier {
-				d.logInfo("Using terminal-notifier for notifications")
+			switch runtime.GOOS {
+			case "darwin":
+				if d.hasTerminalNotifier {
+					d.logInfo("Using terminal-notifier for notifications")
+					if d.iconPath != "" {
+						d.logInfo("Custom icon path: %s", d.iconPath)
+					} else {
+						d.logInfo("No custom icon configured")
+					}
+				} else {
+					d.logInfo("Using osascript for notifications (no custom icon)")
+				}
+			case "linux":
+				d.logInfo("Using notify-send for notifications")
 				if d.iconPath != "" {
 					d.logInfo("Custom icon path: %s", d.iconPath)
-				} else {
-					d.logInfo("No custom icon configured")
 				}
-			} else {
-				d.logInfo("Using osascript for notifications (no custom icon)")
 			}
 
 			// Send welcome notification
@@ -225,7 +234,7 @@ func (d *Daemon) checkTokenExpiry(container string, state *ContainerState) {
 			// Send notification if enabled
 			if d.shouldNotify("token_expiring", state) {
 				d.notify("Token Expiring", fmt.Sprintf("Container %s token expires in %.1fh and auto-refresh failed",
-					getShortName(container), timeLeft.Hours()))
+					d.getShortName(container), timeLeft.Hours()))
 				state.LastNotified = timeNow()
 			}
 		} else {
@@ -244,7 +253,7 @@ func (d *Daemon) checkAttentionStatus(container string, state *ContainerState) {
 			now := time.Now()
 			state.AttentionStarted = &now
 			state.NotificationSent = false
-			d.logInfo("Container %s needs attention", getShortName(container))
+			d.logInfo("Container %s needs attention", d.getShortName(container))
 		}
 
 		// Check if we should notify
@@ -253,7 +262,7 @@ func (d *Daemon) checkAttentionStatus(container string, state *ContainerState) {
 			if d.shouldNotify("attention_needed", state) {
 				d.notify("Container Needs Attention",
 					fmt.Sprintf("Container %s has needed attention for %s",
-						getShortName(container), formatDuration(attentionDuration)))
+						d.getShortName(container), formatDuration(attentionDuration)))
 				state.NotificationSent = true
 				state.LastNotified = timeNow()
 			}
@@ -261,7 +270,7 @@ func (d *Daemon) checkAttentionStatus(container string, state *ContainerState) {
 	} else {
 		// Clear attention state
 		if state.AttentionStarted != nil {
-			d.logInfo("Container %s attention resolved", getShortName(container))
+			d.logInfo("Container %s attention resolved", d.getShortName(container))
 		}
 		state.AttentionStarted = nil
 		state.NotificationSent = false
@@ -340,10 +349,12 @@ func (d *Daemon) notify(title, message string) {
 		}
 	case "linux":
 		// Linux notification via notify-send
-		args := []string{fmt.Sprintf("MCL - %s", title), message}
+		// Note: --icon must come before title and message
+		var args []string
 		if d.iconPath != "" {
 			args = append(args, "--icon", d.iconPath)
 		}
+		args = append(args, fmt.Sprintf("Maestro - %s", title), message)
 		cmd := exec.Command("notify-send", args...)
 		if err := cmd.Run(); err != nil {
 			d.logError("Failed to send Linux notification: %v", err)
@@ -402,10 +413,15 @@ func (d *Daemon) getRunningContainers() ([]string, error) {
 		return nil, err
 	}
 
+	prefix := d.config.ContainerPrefix
+	if prefix == "" {
+		prefix = "maestro-" // Default prefix
+	}
+
 	var containers []string
 	for _, line := range strings.Split(string(output), "\n") {
 		name := strings.TrimSpace(line)
-		if name != "" && strings.HasPrefix(name, "mcl-") {
+		if name != "" && strings.HasPrefix(name, prefix) {
 			containers = append(containers, name)
 		}
 	}
@@ -487,9 +503,13 @@ func readCredentials(path string) (*Credentials, error) {
 	return &creds, nil
 }
 
-func getShortName(containerName string) string {
-	if strings.HasPrefix(containerName, "mcl-") {
-		return containerName[4:]
+func (d *Daemon) getShortName(containerName string) string {
+	prefix := d.config.ContainerPrefix
+	if prefix == "" {
+		prefix = "maestro-"
+	}
+	if strings.HasPrefix(containerName, prefix) {
+		return containerName[len(prefix):]
 	}
 	return containerName
 }

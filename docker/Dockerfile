@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   wget \
   build-essential \
   locales \
+  ca-certificates \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Set up UTF-8 locale
@@ -55,6 +56,27 @@ RUN ARCH=$(dpkg --print-architecture) && \
 ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH="/home/node/go"
 ENV PATH="${GOPATH}/bin:${PATH}"
+
+# Install Java JDK 17 (for Android development)
+RUN ARCH=$(dpkg --print-architecture) && \
+  if [ "$ARCH" = "amd64" ]; then JAVA_ARCH="x64"; else JAVA_ARCH="$ARCH"; fi && \
+  wget "https://download.java.net/java/GA/jdk17.0.2/dfd4a8d0985749f896bed50d7138ee7f/8/GPL/openjdk-17.0.2_linux-${JAVA_ARCH}_bin.tar.gz" && \
+  tar -C /usr/local -xzf "openjdk-17.0.2_linux-${JAVA_ARCH}_bin.tar.gz" && \
+  rm "openjdk-17.0.2_linux-${JAVA_ARCH}_bin.tar.gz"
+
+# Set Java environment variables
+ENV JAVA_HOME="/usr/local/jdk-17.0.2"
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+# Install Gradle 8.13 (for Android development)
+ARG GRADLE_VERSION=8.13
+RUN wget "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" && \
+  unzip -d /usr/local "gradle-${GRADLE_VERSION}-bin.zip" && \
+  rm "gradle-${GRADLE_VERSION}-bin.zip"
+
+# Set Gradle environment variables
+ENV GRADLE_HOME="/usr/local/gradle-${GRADLE_VERSION}"
+ENV PATH="${GRADLE_HOME}/bin:${PATH}"
 
 # Install UV (Python package manager)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -127,7 +149,7 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
   -a "source /usr/share/doc/fzf/examples/key-bindings.zsh" \
   -a "source /usr/share/doc/fzf/examples/completion.zsh" \
   -a "export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" \
-  -a "export PATH=/usr/local/go/bin:\$GOPATH/bin:\$PATH" \
+  -a "export PATH=/usr/local/go/bin:\$GOPATH/bin:\$JAVA_HOME/bin:\$GRADLE_HOME/bin:\$PATH" \
   -a "export MCL_CONTAINER=true" \
   -x
 
@@ -150,6 +172,7 @@ RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/container-startup.sh
   echo "node ALL=(root) NOPASSWD: /usr/bin/tee /etc/resolv.conf" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /bin/chown" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /bin/chmod" >> /etc/sudoers.d/node && \
+  echo "node ALL=(root) NOPASSWD: /usr/sbin/update-ca-certificates" >> /etc/sudoers.d/node && \
   chmod 0440 /etc/sudoers.d/node
 
 USER node

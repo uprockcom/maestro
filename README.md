@@ -58,7 +58,7 @@ This stores credentials in `~/.maestro/` and shares them (read-only) with all co
 
 ### 2. Configure (Optional)
 
-Edit `~/.maestro/config.yml` to add additional folders and network domains:
+Edit `~/.maestro/config.yml` to customize your setup:
 
 ```yaml
 firewall:
@@ -66,14 +66,92 @@ firewall:
     - github.com
     - api.anthropic.com
     # Add your domains here
+  # For corporate networks with internal DNS (Zscaler, VPN, etc.)
+  internal_dns: "10.0.0.1"
+  internal_domains:
+    - "internal.company.com"
 
 sync:
   additional_folders:
     - ~/Documents/Code/mcp-servers
     - ~/Documents/Code/helpers
+
+# Git user for commits inside containers
+git:
+  user_name: "Your Name"
+  user_email: "you@example.com"
+
+# SSH agent forwarding for git authentication (keys stay on host)
+ssh:
+  enabled: true
+
+# AWS Bedrock support (alternative to Anthropic API)
+aws:
+  enabled: true
+  profile: "your-aws-profile"
+  region: "us-east-1"
+
+bedrock:
+  enabled: true
+  model: "anthropic.claude-sonnet-4-20250514-v1:0"
+
+# SSL certificates for corporate HTTPS inspection
+ssl:
+  certificates_path: "~/.maestro/certificates"
+
+# Android SDK for mobile development
+android:
+  sdk_path: "~/Android/Sdk"
+
+# Container defaults
+containers:
+  default_return_to_tui: true  # Auto-check "Return to TUI" when creating containers
+
+# Daemon and notification settings
+daemon:
+  check_interval: "10s"  # How often to check containers (default: 30m)
+  notifications:
+    enabled: true
+    attention_threshold: "5s"  # Notify after this duration of waiting
+    notify_on:
+      - attention_needed  # When Claude waits for input
+      - token_expiring    # When auth token is expiring
 ```
 
 You can also set firewall rules from the text UI using the `f` shortcut.
+
+#### AWS Bedrock Setup
+
+To use Claude via AWS Bedrock instead of the Anthropic API:
+
+1. Configure your AWS profile with Bedrock access
+2. Enable bedrock in config (see above)
+3. Run `maestro auth` to set up AWS SSO login
+4. Containers will automatically use Bedrock for Claude
+
+#### Corporate Network / VPN Setup
+
+If you're behind a corporate proxy (Zscaler, etc.) or need to access internal resources:
+
+1. Set `firewall.internal_dns` to your internal DNS server
+2. Add internal domains to `firewall.internal_domains`
+3. Host SSL certificates are automatically mounted for HTTPS inspection
+
+#### SSL Certificates
+
+For corporate environments with HTTPS inspection (Zscaler, etc.), place your CA certificates in the configured path:
+
+1. Create the certificates directory: `mkdir -p ~/.maestro/certificates`
+2. Copy your corporate CA certificates (`.crt`, `.pem` files) to this directory
+3. Certificates are automatically imported into both the system trust store and Java keystore inside containers
+
+#### Android SDK
+
+For Android/mobile development, mount your host Android SDK into containers:
+
+1. Set `android.sdk_path` to your SDK location (e.g., `~/Android/Sdk`)
+2. The SDK will be mounted read-only at `/opt/android-sdk` inside containers
+3. Environment variables (`ANDROID_HOME`, `ANDROID_SDK_ROOT`) are automatically configured
 
 ### 3. Create Your First Container
 
@@ -123,22 +201,27 @@ When connected via `maestro connect`:
 
 _Note: Not tested on Windows._
 
-Start the daemon to monitor containers and get desktop notifications:
+The daemon monitors containers and sends desktop notifications when Claude needs your attention. It **auto-starts** when you launch the TUI (`maestro`), but you can also manage it manually:
 
 ```bash
-maestro daemon start
-
-# Check status
-maestro daemon status
-
-# View logs
-maestro daemon logs
+maestro daemon start   # Start manually
+maestro daemon stop    # Stop the daemon
+maestro daemon status  # Check status
+maestro daemon logs    # View logs
 ```
 
 The daemon monitors:
-- Token expiration (warns when < 1 hour remaining)
-- Container attention needs (bell indicators)
-- Automatic health checks every 30 minutes
+- **Attention needs** - Notifies when Claude is waiting for input (configurable delay)
+- **Token expiration** - Warns when auth token is expiring soon
+- **Container health** - Periodic checks based on `check_interval`
+
+Configure notification speed in `~/.maestro/config.yml`:
+```yaml
+daemon:
+  check_interval: "10s"        # Check every 10 seconds (default: 30m)
+  notifications:
+    attention_threshold: "5s"  # Notify after 5s of waiting
+```
 
 ## Container Status
 

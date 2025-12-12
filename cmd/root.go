@@ -46,6 +46,7 @@ type Config struct {
 			Memory string `mapstructure:"memory"`
 			CPUs   string `mapstructure:"cpus"`
 		} `mapstructure:"resources"`
+		DefaultReturnToTUI bool `mapstructure:"default_return_to_tui"`
 	} `mapstructure:"containers"`
 
 	Tmux struct {
@@ -54,17 +55,47 @@ type Config struct {
 	} `mapstructure:"tmux"`
 
 	Firewall struct {
-		AllowedDomains []string `mapstructure:"allowed_domains"`
+		AllowedDomains  []string `mapstructure:"allowed_domains"`
+		InternalDNS     string   `mapstructure:"internal_dns"`
+		InternalDomains []string `mapstructure:"internal_domains"`
 	} `mapstructure:"firewall"`
 
 	Sync struct {
 		AdditionalFolders []string `mapstructure:"additional_folders"`
 	} `mapstructure:"sync"`
 
+	SSH struct {
+		Enabled bool `mapstructure:"enabled"`
+	} `mapstructure:"ssh"`
+
+	SSL struct {
+		CertificatesPath string `mapstructure:"certificates_path"`
+	} `mapstructure:"ssl"`
+
+	Android struct {
+		SDKPath string `mapstructure:"sdk_path"`
+	} `mapstructure:"android"`
+
+	Git struct {
+		UserName  string `mapstructure:"user_name"`
+		UserEmail string `mapstructure:"user_email"`
+	} `mapstructure:"git"`
+
 	GitHub struct {
 		Enabled    bool   `mapstructure:"enabled"`
 		ConfigPath string `mapstructure:"config_path"`
 	} `mapstructure:"github"`
+
+	AWS struct {
+		Enabled bool   `mapstructure:"enabled"`
+		Profile string `mapstructure:"profile"`
+		Region  string `mapstructure:"region"`
+	} `mapstructure:"aws"`
+
+	Bedrock struct {
+		Enabled bool   `mapstructure:"enabled"`
+		Model   string `mapstructure:"model"`
+	} `mapstructure:"bedrock"`
 
 	Daemon struct {
 		CheckInterval string `mapstructure:"check_interval"`
@@ -94,6 +125,9 @@ var rootCmd = &cobra.Command{
 for Claude Code development. It allows you to run multiple Claude instances in
 parallel, each in their own isolated environment with proper branch management.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Auto-start daemon if not running
+		EnsureDaemonRunning()
+
 		// Keep running TUI in a loop until user explicitly quits
 		// Maintain cached state for seamless return from containers
 		var cachedState *tui.CachedState
@@ -261,6 +295,7 @@ func initConfig() {
 	viper.SetDefault("containers.image", "ghcr.io/uprockcom/maestro:latest")
 	viper.SetDefault("containers.resources.memory", "4g")
 	viper.SetDefault("containers.resources.cpus", "2")
+	viper.SetDefault("containers.default_return_to_tui", false)
 	viper.SetDefault("tmux.default_session", "main")
 	viper.SetDefault("tmux.prefix", "C-b")
 	viper.SetDefault("firewall.allowed_domains", []string{
@@ -272,9 +307,25 @@ func initConfig() {
 		"sentry.io",
 		"statsig.anthropic.com",
 		"statsig.com",
+		// AWS Bedrock domains
+		"sts.amazonaws.com",
+		"bedrock.amazonaws.com",
+		"bedrock-runtime.amazonaws.com",
 	})
+	viper.SetDefault("firewall.internal_dns", "")
+	viper.SetDefault("firewall.internal_domains", []string{})
+	viper.SetDefault("ssh.enabled", false)
+	viper.SetDefault("ssl.certificates_path", paths.CertificatesDir())
+	viper.SetDefault("android.sdk_path", "")
+	viper.SetDefault("git.user_name", "")
+	viper.SetDefault("git.user_email", "")
 	viper.SetDefault("github.enabled", false)
 	viper.SetDefault("github.config_path", paths.GitHubAuthDir())
+	viper.SetDefault("aws.enabled", false)
+	viper.SetDefault("aws.profile", "")
+	viper.SetDefault("aws.region", "")
+	viper.SetDefault("bedrock.enabled", false)
+	viper.SetDefault("bedrock.model", "")
 	viper.SetDefault("daemon.check_interval", "30m")
 	viper.SetDefault("daemon.show_nag", true)
 	viper.SetDefault("daemon.token_refresh.enabled", true)
