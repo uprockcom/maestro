@@ -94,6 +94,14 @@ aws:
 bedrock:
   enabled: true
   model: "anthropic.claude-sonnet-4-20250514-v1:0"
+
+# SSL certificates for corporate HTTPS inspection
+ssl:
+  certificates_path: "~/.maestro/certificates"
+
+# Android SDK for mobile development
+android:
+  sdk_path: "~/Android/Sdk"
 ```
 
 You can also set firewall rules from the text UI using the `f` shortcut.
@@ -114,6 +122,22 @@ If you're behind a corporate proxy (Zscaler, etc.) or need to access internal re
 1. Set `firewall.internal_dns` to your internal DNS server
 2. Add internal domains to `firewall.internal_domains`
 3. Host SSL certificates are automatically mounted for HTTPS inspection
+
+#### SSL Certificates
+
+For corporate environments with HTTPS inspection (Zscaler, etc.), place your CA certificates in the configured path:
+
+1. Create the certificates directory: `mkdir -p ~/.maestro/certificates`
+2. Copy your corporate CA certificates (`.crt`, `.pem` files) to this directory
+3. Certificates are automatically imported into both the system trust store and Java keystore inside containers
+
+#### Android SDK
+
+For Android/mobile development, mount your host Android SDK into containers:
+
+1. Set `android.sdk_path` to your SDK location (e.g., `~/Android/Sdk`)
+2. The SDK will be mounted read-only at `/opt/android-sdk` inside containers
+3. Environment variables (`ANDROID_HOME`, `ANDROID_SDK_ROOT`) are automatically configured
 
 ### 3. Create Your First Container
 
