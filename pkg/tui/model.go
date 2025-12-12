@@ -1478,6 +1478,9 @@ func createContainerCreateModal() *Modal {
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
 	// Note: textinput doesn't have BlurredStyle, we'll handle prompt color in the blur/focus methods
 
+	// Get default value for "Return to TUI" from config
+	defaultReturnToTUI := viper.GetBool("containers.default_return_to_tui")
+
 	modal := &Modal{
 		Type:         ModalForm,
 		Title:        "Create New Container",
@@ -1485,8 +1488,8 @@ func createContainerCreateModal() *Modal {
 		Height:       30,
 		textarea:     &ta,
 		textinputs:   []textinput.Model{ti},
-		checkboxes:   []bool{false, false}, // [0]=no-connect, [1]=exact
-		focusedField: 0,                    // Start with textarea focused
+		checkboxes:   []bool{defaultReturnToTUI, false}, // [0]=no-connect, [1]=exact
+		focusedField: 0,                                 // Start with textarea focused
 		fieldLabels: []string{
 			"Task Description:",
 			"Branch Name:",

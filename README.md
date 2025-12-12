@@ -102,6 +102,20 @@ ssl:
 # Android SDK for mobile development
 android:
   sdk_path: "~/Android/Sdk"
+
+# Container defaults
+containers:
+  default_return_to_tui: true  # Auto-check "Return to TUI" when creating containers
+
+# Daemon and notification settings
+daemon:
+  check_interval: "10s"  # How often to check containers (default: 30m)
+  notifications:
+    enabled: true
+    attention_threshold: "5s"  # Notify after this duration of waiting
+    notify_on:
+      - attention_needed  # When Claude waits for input
+      - token_expiring    # When auth token is expiring
 ```
 
 You can also set firewall rules from the text UI using the `f` shortcut.
@@ -187,22 +201,27 @@ When connected via `maestro connect`:
 
 _Note: Not tested on Windows._
 
-Start the daemon to monitor containers and get desktop notifications:
+The daemon monitors containers and sends desktop notifications when Claude needs your attention. It **auto-starts** when you launch the TUI (`maestro`), but you can also manage it manually:
 
 ```bash
-maestro daemon start
-
-# Check status
-maestro daemon status
-
-# View logs
-maestro daemon logs
+maestro daemon start   # Start manually
+maestro daemon stop    # Stop the daemon
+maestro daemon status  # Check status
+maestro daemon logs    # View logs
 ```
 
 The daemon monitors:
-- Token expiration (warns when < 1 hour remaining)
-- Container attention needs (bell indicators)
-- Automatic health checks every 30 minutes
+- **Attention needs** - Notifies when Claude is waiting for input (configurable delay)
+- **Token expiration** - Warns when auth token is expiring soon
+- **Container health** - Periodic checks based on `check_interval`
+
+Configure notification speed in `~/.maestro/config.yml`:
+```yaml
+daemon:
+  check_interval: "10s"        # Check every 10 seconds (default: 30m)
+  notifications:
+    attention_threshold: "5s"  # Notify after 5s of waiting
+```
 
 ## Container Status
 

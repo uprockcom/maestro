@@ -46,6 +46,7 @@ type Config struct {
 			Memory string `mapstructure:"memory"`
 			CPUs   string `mapstructure:"cpus"`
 		} `mapstructure:"resources"`
+		DefaultReturnToTUI bool `mapstructure:"default_return_to_tui"`
 	} `mapstructure:"containers"`
 
 	Tmux struct {
@@ -124,6 +125,9 @@ var rootCmd = &cobra.Command{
 for Claude Code development. It allows you to run multiple Claude instances in
 parallel, each in their own isolated environment with proper branch management.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Auto-start daemon if not running
+		EnsureDaemonRunning()
+
 		// Keep running TUI in a loop until user explicitly quits
 		// Maintain cached state for seamless return from containers
 		var cachedState *tui.CachedState
@@ -291,6 +295,7 @@ func initConfig() {
 	viper.SetDefault("containers.image", "ghcr.io/uprockcom/maestro:latest")
 	viper.SetDefault("containers.resources.memory", "4g")
 	viper.SetDefault("containers.resources.cpus", "2")
+	viper.SetDefault("containers.default_return_to_tui", false)
 	viper.SetDefault("tmux.default_session", "main")
 	viper.SetDefault("tmux.prefix", "C-b")
 	viper.SetDefault("firewall.allowed_domains", []string{
