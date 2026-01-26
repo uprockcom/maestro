@@ -1,19 +1,20 @@
 # Copyright 2025 Christopher O'Connell
 # All rights reserved
 
-.PHONY: build install docker signing-image clean test help release release-snapshot license-check
+.PHONY: build install install-completion docker signing-image clean test help release release-snapshot license-check
 
 # Default target
 help:
 	@echo "MCL Build Targets:"
-	@echo "  make build            - Build the maestro binary"
-	@echo "  make docker           - Build the Docker image locally"
-	@echo "  make signing-image    - Build the code signing Docker image"
-	@echo "  make install          - Install maestro to /usr/local/bin (requires sudo)"
-	@echo "  make test             - Run tests"
-	@echo "  make clean            - Remove built binaries"
-	@echo "  make all              - Build everything (binary + docker)"
-	@echo "  make license-check    - Check/add Apache 2.0 headers to source files"
+	@echo "  make build              - Build the maestro binary"
+	@echo "  make docker             - Build the Docker image locally"
+	@echo "  make signing-image      - Build the code signing Docker image"
+	@echo "  make install            - Install maestro to /usr/local/bin (requires sudo)"
+	@echo "  make install-completion - Install shell completion for current shell"
+	@echo "  make test               - Run tests"
+	@echo "  make clean              - Remove built binaries"
+	@echo "  make all                - Build everything (binary + docker)"
+	@echo "  make license-check      - Check/add Apache 2.0 headers to source files"
 	@echo ""
 	@echo "Release Targets:"
 	@echo "  make release-preflight           - Check release prerequisites"
@@ -55,6 +56,43 @@ signing-image:
 # Install to system PATH (run 'make build' first, then 'sudo make install')
 install:
 	cp bin/maestro /usr/local/bin/
+	@echo ""
+	@echo "Run 'make install-completion' to enable shell autocompletion"
+
+# Install shell completion for current shell
+install-completion:
+	@if [ ! -f bin/maestro ]; then \
+		echo "Error: bin/maestro not found. Run 'make build' first."; \
+		exit 1; \
+	fi
+	@SHELL_NAME=$$(basename "$$SHELL"); \
+	case "$$SHELL_NAME" in \
+		bash) \
+			echo "Installing bash completion..."; \
+			mkdir -p ~/.local/share/bash-completion/completions; \
+			bin/maestro completion bash > ~/.local/share/bash-completion/completions/maestro; \
+			echo "Installed to ~/.local/share/bash-completion/completions/maestro"; \
+			echo "Run 'source ~/.local/share/bash-completion/completions/maestro' or restart your shell"; \
+			;; \
+		zsh) \
+			echo "Installing zsh completion..."; \
+			mkdir -p ~/.zsh/completions; \
+			bin/maestro completion zsh > ~/.zsh/completions/_maestro; \
+			echo "Installed to ~/.zsh/completions/_maestro"; \
+			echo "Add 'fpath=(~/.zsh/completions \$$fpath)' to ~/.zshrc if not already present"; \
+			echo "Then run 'autoload -U compinit && compinit' or restart your shell"; \
+			;; \
+		fish) \
+			echo "Installing fish completion..."; \
+			mkdir -p ~/.config/fish/completions; \
+			bin/maestro completion fish > ~/.config/fish/completions/maestro.fish; \
+			echo "Installed to ~/.config/fish/completions/maestro.fish"; \
+			;; \
+		*) \
+			echo "Unknown shell: $$SHELL_NAME"; \
+			echo "Run 'maestro completion --help' for manual installation instructions"; \
+			;; \
+	esac
 
 # Run tests
 test:

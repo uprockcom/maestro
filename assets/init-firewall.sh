@@ -115,6 +115,40 @@ echo "server=/.githubusercontent.com/8.8.8.8" >> "$DNSMASQ_CONF"
 echo "ipset=/.anthropic.com/allowed-domains" >> "$DNSMASQ_CONF"
 echo "server=/.anthropic.com/8.8.8.8" >> "$DNSMASQ_CONF"
 
+# Add wildcard entries for AWS (only if AWS/Bedrock is enabled)
+# This is controlled by /etc/aws-enabled.txt which is written by maestro when aws.enabled or bedrock.enabled is true
+AWS_ENABLED_FILE="/etc/aws-enabled.txt"
+if [ -f "$AWS_ENABLED_FILE" ]; then
+    echo "AWS/Bedrock enabled - adding AWS domain rules"
+    echo "ipset=/.amazonaws.com/allowed-domains" >> "$DNSMASQ_CONF"
+    echo "server=/.amazonaws.com/8.8.8.8" >> "$DNSMASQ_CONF"
+    echo "ipset=/.awsapps.com/allowed-domains" >> "$DNSMASQ_CONF"
+    echo "server=/.awsapps.com/8.8.8.8" >> "$DNSMASQ_CONF"
+else
+    echo "AWS/Bedrock not enabled - skipping AWS domain rules"
+fi
+
+# Configure internal DNS for corporate networks (Zscaler, VPN, etc.)
+INTERNAL_DNS_FILE="/etc/internal-dns.txt"
+INTERNAL_DOMAINS_FILE="/etc/internal-domains.txt"
+if [ -f "$INTERNAL_DNS_FILE" ] && [ -f "$INTERNAL_DOMAINS_FILE" ]; then
+    INTERNAL_DNS=$(cat "$INTERNAL_DNS_FILE")
+    if [ -n "$INTERNAL_DNS" ]; then
+        echo "Configuring internal DNS server: $INTERNAL_DNS"
+        while read -r domain; do
+            [ -z "$domain" ] && continue
+            echo "  Routing $domain via internal DNS"
+            echo "ipset=/$domain/allowed-domains" >> "$DNSMASQ_CONF"
+            echo "server=/$domain/$INTERNAL_DNS" >> "$DNSMASQ_CONF"
+            # Also add wildcard for subdomains
+            echo "ipset=/.$domain/allowed-domains" >> "$DNSMASQ_CONF"
+            echo "server=/.$domain/$INTERNAL_DNS" >> "$DNSMASQ_CONF"
+        done < "$INTERNAL_DOMAINS_FILE"
+    fi
+elif [ -f "$INTERNAL_DNS_FILE" ]; then
+    echo "Warning: Internal DNS configured but no internal domains specified"
+fi
+
 # Start dnsmasq
 echo "Starting dnsmasq..."
 dnsmasq --conf-file="$DNSMASQ_CONF"
@@ -125,7 +159,7 @@ echo "nameserver 127.0.0.1" | tee /etc/resolv.conf > /dev/null
 # Process GitHub API ranges and add them directly to ipset
 # We do this because GitHub has many IPs and we want to ensure we catch them all
 echo "Fetching GitHub IP ranges..."
-gh_ranges=$(curl -s https://api.github.com/meta)
+gh_ranges=$(curl -s --connect-timeout 5 --max-time 10 https://api.github.com/meta)
 if [ -z "$gh_ranges" ]; then
     echo "WARNING: Failed to fetch GitHub IP ranges - GitHub access may be limited"
 else
@@ -193,24 +227,36 @@ iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
 
 echo "Firewall configuration complete"
 
-# Verify firewall rules
+# Verify firewall rules (run all checks in parallel)
 echo "Verifying firewall rules..."
-if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
+
+# Create temp files for results
+VERIFY_DIR=$(mktemp -d)
+trap "rm -rf $VERIFY_DIR" EXIT
+
+# Run all verification tests in parallel
+(curl --connect-timeout 3 --max-time 5 https://example.com >/dev/null 2>&1 && echo "fail" || echo "pass") > "$VERIFY_DIR/block" &
+(curl --connect-timeout 3 --max-time 5 https://api.github.com/zen >/dev/null 2>&1 && echo "pass" || echo "fail") > "$VERIFY_DIR/github" &
+(curl --connect-timeout 3 --max-time 5 https://api.anthropic.com >/dev/null 2>&1 && echo "pass" || echo "fail") > "$VERIFY_DIR/anthropic" &
+
+# Wait for all background jobs
+wait
+
+# Check results
+if [ "$(cat "$VERIFY_DIR/block")" = "fail" ]; then
     echo "ERROR: Firewall verification failed - was able to reach https://example.com"
     exit 1
 else
     echo "✓ Firewall blocking works - unable to reach https://example.com"
 fi
 
-# Verify allowed access
-echo "Testing DNS resolution and access to whitelisted domains..."
-if ! curl --connect-timeout 10 https://api.github.com/zen >/dev/null 2>&1; then
+if [ "$(cat "$VERIFY_DIR/github")" = "fail" ]; then
     echo "WARNING: Unable to reach https://api.github.com - GitHub access may be limited"
 else
     echo "✓ GitHub API access works"
 fi
 
-if ! curl --connect-timeout 10 https://api.anthropic.com >/dev/null 2>&1; then
+if [ "$(cat "$VERIFY_DIR/anthropic")" = "fail" ]; then
     echo "WARNING: Unable to reach https://api.anthropic.com - Anthropic access may be limited"
 else
     echo "✓ Anthropic API access works"

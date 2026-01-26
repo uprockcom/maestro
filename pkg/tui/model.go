@@ -137,6 +137,11 @@ func isFirstRun() bool {
 		return true // No config file = first run
 	}
 
+	// Skip credential check if Bedrock is enabled (uses AWS auth instead)
+	if viper.GetBool("bedrock.enabled") {
+		return false
+	}
+
 	// Check if credentials exist
 	credPath := viper.GetString("claude.auth_path")
 	if credPath == "" {
@@ -343,7 +348,7 @@ func NewWithCache(containerPrefix string, cached *CachedState) *Model {
 	} else {
 		// Normal mode: If we have cached state, initialize with it for instant render
 		if cached != nil && len(cached.Containers) > 0 {
-			m.homeView = views.NewHomeModel(cached.Containers, false)
+			m.homeView = views.NewHomeModel(cached.Containers, false, viper.GetBool("bedrock.enabled"))
 			m.ready = true // Skip "Loading..."
 			m.cachedCursorPos = cached.CursorPos
 		} else {
@@ -720,7 +725,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Initialize home view with loaded data
-		m.homeView = views.NewHomeModel(msg.containers, false)
+		m.homeView = views.NewHomeModel(msg.containers, false, viper.GetBool("bedrock.enabled"))
 		if m.width > 0 && m.height > 0 {
 			// Subtract 9 lines: title banner (6) + help (1) + blank line (1) + statusbar (1)
 			m.homeView.SetSize(m.width, m.height-9)
@@ -1493,6 +1498,9 @@ func createContainerCreateModal() *Modal {
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
 	// Note: textinput doesn't have BlurredStyle, we'll handle prompt color in the blur/focus methods
 
+	// Get default value for "Return to TUI" from config
+	defaultReturnToTUI := viper.GetBool("containers.default_return_to_tui")
+
 	modal := &Modal{
 		Type:         ModalForm,
 		Title:        "Create New Container",
@@ -1500,8 +1508,8 @@ func createContainerCreateModal() *Modal {
 		Height:       30,
 		textarea:     &ta,
 		textinputs:   []textinput.Model{ti},
-		checkboxes:   []bool{false, false}, // [0]=no-connect, [1]=exact
-		focusedField: 0,                    // Start with textarea focused
+		checkboxes:   []bool{defaultReturnToTUI, false}, // [0]=no-connect, [1]=exact
+		focusedField: 0,                                 // Start with textarea focused
 		fieldLabels: []string{
 			"Task Description:",
 			"Branch Name:",

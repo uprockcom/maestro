@@ -30,29 +30,34 @@ type columnConfig struct {
 	minSize  int // Minimum width for this column
 }
 
-var (
-	// Maximum table width before centering kicks in
-	maxTableWidth = 160
+// Maximum table width before centering kicks in
+const maxTableWidth = 160
 
-	// Column definitions with base sizes and minimums
-	columnConfigs = []columnConfig{
+// getColumnConfigs returns column definitions based on whether AWS auth is used
+func getColumnConfigs(useAWSAuth bool) []columnConfig {
+	configs := []columnConfig{
 		{title: "NAME", baseSize: 25, minSize: 15},
 		{title: "STATUS", baseSize: 14, minSize: 12},
 		{title: "BRANCH", baseSize: 25, minSize: 15},
 		{title: "GIT", baseSize: 10, minSize: 8},
 		{title: "ACTIVITY", baseSize: 12, minSize: 10},
-		{title: "AUTH", baseSize: 12, minSize: 10},
 	}
+	// Only show AUTH column when not using AWS/Bedrock auth
+	if !useAWSAuth {
+		configs = append(configs, columnConfig{title: "AUTH", baseSize: 12, minSize: 10})
+	}
+	configs = append(configs, columnConfig{title: "CREATED", baseSize: 12, minSize: 10})
+	return configs
+}
 
-	// Total base width for proportion calculations
-	totalBaseWidth = func() int {
-		total := 0
-		for _, c := range columnConfigs {
-			total += c.baseSize
-		}
-		return total
-	}()
-)
+// getTotalBaseWidth calculates total base width for the given column configs
+func getTotalBaseWidth(configs []columnConfig) int {
+	total := 0
+	for _, c := range configs {
+		total += c.baseSize
+	}
+	return total
+}
 
 // HomeModel is the main container list view
 type HomeModel struct {
@@ -62,10 +67,14 @@ type HomeModel struct {
 	animState     int
 	containers    []container.Info
 	daemonRunning bool
+	useAWSAuth    bool // Whether AWS/Bedrock auth is being used (hides AUTH column)
 }
 
 // calculateColumnWidths returns column widths scaled to fit the given width
-func calculateColumnWidths(availableWidth int) []table.Column {
+func calculateColumnWidths(availableWidth int, useAWSAuth bool) []table.Column {
+	columnConfigs := getColumnConfigs(useAWSAuth)
+	totalBaseWidth := getTotalBaseWidth(columnConfigs)
+
 	// Account for table borders and padding (roughly 4 chars for borders + spacing)
 	usableWidth := availableWidth - 4
 	if usableWidth < totalBaseWidth {
@@ -105,9 +114,12 @@ func calculateColumnWidths(availableWidth int) []table.Column {
 }
 
 // NewHomeModel creates a new home view
-func NewHomeModel(containers []container.Info, daemonRunning bool) *HomeModel {
+func NewHomeModel(containers []container.Info, daemonRunning bool, useAWSAuth bool) *HomeModel {
+	columnConfigs := getColumnConfigs(useAWSAuth)
+	totalBaseWidth := getTotalBaseWidth(columnConfigs)
+
 	// Start with base column widths
-	columns := calculateColumnWidths(totalBaseWidth)
+	columns := calculateColumnWidths(totalBaseWidth, useAWSAuth)
 
 	t := table.New(
 		table.WithColumns(columns),
@@ -135,6 +147,7 @@ func NewHomeModel(containers []container.Info, daemonRunning bool) *HomeModel {
 		table:         t,
 		containers:    containers,
 		daemonRunning: daemonRunning,
+		useAWSAuth:    useAWSAuth,
 	}
 
 	h.updateTableRows()
@@ -239,7 +252,7 @@ func (h *HomeModel) SetSize(width, height int) {
 	}
 
 	// Update column widths proportionally
-	columns := calculateColumnWidths(effectiveWidth)
+	columns := calculateColumnWidths(effectiveWidth, h.useAWSAuth)
 	h.table.SetColumns(columns)
 
 	// Only set table viewport width if we're filling the space
@@ -274,8 +287,12 @@ func (h *HomeModel) updateTableRows() {
 			h.formatBranch(c),
 			h.formatGit(c),
 			h.formatActivity(c),
-			h.formatAuth(c),
 		}
+		// Only include AUTH column when not using AWS auth
+		if !h.useAWSAuth {
+			row = append(row, h.formatAuth(c))
+		}
+		row = append(row, h.formatCreated(c))
 		rows = append(rows, row)
 	}
 
@@ -288,12 +305,16 @@ func (h *HomeModel) formatName(c container.Info) string {
 }
 
 // formatStatus returns the status indicator
+// Using plain text without colors to avoid ANSI bleeding issues in the table
 func (h *HomeModel) formatStatus(c container.Info) string {
 	switch c.Status {
 	case "running":
+		if c.NeedsAttention {
+			return "⚠ Waiting"
+		}
 		return "● Running"
 	case "exited":
-		return "■ Stopped"
+		return "○ Stopped"
 	default:
 		return "? " + c.Status
 	}
@@ -329,6 +350,14 @@ func (h *HomeModel) formatAuth(c container.Info) string {
 		return "—"
 	}
 	return c.AuthStatus
+}
+
+// formatCreated returns when the container was created
+func (h *HomeModel) formatCreated(c container.Info) string {
+	if c.CreatedAt.IsZero() {
+		return "—"
+	}
+	return c.CreatedAt.Format("Jan 2 15:04")
 }
 
 // GetContainers returns the current container list for caching

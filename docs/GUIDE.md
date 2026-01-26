@@ -101,6 +101,7 @@ sync:
   additional_folders:          # Folders to copy as siblings
     - ~/Documents/Code/mcp-servers
     - ~/Documents/Code/helpers
+  compress: true               # Set to false for faster copying of large projects
 
 github:
   enabled: false               # Enable GitHub CLI (gh) integration

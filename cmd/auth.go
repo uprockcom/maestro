@@ -53,7 +53,125 @@ func init() {
 	authCmd.Flags().BoolVar(&noSync, "no-sync", false, "Skip syncing credentials to running containers")
 }
 
+// runBedrockAuth handles authentication for AWS Bedrock users
+func runBedrockAuth() error {
+	fmt.Println("Bedrock mode enabled - using AWS authentication")
+
+	// Copy Claude config from ~/.claude to maestro's auth directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	sourceClaudeDir := filepath.Join(homeDir, ".claude")
+	destAuthPath := expandPath(config.Claude.AuthPath)
+
+	// Ensure destination directory exists
+	if err := os.MkdirAll(destAuthPath, 0755); err != nil {
+		return fmt.Errorf("failed to create auth directory: %w", err)
+	}
+
+	// Check if source ~/.claude exists
+	if _, err := os.Stat(sourceClaudeDir); os.IsNotExist(err) {
+		fmt.Printf("Warning: ~/.claude directory not found\n")
+		fmt.Println("You may need to run 'claude' once on the host to create initial config")
+	} else {
+		// Copy .credentials.json if exists
+		srcCreds := filepath.Join(sourceClaudeDir, ".credentials.json")
+		if _, err := os.Stat(srcCreds); err == nil {
+			destCreds := filepath.Join(destAuthPath, ".credentials.json")
+			if err := copyFile(srcCreds, destCreds); err != nil {
+				fmt.Printf("Warning: Failed to copy credentials: %v\n", err)
+			} else {
+				fmt.Printf("✓ Copied credentials from %s\n", srcCreds)
+			}
+		}
+
+		// Copy settings.json if exists (Claude Code settings)
+		srcSettings := filepath.Join(sourceClaudeDir, "settings.json")
+		if _, err := os.Stat(srcSettings); err == nil {
+			destSettings := filepath.Join(destAuthPath, "settings.json")
+			if err := copyFile(srcSettings, destSettings); err != nil {
+				fmt.Printf("Warning: Failed to copy settings: %v\n", err)
+			} else {
+				fmt.Printf("✓ Copied settings from %s\n", srcSettings)
+			}
+		}
+	}
+
+	// Copy .claude.json from home directory if exists
+	srcClaudeJson := filepath.Join(homeDir, ".claude.json")
+	if _, err := os.Stat(srcClaudeJson); err == nil {
+		destClaudeJson := filepath.Join(destAuthPath, ".claude.json")
+		if err := copyFile(srcClaudeJson, destClaudeJson); err != nil {
+			fmt.Printf("Warning: Failed to copy .claude.json: %v\n", err)
+		} else {
+			fmt.Printf("✓ Copied config from %s\n", srcClaudeJson)
+		}
+	}
+
+	// Run AWS SSO login if profile is configured
+	if config.AWS.Profile != "" {
+		fmt.Printf("\nRunning AWS SSO login for profile: %s\n", config.AWS.Profile)
+		fmt.Println("This will open a browser window for authentication...")
+
+		ssoCmd := exec.Command("aws", "sso", "login", "--profile", config.AWS.Profile)
+		ssoCmd.Stdin = os.Stdin
+		ssoCmd.Stdout = os.Stdout
+		ssoCmd.Stderr = os.Stderr
+
+		if err := ssoCmd.Run(); err != nil {
+			return fmt.Errorf("AWS SSO login failed: %w", err)
+		}
+		fmt.Println("✓ AWS SSO login successful")
+	}
+
+	fmt.Println("\n✅ Bedrock authentication setup complete!")
+	fmt.Printf("AWS Profile: %s\n", config.AWS.Profile)
+	fmt.Printf("AWS Region: %s\n", config.AWS.Region)
+	fmt.Printf("Bedrock Model: %s\n", config.Bedrock.Model)
+
+	// Ask user if they want to set up GitHub CLI (same as non-Bedrock flow)
+	fmt.Println("\n========================================================================")
+	hostname := config.GitHub.Hostname
+	if hostname == "" {
+		hostname = "github.com"
+	}
+	fmt.Printf("\nWould you like to set up GitHub CLI (gh) authentication for %s? (y/N): ", hostname)
+	var response string
+	fmt.Scanln(&response)
+
+	if response == "y" || response == "Y" || response == "yes" || response == "Yes" {
+		if err := setupGitHubAuth(); err != nil {
+			fmt.Printf("\n⚠️  GitHub CLI setup failed: %v\n", err)
+			fmt.Println("You can skip this and run 'gh auth login' manually later.")
+		}
+	} else {
+		fmt.Println("\nSkipping GitHub CLI setup.")
+		fmt.Println("You can set it up later by running 'gh auth login' in a container,")
+		fmt.Println("or enable github.enabled in your config file and authenticate on the host.")
+	}
+
+	fmt.Println("\nYou can now create containers with: maestro new <description>")
+
+	return nil
+}
+
+// copyFile copies a file from src to dst
+func copyFile(src, dst string) error {
+	input, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, input, 0644)
+}
+
 func runAuth(cmd *cobra.Command, cmdArgs []string) error {
+	// If Bedrock is enabled, use different auth flow
+	if config.Bedrock.Enabled {
+		return runBedrockAuth()
+	}
+
 	// Ensure MCL Claude directory exists
 	authPath := expandPath(config.Claude.AuthPath)
 	if err := os.MkdirAll(authPath, 0755); err != nil {
@@ -107,10 +225,25 @@ func runAuth(cmd *cobra.Command, cmdArgs []string) error {
 		"--name", authContainerName,
 		"-v", fmt.Sprintf("%s:/home/node/.claude", authPath),
 		"-w", "/workspace",
-		config.Containers.Image,
-		"claude",
-		"--dangerously-skip-permissions",
 	}
+
+	// Mount host SSL certificates for corporate proxies (Zscaler, etc.)
+	// This allows the container to use the same CA trust store as the host
+	if _, err := os.Stat("/etc/ssl/certs/ca-certificates.crt"); err == nil {
+		args = append(args,
+			"-v", "/etc/ssl/certs:/etc/ssl/certs:ro",
+			"-e", "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "NODE_OPTIONS=--use-openssl-ca",
+			"-e", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+		)
+	}
+
+	args = append(args,
+		config.Containers.Image,
+		"claude", "--dangerously-skip-permissions",
+	)
 
 	authCmd := exec.Command("docker", args...)
 	authCmd.Stdin = os.Stdin
@@ -203,7 +336,14 @@ func setupGitHubAuth() error {
 		return fmt.Errorf("failed to create MCL gh directory: %w", err)
 	}
 
+	// Determine hostname (default to github.com)
+	hostname := config.GitHub.Hostname
+	if hostname == "" {
+		hostname = "github.com"
+	}
+
 	fmt.Printf("\nGitHub CLI directory: %s\n", mclGhPath)
+	fmt.Printf("GitHub hostname: %s\n", hostname)
 
 	// Clear existing GitHub auth data
 	fmt.Println("Clearing existing GitHub authentication data...")
@@ -241,9 +381,21 @@ func setupGitHubAuth() error {
 		"--name", ghAuthContainerName,
 		"-v", fmt.Sprintf("%s:/home/node/.config/gh", mclGhPath),
 		"-w", "/workspace",
-		config.Containers.Image,
-		"gh", "auth", "login",
 	}
+
+	// Mount host SSL certificates for corporate proxies (Zscaler, etc.)
+	if _, err := os.Stat("/etc/ssl/certs/ca-certificates.crt"); err == nil {
+		args = append(args,
+			"-v", "/etc/ssl/certs:/etc/ssl/certs:ro",
+			"-e", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+		)
+	}
+
+	// Build gh auth login command with hostname
+	ghAuthArgs := []string{"gh", "auth", "login", "--hostname", hostname}
+	args = append(args, config.Containers.Image)
+	args = append(args, ghAuthArgs...)
 
 	ghAuthCmd := exec.Command("docker", args...)
 	ghAuthCmd.Stdin = os.Stdin
@@ -264,6 +416,7 @@ func setupGitHubAuth() error {
 	hostsPath := filepath.Join(mclGhPath, "hosts.yml")
 	if _, err := os.Stat(hostsPath); err == nil {
 		fmt.Println("\n✅ GitHub CLI authentication successful!")
+		fmt.Printf("Hostname: %s\n", hostname)
 		fmt.Printf("Configuration saved to: %s\n", mclGhPath)
 		fmt.Println("\nGitHub CLI will be available in all MCL containers when github.enabled is true.")
 	} else {

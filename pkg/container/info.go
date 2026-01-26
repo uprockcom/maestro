@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -167,7 +168,15 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 		return nil, err
 	}
 
-	containers := []Info{}
+	// Parse basic container info first
+	type basicInfo struct {
+		name      string
+		status    string
+		state     string
+		createdAt time.Time
+	}
+	var basics []basicInfo
+
 	for _, line := range strings.Split(string(output), "\n") {
 		if line == "" {
 			continue
@@ -183,40 +192,77 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 			continue
 		}
 
-		status := parts[1]
-		state := parts[2]
-		createdStr := parts[3]
-
 		// Parse creation time
-		createdAt, err := time.Parse("2006-01-02 15:04:05 -0700 MST", createdStr)
+		createdAt, err := time.Parse("2006-01-02 15:04:05 -0700 MST", parts[3])
 		if err != nil {
-			// Fallback to zero time if parse fails
 			createdAt = time.Time{}
 		}
 
-		// Get branch name
-		branch := GetBranchName(name)
-
-		// Check for attention needed and dormant status
-		needsAttention := false
-		isDormant := false
-		if state == "running" {
-			needsAttention = CheckBellStatus(name)
-			isDormant = !IsClaudeRunning(name)
-		}
-
-		containers = append(containers, Info{
-			Name:           name,
-			ShortName:      GetShortName(name, prefix),
-			Status:         state,
-			StatusDetails:  status,
-			Branch:         branch,
-			NeedsAttention: needsAttention,
-			IsDormant:      isDormant,
-			CreatedAt:      createdAt,
+		basics = append(basics, basicInfo{
+			name:      name,
+			status:    parts[1],
+			state:     parts[2],
+			createdAt: createdAt,
 		})
 	}
 
+	// Fetch detailed info for all containers in parallel
+	containers := make([]Info, len(basics))
+	var wg sync.WaitGroup
+
+	for i, b := range basics {
+		wg.Add(1)
+		go func(idx int, basic basicInfo) {
+			defer wg.Done()
+
+			info := Info{
+				Name:          basic.name,
+				ShortName:     GetShortName(basic.name, prefix),
+				Status:        basic.state,
+				StatusDetails: basic.status,
+				CreatedAt:     basic.createdAt,
+			}
+
+			// Fetch details in parallel
+			var detailWg sync.WaitGroup
+			var mu sync.Mutex
+
+			// Branch name
+			detailWg.Add(1)
+			go func() {
+				defer detailWg.Done()
+				branch := GetBranchName(basic.name)
+				mu.Lock()
+				info.Branch = branch
+				mu.Unlock()
+			}()
+
+			// Bell status
+			detailWg.Add(1)
+			go func() {
+				defer detailWg.Done()
+				needsAttention := CheckBellStatus(basic.name)
+				mu.Lock()
+				info.NeedsAttention = needsAttention
+				mu.Unlock()
+			}()
+
+			// Claude running check
+			detailWg.Add(1)
+			go func() {
+				defer detailWg.Done()
+				isDormant := !IsClaudeRunning(basic.name)
+				mu.Lock()
+				info.IsDormant = isDormant
+				mu.Unlock()
+			}()
+
+			detailWg.Wait()
+			containers[idx] = info
+		}(i, b)
+	}
+
+	wg.Wait()
 	return containers, nil
 }
 
@@ -229,7 +275,15 @@ func GetAllContainers(prefix string) ([]Info, error) {
 		return nil, err
 	}
 
-	containers := []Info{}
+	// Parse basic container info first
+	type basicInfo struct {
+		name      string
+		status    string
+		state     string
+		createdAt time.Time
+	}
+	var basics []basicInfo
+
 	for _, line := range strings.Split(string(output), "\n") {
 		if line == "" {
 			continue
@@ -245,53 +299,115 @@ func GetAllContainers(prefix string) ([]Info, error) {
 			continue
 		}
 
-		status := parts[1]
-		state := parts[2]
-		createdStr := parts[3]
-
 		// Parse creation time
-		createdAt, err := time.Parse("2006-01-02 15:04:05 -0700 MST", createdStr)
+		createdAt, err := time.Parse("2006-01-02 15:04:05 -0700 MST", parts[3])
 		if err != nil {
-			// Fallback to zero time if parse fails
 			createdAt = time.Time{}
 		}
 
-		// Get branch name
-		branch := GetBranchName(name)
-
-		// Check for attention needed (bell/silence) only for running containers
-		needsAttention := false
-		isDormant := false
-		authStatus := ""
-		lastActivity := "-"
-		gitStatus := "-"
-		if state == "running" {
-			needsAttention = CheckBellStatus(name)
-			// Check if Claude is running - if not, container is dormant
-			isDormant = !IsClaudeRunning(name)
-			// Check authentication status
-			authStatus = GetAuthStatus(name)
-			// Get last activity
-			lastActivity = GetLastActivity(name)
-			// Get git status
-			gitStatus = GetGitStatus(name)
-		}
-
-		containers = append(containers, Info{
-			Name:           name,
-			ShortName:      GetShortName(name, prefix),
-			Status:         state,
-			StatusDetails:  status,
-			Branch:         branch,
-			NeedsAttention: needsAttention,
-			IsDormant:      isDormant,
-			AuthStatus:     authStatus,
-			LastActivity:   lastActivity,
-			GitStatus:      gitStatus,
-			CreatedAt:      createdAt,
+		basics = append(basics, basicInfo{
+			name:      name,
+			status:    parts[1],
+			state:     parts[2],
+			createdAt: createdAt,
 		})
 	}
 
+	// Fetch detailed info for all containers in parallel
+	containers := make([]Info, len(basics))
+	var wg sync.WaitGroup
+
+	for i, b := range basics {
+		wg.Add(1)
+		go func(idx int, basic basicInfo) {
+			defer wg.Done()
+
+			info := Info{
+				Name:          basic.name,
+				ShortName:     GetShortName(basic.name, prefix),
+				Status:        basic.state,
+				StatusDetails: basic.status,
+				CreatedAt:     basic.createdAt,
+				LastActivity:  "-",
+				GitStatus:     "-",
+			}
+
+			// For running containers, fetch detailed info in parallel
+			if basic.state == "running" {
+				var detailWg sync.WaitGroup
+				var mu sync.Mutex
+
+				// Branch name
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					branch := GetBranchName(basic.name)
+					mu.Lock()
+					info.Branch = branch
+					mu.Unlock()
+				}()
+
+				// Bell status
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					needsAttention := CheckBellStatus(basic.name)
+					mu.Lock()
+					info.NeedsAttention = needsAttention
+					mu.Unlock()
+				}()
+
+				// Claude running check
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					isDormant := !IsClaudeRunning(basic.name)
+					mu.Lock()
+					info.IsDormant = isDormant
+					mu.Unlock()
+				}()
+
+				// Auth status
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					authStatus := GetAuthStatus(basic.name)
+					mu.Lock()
+					info.AuthStatus = authStatus
+					mu.Unlock()
+				}()
+
+				// Last activity
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					lastActivity := GetLastActivity(basic.name)
+					mu.Lock()
+					info.LastActivity = lastActivity
+					mu.Unlock()
+				}()
+
+				// Git status
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					gitStatus := GetGitStatus(basic.name)
+					mu.Lock()
+					info.GitStatus = gitStatus
+					mu.Unlock()
+				}()
+
+				detailWg.Wait()
+			} else {
+				// For stopped containers, just get branch name
+				info.Branch = GetBranchName(basic.name)
+			}
+
+			containers[idx] = info
+		}(i, b)
+	}
+
+	wg.Wait()
 	return containers, nil
 }
 

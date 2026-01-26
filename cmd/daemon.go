@@ -252,6 +252,7 @@ func runDaemonBackground(cmd *cobra.Command, args []string) error {
 		NotifyOn:           config.Daemon.Notifications.NotifyOn,
 		QuietHoursStart:    config.Daemon.Notifications.QuietHours.Start,
 		QuietHoursEnd:      config.Daemon.Notifications.QuietHours.End,
+		ContainerPrefix:    config.Containers.Prefix,
 	}
 
 	// Create and start daemon with embedded icon
@@ -261,6 +262,36 @@ func runDaemonBackground(cmd *cobra.Command, args []string) error {
 	}
 
 	return d.Start()
+}
+
+// EnsureDaemonRunning starts the daemon if it's not already running.
+// This is called automatically when the TUI starts.
+func EnsureDaemonRunning() {
+	authDir := expandPath(config.Claude.AuthPath)
+	pidFile := filepath.Join(authDir, "daemon.pid")
+
+	// Check if already running
+	if _, running := isDaemonRunning(pidFile); running {
+		return // Already running, nothing to do
+	}
+
+	// Start daemon silently in background
+	binary, err := os.Executable()
+	if err != nil {
+		return // Fail silently
+	}
+
+	daemonCmd := exec.Command(binary, "daemon", "_run")
+	daemonCmd.Stdout = nil
+	daemonCmd.Stderr = nil
+	daemonCmd.Stdin = nil
+
+	if err := daemonCmd.Start(); err != nil {
+		return // Fail silently
+	}
+
+	// Detach from parent
+	daemonCmd.Process.Release()
 }
 
 // Helper functions

@@ -17,18 +17,22 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"fmt"
+	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/uprockcom/maestro/assets"
 	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/version"
-	"github.com/spf13/cobra"
 )
 
 var (
@@ -131,6 +135,11 @@ func runNew(cmd *cobra.Command, args []string) error {
 	// Step 7: Initialize git branch in container
 	if err := initializeGitBranch(containerName, branchName); err != nil {
 		return fmt.Errorf("failed to initialize git branch: %w", err)
+	}
+
+	// Step 7.1: Configure git user if specified
+	if err := configureGitUser(containerName); err != nil {
+		fmt.Printf("Warning: Failed to configure git user: %v\n", err)
 	}
 
 	// Step 7.5: Convert SSH GitHub remotes to HTTPS for gh authentication
@@ -584,7 +593,13 @@ func startContainer(containerName string) error {
 		configExists = true
 	}
 
-	if !credExists || !configExists {
+	// Skip credential checks when using Bedrock (uses AWS auth instead)
+	if config.Bedrock.Enabled {
+		if !configExists {
+			fmt.Println("⚠️  Warning: Missing .claude.json configuration.")
+			fmt.Println("Run 'maestro auth' to copy config from ~/.claude")
+		}
+	} else if !credExists || !configExists {
 		fmt.Println("⚠️  Warning: Claude authentication/configuration incomplete.")
 		if !credExists {
 			fmt.Println("  - Missing .credentials.json")
@@ -632,6 +647,83 @@ func startContainer(containerName string) error {
 		"-v", fmt.Sprintf("%s-uv:/home/node/.cache/uv", containerName),
 		"-v", fmt.Sprintf("%s-history:/commandhistory", containerName),
 	)
+
+	// Mount host SSL certificates for corporate proxies (Zscaler, etc.)
+	// This allows the container to use the same CA trust store as the host
+	if _, err := os.Stat("/etc/ssl/certs/ca-certificates.crt"); err == nil {
+		args = append(args,
+			"-v", "/etc/ssl/certs:/etc/ssl/certs:ro",
+			"-e", "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "NODE_OPTIONS=--use-openssl-ca",
+			"-e", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+			"-e", "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt",
+		)
+	}
+
+	// Mount AWS config and credentials for Bedrock support
+	if config.AWS.Enabled || config.Bedrock.Enabled {
+		homeDir, _ := os.UserHomeDir()
+		awsDir := filepath.Join(homeDir, ".aws")
+		if _, err := os.Stat(awsDir); err == nil {
+			// Mount as read-write so SSO token refresh can work
+			args = append(args,
+				"-v", fmt.Sprintf("%s:/home/node/.aws", awsDir),
+			)
+		}
+
+		// Set AWS environment variables
+		if config.AWS.Profile != "" {
+			args = append(args, "-e", fmt.Sprintf("AWS_PROFILE=%s", config.AWS.Profile))
+		}
+		if config.AWS.Region != "" {
+			args = append(args, "-e", fmt.Sprintf("AWS_REGION=%s", config.AWS.Region))
+			args = append(args, "-e", fmt.Sprintf("AWS_DEFAULT_REGION=%s", config.AWS.Region))
+		}
+
+		// Set Bedrock environment variables
+		if config.Bedrock.Enabled {
+			args = append(args, "-e", "CLAUDE_CODE_USE_BEDROCK=1")
+			if config.Bedrock.Model != "" {
+				args = append(args, "-e", fmt.Sprintf("ANTHROPIC_MODEL=%s", config.Bedrock.Model))
+			}
+		}
+	}
+
+	// Mount SSH agent socket for git authentication (more secure than mounting keys)
+	// Only the agent socket is exposed - private keys stay on the host
+	if config.SSH.Enabled {
+		sshAuthSock := os.Getenv("SSH_AUTH_SOCK")
+		if sshAuthSock != "" {
+			args = append(args,
+				"-v", fmt.Sprintf("%s:/ssh-agent", sshAuthSock),
+				"-e", "SSH_AUTH_SOCK=/ssh-agent",
+			)
+		} else {
+			fmt.Println("Warning: SSH enabled but SSH_AUTH_SOCK not set. Run 'ssh-add' first.")
+		}
+
+		// Mount known_hosts from host to avoid SSH host key verification prompts
+		if config.SSH.KnownHostsPath != "" {
+			knownHostsPath := expandPath(config.SSH.KnownHostsPath)
+			if _, err := os.Stat(knownHostsPath); err == nil {
+				args = append(args,
+					"-v", fmt.Sprintf("%s:/home/node/.ssh/known_hosts:ro", knownHostsPath),
+				)
+			}
+		}
+	}
+
+	// Mount Android SDK if configured (read-only for safety)
+	if config.Android.SDKPath != "" {
+		sdkPath := expandPath(config.Android.SDKPath)
+		if _, err := os.Stat(sdkPath); err == nil {
+			args = append(args,
+				"-v", fmt.Sprintf("%s:/home/node/Android/Sdk:ro", sdkPath),
+				"-e", "ANDROID_HOME=/home/node/Android/Sdk",
+			)
+		}
+	}
 
 	// Use version-synchronized image (or config override if set)
 	args = append(args, getDockerImage())
@@ -770,6 +862,16 @@ PROMPT_EOF`)
 		}
 	}
 
+	// Copy and import SSL certificates for Java
+	if err := copySSLCertificates(containerName); err != nil {
+		fmt.Printf("Warning: Failed to install SSL certificates: %v\n", err)
+	}
+
+	// Setup Android SDK environment (SDK is mounted as volume)
+	if err := setupAndroidSDK(containerName); err != nil {
+		fmt.Printf("Warning: Failed to setup Android SDK: %v\n", err)
+	}
+
 	// Initialize firewall
 	fmt.Println("Setting up firewall...")
 	if err := initializeFirewall(containerName); err != nil {
@@ -779,40 +881,383 @@ PROMPT_EOF`)
 	return nil
 }
 
+// MultiProgress manages a multi-line progress display (like docker pull)
+type MultiProgress struct {
+	mu          sync.Mutex
+	items       map[string]*ProgressItem
+	order       []string // Track order of items
+	lineCount   int
+	initialized bool
+	done        chan bool
+}
+
+type ProgressItem struct {
+	Name      string
+	Status    string // "waiting", "copying", "done", "error"
+	BytesRead int64
+	TotalSize int64
+	StartTime time.Time
+	EndTime   time.Time
+}
+
+var globalProgress *MultiProgress
+
+// InitMultiProgress initializes the global multi-progress display
+func InitMultiProgress() *MultiProgress {
+	globalProgress = &MultiProgress{
+		items: make(map[string]*ProgressItem),
+		done:  make(chan bool),
+	}
+	return globalProgress
+}
+
+// GetMultiProgress returns the global progress display
+func GetMultiProgress() *MultiProgress {
+	return globalProgress
+}
+
+// AddItem adds a new item to track
+func (mp *MultiProgress) AddItem(name string, totalSize int64) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	mp.items[name] = &ProgressItem{
+		Name:      name,
+		Status:    "waiting",
+		TotalSize: totalSize,
+	}
+	mp.order = append(mp.order, name)
+}
+
+// StartItem marks an item as started
+func (mp *MultiProgress) StartItem(name string) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	if item, ok := mp.items[name]; ok {
+		item.Status = "copying"
+		item.StartTime = time.Now()
+	}
+}
+
+// UpdateItem updates bytes read for an item
+func (mp *MultiProgress) UpdateItem(name string, bytesRead int64) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	if item, ok := mp.items[name]; ok {
+		item.BytesRead = bytesRead
+	}
+}
+
+// CompleteItem marks an item as done
+func (mp *MultiProgress) CompleteItem(name string) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	if item, ok := mp.items[name]; ok {
+		item.Status = "done"
+		item.EndTime = time.Now()
+	}
+}
+
+// ErrorItem marks an item as failed
+func (mp *MultiProgress) ErrorItem(name string, err error) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	if item, ok := mp.items[name]; ok {
+		item.Status = "error"
+		item.EndTime = time.Now()
+	}
+}
+
+// Start begins the progress display loop
+func (mp *MultiProgress) Start() {
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-mp.done:
+				return
+			case <-ticker.C:
+				mp.render()
+			}
+		}
+	}()
+}
+
+// Stop stops the progress display and renders final state
+func (mp *MultiProgress) Stop() {
+	close(mp.done)
+	mp.renderFinal()
+}
+
+func (mp *MultiProgress) render() {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	if len(mp.items) == 0 {
+		return
+	}
+
+	// Count active items (skip "waiting" - they haven't started yet)
+	activeCount := 0
+	for _, name := range mp.order {
+		if mp.items[name].Status != "waiting" {
+			activeCount++
+		}
+	}
+
+	if activeCount == 0 {
+		return
+	}
+
+	// Move cursor up if we've already printed lines
+	if mp.initialized && mp.lineCount > 0 {
+		fmt.Printf("\033[%dA", mp.lineCount)
+	}
+
+	mp.lineCount = activeCount
+	mp.initialized = true
+
+	for _, name := range mp.order {
+		item := mp.items[name]
+		if item.Status != "waiting" {
+			mp.renderLine(item)
+		}
+	}
+}
+
+func (mp *MultiProgress) renderFinal() {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	// Move cursor up to overwrite progress lines
+	if mp.initialized && mp.lineCount > 0 {
+		fmt.Printf("\033[%dA", mp.lineCount)
+	}
+
+	for _, name := range mp.order {
+		item := mp.items[name]
+		if item.Status != "waiting" {
+			mp.renderLine(item)
+		}
+	}
+}
+
+func (mp *MultiProgress) renderLine(item *ProgressItem) {
+	// Truncate name if too long
+	displayName := item.Name
+	if len(displayName) > 40 {
+		displayName = displayName[:37] + "..."
+	}
+
+	// Clear line
+	fmt.Print("\033[K")
+
+	switch item.Status {
+	case "copying":
+		elapsed := time.Since(item.StartTime).Seconds()
+		if elapsed < 0.1 {
+			elapsed = 0.1
+		}
+		speed := float64(item.BytesRead) / elapsed / 1024 / 1024
+
+		if item.TotalSize > 0 {
+			pct := float64(item.BytesRead) / float64(item.TotalSize) * 100
+			if pct > 100 {
+				pct = 100
+			}
+			barWidth := 20
+			filled := int(pct / 100 * float64(barWidth))
+			bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+			fmt.Printf("%-40s  [%s] %5.1f%% %6.1f MB/s\n", displayName, bar, pct, speed)
+		} else {
+			fmt.Printf("%-40s  %8s  %6.1f MB/s\n", displayName, formatBytes(item.BytesRead), speed)
+		}
+	case "done":
+		duration := item.EndTime.Sub(item.StartTime).Seconds()
+		speed := float64(item.BytesRead) / duration / 1024 / 1024
+		fmt.Printf("%-40s  ✓ %s in %.1fs (%.1f MB/s)\n", displayName, formatBytes(item.BytesRead), duration, speed)
+	case "error":
+		fmt.Printf("%-40s  ✗ Failed\n", displayName)
+	}
+}
+
+// progressReader wraps an io.Reader to track bytes and report to MultiProgress
+type progressReader struct {
+	reader        io.Reader
+	containerName string
+	bytesRead     int64
+	mu            sync.Mutex
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	pr.mu.Lock()
+	pr.bytesRead += int64(n)
+	bytes := pr.bytesRead
+	pr.mu.Unlock()
+
+	// Report to global progress if active
+	if mp := GetMultiProgress(); mp != nil {
+		mp.UpdateItem(pr.containerName, bytes)
+	}
+	return n, err
+}
+
+func (pr *progressReader) getBytesRead() int64 {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	return pr.bytesRead
+}
+
+func formatBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.1f GB", float64(bytes)/GB)
+	case bytes >= MB:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/MB)
+	case bytes >= KB:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/KB)
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+// readMaestroIgnore reads exclusion patterns from .maestroignore file
+func readMaestroIgnore(dir string) []string {
+	ignorePath := filepath.Join(dir, ".maestroignore")
+	file, err := os.Open(ignorePath)
+	if err != nil {
+		return nil // No .maestroignore file, that's fine
+	}
+	defer file.Close()
+
+	var patterns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, line)
+	}
+	return patterns
+}
+
 func copyProjectToContainer(containerName string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	// Create tar of current directory (excluding .git if it's huge)
-	tarCmd := exec.Command("tar", "-czf", "-", "--exclude=node_modules", "--exclude=.git", ".")
+	// Determine compression setting (default: true for backward compatibility)
+	useCompression := config.Sync.Compress == nil || *config.Sync.Compress
+
+	// Check if we're in batch mode (MultiProgress active)
+	mp := GetMultiProgress()
+	isBatchMode := mp != nil
+
+	// Signal start to MultiProgress
+	if isBatchMode {
+		mp.StartItem(containerName)
+	} else {
+		fmt.Printf("Copying source code to %s...\n", containerName)
+	}
+
+	startTime := time.Now()
+
+	// Build exclude arguments (defaults + .maestroignore)
+	excludeArgs := []string{"--exclude=node_modules", "--exclude=.git"}
+	for _, pattern := range readMaestroIgnore(cwd) {
+		excludeArgs = append(excludeArgs, "--exclude="+pattern)
+	}
+
+	// Create tar of current directory (excluding .git which is copied separately)
+	var tarCmd *exec.Cmd
+	var dockerCmd *exec.Cmd
+	if useCompression {
+		// Use gzip compression (slower for large projects but smaller transfer)
+		tarArgs := append([]string{"-czf", "-"}, excludeArgs...)
+		tarArgs = append(tarArgs, ".")
+		tarCmd = exec.Command("tar", tarArgs...)
+		dockerCmd = exec.Command("docker", "exec", "-i", containerName, "tar", "-xzf", "-", "-C", "/workspace")
+	} else {
+		// No compression (faster for large projects on local Docker)
+		tarArgs := append([]string{"-cf", "-"}, excludeArgs...)
+		tarArgs = append(tarArgs, ".")
+		tarCmd = exec.Command("tar", tarArgs...)
+		dockerCmd = exec.Command("docker", "exec", "-i", containerName, "tar", "-xf", "-", "-C", "/workspace")
+	}
 	tarCmd.Dir = cwd
 
-	// Pipe to docker cp
-	dockerCmd := exec.Command("docker", "exec", "-i", containerName, "tar", "-xzf", "-", "-C", "/workspace")
-
-	// Connect pipes
+	// Connect pipes with progress tracking
 	pipe, err := tarCmd.StdoutPipe()
 	if err != nil {
+		if isBatchMode {
+			mp.ErrorItem(containerName, err)
+		}
 		return err
 	}
-	dockerCmd.Stdin = pipe
+
+	// Create progress reader
+	pr := &progressReader{
+		reader:        pipe,
+		containerName: containerName,
+	}
+	dockerCmd.Stdin = pr
 
 	// Start both commands
 	if err := tarCmd.Start(); err != nil {
+		if isBatchMode {
+			mp.ErrorItem(containerName, err)
+		}
 		return err
 	}
 	if err := dockerCmd.Start(); err != nil {
+		if isBatchMode {
+			mp.ErrorItem(containerName, err)
+		}
 		return err
 	}
 
 	// Wait for completion
-	if err := tarCmd.Wait(); err != nil {
-		return err
+	tarErr := tarCmd.Wait()
+	dockerErr := dockerCmd.Wait()
+
+	bytesRead := pr.getBytesRead()
+	duration := time.Since(startTime)
+
+	if tarErr != nil {
+		if isBatchMode {
+			mp.ErrorItem(containerName, tarErr)
+		}
+		return tarErr
 	}
-	if err := dockerCmd.Wait(); err != nil {
-		return err
+	if dockerErr != nil {
+		if isBatchMode {
+			mp.ErrorItem(containerName, dockerErr)
+		}
+		return dockerErr
+	}
+
+	// Update final bytes and mark complete
+	if isBatchMode {
+		mp.UpdateItem(containerName, bytesRead)
+		mp.CompleteItem(containerName)
+	} else {
+		speed := float64(bytesRead) / duration.Seconds() / 1024 / 1024
+		fmt.Printf("  Copied %s in %.1fs (%.1f MB/s)\n", formatBytes(bytesRead), duration.Seconds(), speed)
 	}
 
 	// Copy .git separately if it exists
@@ -872,6 +1317,22 @@ func initializeGitBranch(containerName, branchName string) error {
 	cmd := exec.Command("docker", "exec", containerName, "sh", "-c",
 		fmt.Sprintf("cd /workspace && git checkout -b %s 2>/dev/null || git checkout %s", branchName, branchName))
 	return cmd.Run()
+}
+
+func configureGitUser(containerName string) error {
+	if config.Git.UserName != "" {
+		cmd := exec.Command("docker", "exec", containerName, "git", "config", "--global", "user.name", config.Git.UserName)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to set git user.name: %w", err)
+		}
+	}
+	if config.Git.UserEmail != "" {
+		cmd := exec.Command("docker", "exec", containerName, "git", "config", "--global", "user.email", config.Git.UserEmail)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to set git user.email: %w", err)
+		}
+	}
+	return nil
 }
 
 func setupGitHubRemote(containerName string) error {
@@ -1017,10 +1478,18 @@ Please analyze this task and create a detailed implementation plan. Do not start
 	}
 
 	// Create a background script to send the initial prompt
-	// .claude.json is deleted before starting Claude to force fresh credential discovery
+	// First accepts the bypass permissions prompt, then sends the task
 	autoInputScript := fmt.Sprintf(`#!/bin/sh
-# Wait for Claude to fully start
-sleep 5
+# Wait for Claude to start and show the bypass permissions prompt
+sleep 3
+
+# Accept the bypass permissions prompt by pressing Down then Enter
+tmux send-keys -t main:0 Down 2>/dev/null
+sleep 0.3
+tmux send-keys -t main:0 Enter 2>/dev/null
+
+# Wait for Claude to fully initialize after accepting
+sleep 3
 
 # Send the task prompt
 cat > /tmp/prompt-input.txt << 'PROMPT_EOF'
@@ -1113,6 +1582,35 @@ func initializeFirewall(containerName string) error {
 		return fmt.Errorf("failed to write allowed domains: %w", err)
 	}
 
+	// Write internal DNS config if configured (for corporate networks)
+	if config.Firewall.InternalDNS != "" {
+		writeInternalDNSCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
+			fmt.Sprintf("echo '%s' > /etc/internal-dns.txt", config.Firewall.InternalDNS))
+		if err := writeInternalDNSCmd.Run(); err != nil {
+			fmt.Printf("Warning: Failed to write internal DNS config: %v\n", err)
+		}
+	}
+
+	// Write internal domains if configured
+	if len(config.Firewall.InternalDomains) > 0 {
+		internalDomainsList := strings.Join(config.Firewall.InternalDomains, "\n")
+		writeInternalDomainsCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
+			fmt.Sprintf("echo '%s' > /etc/internal-domains.txt", internalDomainsList))
+		if err := writeInternalDomainsCmd.Run(); err != nil {
+			fmt.Printf("Warning: Failed to write internal domains config: %v\n", err)
+		}
+	}
+
+	// Write AWS config flag if Bedrock or AWS is enabled
+	// This tells the firewall script to add AWS domain rules
+	if config.AWS.Enabled || config.Bedrock.Enabled {
+		writeAWSConfigCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
+			"echo 'enabled' > /etc/aws-enabled.txt")
+		if err := writeAWSConfigCmd.Run(); err != nil {
+			fmt.Printf("Warning: Failed to write AWS config: %v\n", err)
+		}
+	}
+
 	// Run firewall initialization as root (with timeout in background)
 	// We run it in the background because the verification steps can hang
 	firewallCmd := exec.Command("docker", "exec", "-u", "root", "-d", containerName, "/usr/local/bin/init-firewall.sh")
@@ -1131,6 +1629,147 @@ func initializeFirewall(containerName string) error {
 	}
 
 	return nil
+}
+
+func setupAndroidSDK(containerName string) error {
+	sdkPath := expandPath(config.Android.SDKPath)
+	if sdkPath == "" {
+		return nil // No Android SDK configured
+	}
+
+	// Check if SDK exists
+	if _, err := os.Stat(sdkPath); err != nil {
+		return nil // SDK not found
+	}
+
+	fmt.Println("Setting up Android SDK...")
+
+	// Set ANDROID_HOME environment variable in .zshrc
+	envCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
+		`echo 'export ANDROID_HOME=/home/node/Android/Sdk' >> /home/node/.zshrc && echo 'export PATH=$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin' >> /home/node/.zshrc`)
+	if err := envCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to set ANDROID_HOME: %v\n", err)
+	}
+
+	// Update local.properties in workspace if it exists
+	updateLocalPropertiesCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
+		`if [ -f /workspace/local.properties ]; then
+			sed -i 's|sdk.dir=.*|sdk.dir=/home/node/Android/Sdk|' /workspace/local.properties
+			echo "  ✓ Updated local.properties"
+		fi`)
+	if err := updateLocalPropertiesCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to update local.properties: %v\n", err)
+	}
+
+	fmt.Println("  ✓ Android SDK mounted at /home/node/Android/Sdk")
+
+	return nil
+}
+
+func copySSLCertificates(containerName string) error {
+	certsPath := expandPath(config.SSL.CertificatesPath)
+	if certsPath == "" {
+		return nil // No certificates configured
+	}
+
+	// Check if certificates directory exists
+	if _, err := os.Stat(certsPath); err != nil {
+		return nil // No certificates to copy
+	}
+
+	// List certificate files
+	entries, err := os.ReadDir(certsPath)
+	if err != nil {
+		return fmt.Errorf("failed to read certificates directory: %w", err)
+	}
+
+	var certFiles []string
+	for _, entry := range entries {
+		if !entry.IsDir() && (filepath.Ext(entry.Name()) == ".crt" || filepath.Ext(entry.Name()) == ".pem") {
+			certFiles = append(certFiles, entry.Name())
+		}
+	}
+
+	if len(certFiles) == 0 {
+		return nil // No certificate files found
+	}
+
+	fmt.Printf("Installing %d SSL certificate(s) for Java...\n", len(certFiles))
+
+	// Create temporary directory in container for certificates
+	mkdirCmd := exec.Command("docker", "exec", "-u", "root", containerName, "mkdir", "-p", "/tmp/host-certs")
+	if err := mkdirCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create temp certs directory: %w", err)
+	}
+
+	// Copy each certificate and import into Java keystore
+	for _, certFile := range certFiles {
+		certPath := filepath.Join(certsPath, certFile)
+
+		// Copy certificate to container
+		copyCmd := exec.Command("docker", "cp", certPath, fmt.Sprintf("%s:/tmp/host-certs/%s", containerName, certFile))
+		if err := copyCmd.Run(); err != nil {
+			fmt.Printf("  ⚠  Failed to copy %s: %v\n", certFile, err)
+			continue
+		}
+
+		// Generate alias from filename (remove extension, replace special chars)
+		alias := certFile[:len(certFile)-len(filepath.Ext(certFile))]
+		alias = regexp.MustCompile(`[^a-zA-Z0-9_-]`).ReplaceAllString(alias, "_")
+
+		// Import into Java keystore (using keytool)
+		// The default cacerts password is 'changeit'
+		importCmd := exec.Command("docker", "exec", "-u", "root", containerName, "keytool",
+			"-importcert",
+			"-noprompt",
+			"-trustcacerts",
+			"-alias", alias,
+			"-file", fmt.Sprintf("/tmp/host-certs/%s", certFile),
+			"-keystore", "/usr/local/jdk-17.0.2/lib/security/cacerts",
+			"-storepass", "changeit",
+		)
+		output, err := importCmd.CombinedOutput()
+		if err != nil {
+			// Check if it's just a duplicate alias error (certificate already exists)
+			if !strings.Contains(string(output), "already exists") {
+				fmt.Printf("  ⚠  Failed to import %s: %v\n", certFile, err)
+			}
+			continue
+		}
+		fmt.Printf("  ✓ %s\n", certFile)
+	}
+
+	// Cleanup temp directory
+	cleanupCmd := exec.Command("docker", "exec", "-u", "root", containerName, "rm", "-rf", "/tmp/host-certs")
+	cleanupCmd.Run() // Ignore errors on cleanup
+
+	// Change keystore password from default 'changeit' to a random password
+	// This prevents the default password from being used to tamper with the keystore
+	newPassword := generateRandomPassword(32)
+	changePassCmd := exec.Command("docker", "exec", "-u", "root", containerName, "keytool",
+		"-storepasswd",
+		"-keystore", "/usr/local/jdk-17.0.2/lib/security/cacerts",
+		"-storepass", "changeit",
+		"-new", newPassword,
+	)
+	if err := changePassCmd.Run(); err != nil {
+		fmt.Printf("  ⚠  Failed to change keystore password: %v\n", err)
+	} else {
+		fmt.Println("  ✓ Keystore password randomized")
+	}
+
+	return nil
+}
+
+// generateRandomPassword generates a cryptographically random password
+func generateRandomPassword(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		b[i] = charset[n.Int64()]
+	}
+	return string(b)
 }
 
 func copyAppsToContainer(containerName string) error {
@@ -1282,6 +1921,11 @@ func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConn
 	// Step 7: Initialize git branch in container
 	if err := initializeGitBranch(containerName, branchName); err != nil {
 		return fmt.Errorf("failed to initialize git branch: %w", err)
+	}
+
+	// Step 7.1: Configure git user if specified
+	if err := configureGitUser(containerName); err != nil {
+		fmt.Printf("Warning: Failed to configure git user: %v\n", err)
 	}
 
 	// Step 7.5: Convert SSH GitHub remotes to HTTPS for gh authentication
