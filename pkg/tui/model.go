@@ -29,6 +29,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	zone "github.com/lrstanley/bubblezone"
 	"github.com/uprockcom/maestro/pkg/paths"
 	"github.com/mistakenelf/teacup/statusbar"
 	"github.com/spf13/viper"
@@ -1665,6 +1666,12 @@ func createFirewallModal() *Modal {
 	ta.BlurredStyle.Prompt = lipgloss.NewStyle().Foreground(style.DimGray)
 	ta.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
 
+	// Move cursor to end of content (most common use is adding new domains)
+	for i := 0; i < ta.LineCount(); i++ {
+		ta.CursorDown()
+	}
+	ta.CursorEnd()
+
 	modal := &Modal{
 		Type:         ModalForm,
 		Title:        "Firewall Configuration",
@@ -2259,14 +2266,14 @@ func (m *Model) updateStatusBar() {
 func (m Model) View() string {
 	// Wizard mode: Show opening animation
 	if m.wizardMode && m.wizardStep == 0 {
-		return m.renderWizardAnimation()
+		return zone.Scan(m.renderWizardAnimation())
 	}
 
 	// Wizard mode with modal screens: Show blank view with modal overlay and help
 	if m.wizardMode && m.wizardStep > 0 {
 		// If modal not created yet (waiting for WindowSizeMsg), show blank screen
 		if m.modal == nil {
-			return ""
+			return zone.Scan("")
 		}
 
 		// Render blank background with modal on top
@@ -2288,18 +2295,18 @@ func (m Model) View() string {
 		finalView := mainView + "\n" + helpView + "\n"
 
 		// Overlay toasts on top of everything (always on top)
-		return m.alert.Render(finalView)
+		return zone.Scan(m.alert.Render(finalView))
 	}
 
 	if !m.ready || m.homeView == nil {
 		// Show spinner while loading
-		return lipgloss.Place(
+		return zone.Scan(lipgloss.Place(
 			m.width,
 			m.height,
 			lipgloss.Center,
 			lipgloss.Center,
 			m.spinner.View()+" Loading containers...",
-		)
+		))
 	}
 
 	// Render title banner
@@ -2348,7 +2355,8 @@ func (m Model) View() string {
 	finalView := mainView + "\n" + helpView + "\n\n" + statusView
 
 	// Overlay toasts on top of everything (always on top)
-	return m.alert.Render(finalView)
+	// zone.Scan processes mouse zone markers for click detection
+	return zone.Scan(m.alert.Render(finalView))
 }
 
 // GetResult returns the TUI result after it exits

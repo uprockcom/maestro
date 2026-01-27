@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	zone "github.com/lrstanley/bubblezone"
 
 	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/tui/style"
@@ -164,6 +165,38 @@ func (h *HomeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		// Handle mouse clicks on table rows
+		if msg.Action != tea.MouseActionRelease || msg.Button != tea.MouseButtonLeft {
+			// Handle scroll wheel
+			if msg.Button == tea.MouseButtonWheelUp {
+				h.table.MoveUp(1)
+				return h, nil
+			} else if msg.Button == tea.MouseButtonWheelDown {
+				h.table.MoveDown(1)
+				return h, nil
+			}
+			return h, nil
+		}
+
+		// Check if click is within the table zone
+		tableZone := zone.Get("container-table")
+		if tableZone.InBounds(msg) {
+			// Get relative position within the table
+			_, y := tableZone.Pos(msg)
+			// Table header is 2 lines (header text + border line)
+			// So row 0 starts at Y=2
+			headerLines := 2
+			if y >= headerLines && len(h.containers) > 0 {
+				rowIndex := y - headerLines
+				if rowIndex < len(h.containers) {
+					h.table.SetCursor(rowIndex)
+					return h, nil
+				}
+			}
+		}
+		return h, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -218,8 +251,8 @@ type ShowActionsMenuMsg struct {
 
 // View renders the home view
 func (h *HomeModel) View() string {
-	// Container table
-	tableView := h.table.View()
+	// Container table - mark for mouse detection
+	tableView := zone.Mark("container-table", h.table.View())
 
 	// Center the table horizontally
 	return lipgloss.Place(

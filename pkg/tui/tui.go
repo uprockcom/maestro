@@ -16,6 +16,7 @@ package tui
 
 import (
 	tea "github.com/charmbracelet/bubbletea"
+	zone "github.com/lrstanley/bubblezone"
 
 	"github.com/uprockcom/maestro/pkg/container"
 )
@@ -29,11 +30,14 @@ type CachedState struct {
 // Run launches the TUI and returns the result and final state
 // Pass cached state from previous run for instant rendering
 func Run(containerPrefix string, cachedState *CachedState) (*TUIResult, *CachedState, error) {
+	// Initialize bubblezone for mouse click tracking
+	zone.NewGlobal()
+
 	model := NewWithCache(containerPrefix, cachedState)
 
 	// tea.WithAltScreen() enables fullscreen mode
-	// tea.WithMouseCellMotion() enables mouse support (optional)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	// tea.WithMouseCellMotion() enables mouse support for clicks, wheel, drag
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	finalModel, err := p.Run()
 	if err != nil {

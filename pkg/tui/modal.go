@@ -15,6 +15,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -26,6 +27,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	zone "github.com/lrstanley/bubblezone"
 
 	"github.com/uprockcom/maestro/pkg/tui/style"
 )
@@ -66,6 +68,11 @@ type Modal struct {
 	checkboxes    []bool            // Checkbox states
 	focusedField  int               // Currently focused field index
 	fieldLabels   []string          // Labels for form fields
+
+	// Mouse click state for textarea scroll tracking
+	lastTextareaLine   int  // Cursor line after last click
+	lastScrollOffset   int  // Estimated scroll offset at last click
+	scrollOffsetValid  bool // Whether lastScrollOffset is valid
 }
 
 // ModalAction represents a button in the modal
@@ -237,6 +244,155 @@ func (m *Modal) Update(msg tea.Msg) (*Modal, tea.Cmd) {
 			*m.spinner = newSpinner
 			return m, cmd
 		}
+
+	case tea.MouseMsg:
+		// Handle mouse clicks on buttons and form fields
+		if msg.Action != tea.MouseActionRelease || msg.Button != tea.MouseButtonLeft {
+			return m, nil
+		}
+
+		// Check if a button was clicked
+		for i, action := range m.Actions {
+			if zone.Get(fmt.Sprintf("modal-action-%d", i)).InBounds(msg) {
+				m.SelectedAction = i
+				if m.Type == ModalForm {
+					// Focus the action button
+					actionsStartIdx := 1 + len(m.textinputs) + len(m.checkboxes)
+					m.blurFocused()
+					m.focusedField = actionsStartIdx + i
+				}
+				// Execute the action
+				if action.OnSelect != nil {
+					cmd := action.OnSelect()
+					if cmd != nil {
+						return nil, func() tea.Msg { return cmd }
+					}
+				}
+				return nil, nil
+			}
+		}
+
+		// Check if a form field was clicked (for ModalForm)
+		if m.Type == ModalForm {
+			// Check textarea
+			textareaZone := zone.Get("modal-textarea")
+			if textareaZone.InBounds(msg) {
+				// Only change focus if not already focused
+				if m.focusedField != 0 {
+					m.blurFocused()
+					m.focusedField = 0
+					m.focusField()
+				}
+
+				// Position cursor based on click position
+				if m.textarea != nil {
+					x, y := textareaZone.Pos(msg)
+					if x >= 0 && y >= 0 {
+						currentLine := m.textarea.Line()
+						viewportHeight := m.textarea.Height()
+
+						// Determine scroll offset
+						var scrollOffset int
+						if m.scrollOffsetValid && currentLine == m.lastTextareaLine {
+							// Cursor hasn't moved since last click - reuse scroll offset
+							scrollOffset = m.lastScrollOffset
+						} else {
+							// Cursor moved (user scrolled/typed) - recalculate scroll offset
+							// The textarea keeps cursor visible, so if cursor is beyond viewport,
+							// the content has been scrolled
+							if currentLine >= viewportHeight {
+								scrollOffset = currentLine - viewportHeight + 1
+							} else {
+								scrollOffset = 0
+							}
+						}
+
+						// Calculate target line accounting for scroll
+						targetLine := y + scrollOffset
+						if targetLine >= m.textarea.LineCount() {
+							targetLine = m.textarea.LineCount() - 1
+						}
+						if targetLine < 0 {
+							targetLine = 0
+						}
+
+						// Move to target line
+						if targetLine < currentLine {
+							for i := 0; i < currentLine-targetLine; i++ {
+								m.textarea.CursorUp()
+							}
+						} else if targetLine > currentLine {
+							for i := 0; i < targetLine-currentLine; i++ {
+								m.textarea.CursorDown()
+							}
+						}
+
+						// Set column position on the target line
+						// Account for line numbers, prompt, and padding
+						// Layout: " " + lineNum + " " + "> " + text
+						// Approximately 6 characters of prefix
+						promptOffset := 6
+						col := x - promptOffset
+						if col < 0 {
+							col = 0
+						}
+						m.textarea.SetCursor(col)
+
+						// Save state for next click
+						m.lastTextareaLine = m.textarea.Line()
+						m.lastScrollOffset = scrollOffset
+						m.scrollOffsetValid = true
+					}
+				}
+				return m, nil
+			}
+
+			// Check text inputs
+			for i := range m.textinputs {
+				inputZone := zone.Get(fmt.Sprintf("modal-textinput-%d", i))
+				if inputZone.InBounds(msg) {
+					// Only change focus if not already focused on this field
+					targetField := 1 + i
+					if m.focusedField != targetField {
+						m.blurFocused()
+						m.focusedField = targetField
+						m.focusField()
+					}
+
+					// Position cursor based on click X position
+					x, _ := inputZone.Pos(msg)
+					if x >= 0 {
+						// Account for prompt width (use raw length since prompt has no styling)
+						promptLen := len(m.textinputs[i].Prompt)
+						cursorPos := x - promptLen
+						if cursorPos < 0 {
+							cursorPos = 0
+						}
+						// Clamp to text length
+						textLen := len(m.textinputs[i].Value())
+						if cursorPos > textLen {
+							cursorPos = textLen
+						}
+						m.textinputs[i].SetCursor(cursorPos)
+					}
+					return m, nil
+				}
+			}
+
+			// Check checkboxes
+			checkboxStartIdx := 1 + len(m.textinputs)
+			for i := range m.checkboxes {
+				if zone.Get(fmt.Sprintf("modal-checkbox-%d", i)).InBounds(msg) {
+					// Toggle the checkbox and focus it
+					m.blurFocused()
+					m.focusedField = checkboxStartIdx + i
+					m.checkboxes[i] = !m.checkboxes[i]
+					return m, nil
+				}
+			}
+		}
+
+		return m, nil
 
 	case tea.KeyMsg:
 		// Handle form input for ModalForm
@@ -618,7 +774,8 @@ func (m *Modal) View(screenWidth, screenHeight int) string {
 				Background(lipgloss.Color("237")). // Slightly lighter than modal bg
 				Width(modalWidth - 4).
 				Align(lipgloss.Left)
-			formParts = append(formParts, textareaStyle.Render(m.textarea.View()))
+			// Mark textarea zone for mouse click detection
+			formParts = append(formParts, zone.Mark("modal-textarea", textareaStyle.Render(m.textarea.View())))
 			formParts = append(formParts, "") // Spacing after textarea
 			fieldIdx++
 		}
@@ -645,7 +802,8 @@ func (m *Modal) View(screenWidth, screenHeight int) string {
 					Background(lipgloss.Color("237")). // Slightly lighter than modal bg
 					Width(modalWidth - 4).
 					Align(lipgloss.Left)
-				formParts = append(formParts, textinputStyle.Render(ti.View()))
+				// Mark textinput zone for mouse click detection
+				formParts = append(formParts, zone.Mark(fmt.Sprintf("modal-textinput-%d", i), textinputStyle.Render(ti.View())))
 				formParts = append(formParts, "") // Spacing after text input
 				fieldIdx++
 			}
@@ -686,7 +844,8 @@ func (m *Modal) View(screenWidth, screenHeight int) string {
 					Background(lipgloss.Color("237")).
 					Width(modalWidth - 4).
 					Align(lipgloss.Left)
-				formParts = append(formParts, textinputStyle.Render(ti.View()))
+				// Mark textinput zone for mouse click detection
+				formParts = append(formParts, zone.Mark(fmt.Sprintf("modal-textinput-%d", i), textinputStyle.Render(ti.View())))
 				formParts = append(formParts, "") // Spacing after text input
 				fieldIdx++
 			}
@@ -725,7 +884,8 @@ func (m *Modal) View(screenWidth, screenHeight int) string {
 					Render(" " + m.fieldLabels[fieldIdx])
 
 				checkboxLine := checkboxPart + labelPart
-				formParts = append(formParts, checkboxLineStyle.Render(checkboxLine))
+				// Mark checkbox zone for mouse click detection
+				formParts = append(formParts, zone.Mark(fmt.Sprintf("modal-checkbox-%d", i), checkboxLineStyle.Render(checkboxLine)))
 				fieldIdx++
 			}
 		}
@@ -836,7 +996,8 @@ func (m *Modal) View(screenWidth, screenHeight int) string {
 						Padding(0, 3)
 				}
 			}
-			actionParts[i] = actionStyle.Render(action.Label)
+			// Wrap button with zone marker for mouse click detection
+			actionParts[i] = zone.Mark(fmt.Sprintf("modal-action-%d", i), actionStyle.Render(action.Label))
 		}
 		// Join with spacing between buttons
 		actionsView = lipgloss.JoinHorizontal(lipgloss.Left, actionParts...)
