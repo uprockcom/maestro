@@ -579,18 +579,18 @@ func startContainer(containerName string) error {
 		return fmt.Errorf("failed to create Claude auth directory: %w", err)
 	}
 
-	// Check if credentials and config exist, warn if not
-	credPath := filepath.Join(authPath, ".credentials.json")
+	// Check if config exists (for .claude.json)
 	configPath := filepath.Join(authPath, ".claude.json")
-
-	credExists := false
 	configExists := false
-
-	if _, err := os.Stat(credPath); err == nil {
-		credExists = true
-	}
 	if _, err := os.Stat(configPath); err == nil {
 		configExists = true
+	}
+
+	// Default credential path - may be updated by FindFreshestToken
+	credPath := filepath.Join(authPath, ".credentials.json")
+	credExists := false
+	if _, err := os.Stat(credPath); err == nil {
+		credExists = true
 	}
 
 	// Skip credential checks when using Bedrock (uses AWS auth instead)
@@ -599,36 +599,47 @@ func startContainer(containerName string) error {
 			fmt.Println("⚠️  Warning: Missing .claude.json configuration.")
 			fmt.Println("Run 'maestro auth' to copy config from ~/.claude")
 		}
-	} else if !credExists || !configExists {
-		fmt.Println("⚠️  Warning: Claude authentication/configuration incomplete.")
-		if !credExists {
-			fmt.Println("  - Missing .credentials.json")
+	} else {
+		// Find the freshest token from host or any running container
+		freshestToken, tokenErr := container.FindFreshestToken(config.Containers.Prefix)
+
+		// Clean up temp file when done if token came from a container
+		if freshestToken != nil && freshestToken.IsTempFile {
+			defer os.Remove(freshestToken.Path)
 		}
-		if !configExists {
-			fmt.Println("  - Missing .claude.json")
-		}
-		fmt.Println("Run 'maestro auth' to complete setup before creating containers.")
-		fmt.Println("Continuing anyway - you'll need to authenticate in the container...")
-	} else if credExists {
-		// Check token expiration
-		if creds, err := container.ReadCredentials(credPath); err == nil {
-			if container.IsTokenExpired(creds) {
-				fmt.Println("\n⚠️  WARNING: Authentication token is EXPIRED!")
-				fmt.Printf("   Status: %s\n", container.FormatExpiration(creds))
-				fmt.Println("   Run 'maestro auth' or 'maestro refresh-tokens' to get a fresh token.")
-				fmt.Print("\nContinue creating container with expired token? (y/N): ")
-				var response string
-				fmt.Scanln(&response)
-				if response != "y" && response != "Y" {
-					return fmt.Errorf("cancelled by user - run 'maestro refresh-tokens' or 'maestro auth' first")
-				}
+
+		if tokenErr != nil {
+			// No valid token found anywhere
+			fmt.Println("⚠️  Warning: No valid Claude authentication found.")
+			if !credExists {
+				fmt.Println("  - No credentials on host")
 			} else {
-				timeLeft := container.TimeUntilExpiration(creds)
-				if timeLeft < 24*time.Hour {
-					fmt.Printf("\n⚠️  Token expires in %.1f hours. Consider running 'maestro auth' soon.\n\n",
-						timeLeft.Hours())
-				}
+				fmt.Println("  - Host credentials are expired")
 			}
+			if !configExists {
+				fmt.Println("  - Missing .claude.json")
+			}
+			fmt.Println("Run 'maestro auth' to authenticate before creating containers.")
+			fmt.Println("Continuing anyway - you'll need to authenticate in the container...")
+		} else {
+			// Found a valid token
+			if freshestToken.Source != "host" {
+				fmt.Printf("Using fresh token from container %s\n", freshestToken.Source)
+			}
+
+			timeLeft := time.Until(freshestToken.ExpiresAt)
+			if timeLeft < 24*time.Hour {
+				fmt.Printf("⚠️  Token expires in %.1f hours. Consider running 'maestro auth' soon.\n",
+					timeLeft.Hours())
+			}
+
+			// Use the freshest token path for copying
+			credPath = freshestToken.Path
+			credExists = true
+		}
+
+		if !configExists {
+			fmt.Println("⚠️  Warning: Missing .claude.json - run 'maestro auth' to complete setup.")
 		}
 	}
 

@@ -20,6 +20,28 @@ import (
 	"text/tabwriter"
 )
 
+// formatTaskForDisplay returns a formatted task string for display in the list
+func formatTaskForDisplay(c Info) string {
+	if c.Status != "running" {
+		return "-"
+	}
+	if c.CurrentTask != "" {
+		// Show current task with progress if available
+		task := c.CurrentTask
+		if len(task) > 20 {
+			task = task[:17] + "..."
+		}
+		if c.TaskProgress != "" {
+			return "▶ " + task + " (" + c.TaskProgress + ")"
+		}
+		return "▶ " + task
+	}
+	if c.TaskProgress != "" {
+		return "✓ " + c.TaskProgress + " done"
+	}
+	return "-"
+}
+
 // SortByPriority sorts containers by logical priority groups, then by creation date within each group
 // Priority order:
 // 1. Needs Attention (running with bell/silence flag)
@@ -79,11 +101,11 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 
 		// Add number column header if showing numbers
 		if opts.ShowNumbers {
-			fmt.Fprintln(w, "#\tNAME\tSTATUS\tBRANCH\tGIT\tACTIVITY\tAUTH\tATTENTION")
-			fmt.Fprintln(w, "-\t----\t------\t------\t---\t--------\t----\t---------")
+			fmt.Fprintln(w, "#\tNAME\tSTATUS\tBRANCH\tTASK\tGIT\tAUTH\tATTENTION")
+			fmt.Fprintln(w, "-\t----\t------\t------\t----\t---\t----\t---------")
 		} else {
-			fmt.Fprintln(w, "NAME\tSTATUS\tBRANCH\tGIT\tACTIVITY\tAUTH\tATTENTION")
-			fmt.Fprintln(w, "----\t------\t------\t---\t--------\t----\t---------")
+			fmt.Fprintln(w, "NAME\tSTATUS\tBRANCH\tTASK\tGIT\tAUTH\tATTENTION")
+			fmt.Fprintln(w, "----\t------\t------\t----\t---\t----\t---------")
 		}
 
 		for i, c := range sorted {
@@ -103,18 +125,17 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 			if authStatus == "" {
 				authStatus = "-"
 			}
-			lastActivity := c.LastActivity
-			if lastActivity == "" {
-				lastActivity = "-"
-			}
+
+			// Format task info
+			taskInfo := formatTaskForDisplay(c)
 
 			// Include number column if showing numbers
 			if opts.ShowNumbers {
 				fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					i+1, c.ShortName, c.Status, c.Branch, gitStatus, lastActivity, authStatus, attention)
+					i+1, c.ShortName, c.Status, c.Branch, taskInfo, gitStatus, authStatus, attention)
 			} else {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					c.ShortName, c.Status, c.Branch, gitStatus, lastActivity, authStatus, attention)
+					c.ShortName, c.Status, c.Branch, taskInfo, gitStatus, authStatus, attention)
 			}
 		}
 		w.Flush()

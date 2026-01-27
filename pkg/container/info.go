@@ -397,6 +397,17 @@ func GetAllContainers(prefix string) ([]Info, error) {
 					mu.Unlock()
 				}()
 
+				// Task status
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					taskSummary := GetTaskSummary(basic.name)
+					mu.Lock()
+					info.CurrentTask = taskSummary.CurrentTask
+					info.TaskProgress = taskSummary.Progress
+					mu.Unlock()
+				}()
+
 				detailWg.Wait()
 			} else {
 				// For stopped containers, just get branch name

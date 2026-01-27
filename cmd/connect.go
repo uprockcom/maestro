@@ -80,8 +80,8 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		shortName := args[0]
 		containerName = resolveContainerName(shortName)
 
-		// Check if container exists and is running
-		checkCmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("name=%s", containerName), "--format", "{{.State}}")
+		// Check if container exists (include stopped containers with -a)
+		checkCmd := exec.Command("docker", "ps", "-a", "--filter", fmt.Sprintf("name=^%s$", containerName), "--format", "{{.State}}")
 		output, err := checkCmd.Output()
 		if err != nil {
 			return fmt.Errorf("failed to check container status: %w", err)
@@ -92,8 +92,32 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("container %s not found", shortName)
 		}
 		if state != "running" {
-			return fmt.Errorf("container %s is not running (status: %s)", shortName, state)
+			// Container exists but is stopped - offer to start it
+			fmt.Printf("Container %s is stopped (status: %s)\n", shortName, state)
+			fmt.Print("Would you like to start it? (Y/n): ")
+
+			reader := bufio.NewReader(os.Stdin)
+			response, _ := reader.ReadString('\n')
+			response = strings.TrimSpace(strings.ToLower(response))
+
+			if response != "" && response != "y" && response != "yes" {
+				return fmt.Errorf("cancelled - container not started")
+			}
+
+			fmt.Printf("Starting %s...\n", shortName)
+			if err := container.StartContainer(containerName); err != nil {
+				return fmt.Errorf("failed to start container: %w", err)
+			}
+			fmt.Println("Container started successfully")
 		}
+	}
+
+	// Ensure container has fresh token before connecting
+	fmt.Printf("Syncing credentials for %s...\n", containerName)
+	if err := container.EnsureFreshToken(containerName, config.Containers.Prefix); err != nil {
+		// Warn but don't fail - user might want to connect anyway
+		fmt.Printf("⚠️  Token sync warning: %v\n", err)
+		fmt.Println("   You may need to run 'maestro auth' if authentication fails.")
 	}
 
 	fmt.Printf("Connecting to %s...\n", containerName)

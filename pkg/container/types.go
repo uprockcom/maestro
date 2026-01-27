@@ -40,6 +40,8 @@ type Info struct {
 	LastActivity   string    // Time since last activity
 	GitStatus      string    // Git status indicators
 	CreatedAt      time.Time // Container creation time
+	CurrentTask    string    // Current task being worked on (from Claude Code task management)
+	TaskProgress   string    // Task progress (e.g., "2/5")
 }
 
 // DisplayOptions configures how containers are displayed

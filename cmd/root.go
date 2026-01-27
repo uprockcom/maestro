@@ -341,7 +341,7 @@ func initConfig() {
 	viper.SetDefault("daemon.token_refresh.threshold", "6h")
 	viper.SetDefault("daemon.notifications.enabled", true)
 	viper.SetDefault("daemon.notifications.attention_threshold", "5m")
-	viper.SetDefault("daemon.notifications.notify_on", []string{"attention_needed", "token_expiring"})
+	viper.SetDefault("daemon.notifications.notify_on", []string{"attention_needed", "token_expiring", "tasks_completed"})
 	viper.SetDefault("daemon.notifications.quiet_hours.start", "")
 	viper.SetDefault("daemon.notifications.quiet_hours.end", "")
 	viper.SetDefault("apps", map[string]string{})

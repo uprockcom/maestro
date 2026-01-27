@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/uprockcom/maestro/pkg/container"
 )
 
 // Config holds daemon configuration
@@ -52,12 +54,16 @@ type Daemon struct {
 
 // ContainerState tracks container monitoring state
 type ContainerState struct {
-	Name                string
-	AttentionStarted    *time.Time
-	LastNotified        *time.Time
-	LastActivity        time.Time
-	LastTokenCheck      time.Time
-	NotificationSent    bool
+	Name                    string
+	AttentionStarted        *time.Time
+	LastNotified            *time.Time
+	LastActivity            time.Time
+	LastTokenCheck          time.Time
+	NotificationSent        bool
+	LastTaskCheck           time.Time
+	HadOpenTasks            bool   // Whether container had incomplete tasks last check
+	LastTaskProgress        string // Last seen task progress (e.g., "2/5")
+	TaskCompletionNotified  bool   // Whether we've notified about task completion
 }
 
 // New creates a new daemon instance
@@ -192,6 +198,9 @@ func (d *Daemon) check() {
 
 		// Check attention status
 		d.checkAttentionStatus(container, state)
+
+		// Check task completion status
+		d.checkTaskStatus(container, state)
 	}
 
 	// Cleanup states for removed containers
@@ -277,8 +286,60 @@ func (d *Daemon) checkAttentionStatus(container string, state *ContainerState) {
 	}
 }
 
+// checkTaskStatus monitors task completion and sends notifications
+func (d *Daemon) checkTaskStatus(containerName string, state *ContainerState) {
+	// Don't check too frequently (every 30 seconds is enough)
+	if time.Since(state.LastTaskCheck) < 30*time.Second {
+		return
+	}
+	state.LastTaskCheck = time.Now()
+
+	// Get task summary from the container
+	summary := container.GetTaskSummary(containerName)
+
+	// Determine if there are open (incomplete) tasks
+	hasOpenTasks := false
+	if summary.HasTasks {
+		// Check if any tasks are not completed
+		// Progress format is "completed/total", so if they're equal, all done
+		if summary.CurrentTask != "" {
+			hasOpenTasks = true // There's an in-progress task
+		} else if summary.Progress != "" {
+			// Parse progress to check if completed < total
+			var completed, total int
+			if _, err := fmt.Sscanf(summary.Progress, "%d/%d", &completed, &total); err == nil {
+				hasOpenTasks = completed < total
+			}
+		}
+	}
+
+	// Detect transition from having open tasks to all complete
+	if state.HadOpenTasks && !hasOpenTasks && summary.HasTasks {
+		// Tasks just completed!
+		if !state.TaskCompletionNotified {
+			d.logInfo("Container %s completed all tasks (%s)", d.getShortName(containerName), summary.Progress)
+
+			if d.shouldNotify("tasks_completed", state) {
+				d.notify("Tasks Completed",
+					fmt.Sprintf("Container %s finished all tasks (%s)",
+						d.getShortName(containerName), summary.Progress))
+				state.TaskCompletionNotified = true
+				state.LastNotified = timeNow()
+			}
+		}
+	}
+
+	// Update state for next check
+	if hasOpenTasks {
+		// Reset completion notification when new tasks appear
+		state.TaskCompletionNotified = false
+	}
+	state.HadOpenTasks = hasOpenTasks
+	state.LastTaskProgress = summary.Progress
+}
+
 // refreshToken refreshes the token for a container
-func (d *Daemon) refreshToken(container string) error {
+func (d *Daemon) refreshToken(containerName string) error {
 	// This will be implemented once we have the refresh-tokens command
 	// For now, just log that we would refresh
 	return fmt.Errorf("token refresh not yet implemented")

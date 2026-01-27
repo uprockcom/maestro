@@ -39,8 +39,8 @@ func getColumnConfigs(useAWSAuth bool) []columnConfig {
 		{title: "NAME", baseSize: 25, minSize: 15},
 		{title: "STATUS", baseSize: 14, minSize: 12},
 		{title: "BRANCH", baseSize: 25, minSize: 15},
+		{title: "TASK", baseSize: 30, minSize: 20},
 		{title: "GIT", baseSize: 10, minSize: 8},
-		{title: "ACTIVITY", baseSize: 12, minSize: 10},
 	}
 	// Only show AUTH column when not using AWS/Bedrock auth
 	if !useAWSAuth {
@@ -285,8 +285,8 @@ func (h *HomeModel) updateTableRows() {
 			h.formatName(c),
 			h.formatStatus(c),
 			h.formatBranch(c),
+			h.formatTask(c),
 			h.formatGit(c),
-			h.formatActivity(c),
 		}
 		// Only include AUTH column when not using AWS auth
 		if !h.useAWSAuth {
@@ -336,12 +336,26 @@ func (h *HomeModel) formatGit(c container.Info) string {
 	return c.GitStatus
 }
 
-// formatActivity returns time since last activity
-func (h *HomeModel) formatActivity(c container.Info) string {
-	if c.LastActivity == "" {
+// formatTask returns the current task or progress
+func (h *HomeModel) formatTask(c container.Info) string {
+	if c.Status != "running" {
 		return "—"
 	}
-	return c.LastActivity
+	if c.CurrentTask != "" {
+		// Show current task with progress if available
+		task := c.CurrentTask
+		if len(task) > 25 {
+			task = task[:22] + "..."
+		}
+		if c.TaskProgress != "" {
+			return "▶ " + task + " (" + c.TaskProgress + ")"
+		}
+		return "▶ " + task
+	}
+	if c.TaskProgress != "" {
+		return "✓ " + c.TaskProgress + " done"
+	}
+	return "—"
 }
 
 // formatAuth returns authentication status
