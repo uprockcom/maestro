@@ -342,8 +342,11 @@ func (h *HomeModel) formatName(c container.Info) string {
 func (h *HomeModel) formatStatus(c container.Info) string {
 	switch c.Status {
 	case "running":
+		if c.IsDormant {
+			return "◌ Dormant"
+		}
 		if c.NeedsAttention {
-			return "⚠ Waiting"
+			return "⚠ Idle"
 		}
 		return "● Running"
 	case "exited":

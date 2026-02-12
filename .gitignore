@@ -8,6 +8,7 @@ bin/
 *.dylib
 *.test
 *.out
+docker/maestro-request-go/maestro-request
 
 # Go dependencies
 vendor/

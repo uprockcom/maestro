@@ -39,27 +39,27 @@ func init() {
 }
 
 func runCleanupVolumes(cmd *cobra.Command, args []string) error {
-	// Get all MCL volumes
+	// Get all Maestro volumes
 	volumeCmd := exec.Command("docker", "volume", "ls", "--format", "{{.Name}}")
 	volumeOutput, err := volumeCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to list volumes: %w", err)
 	}
 
-	var mclVolumes []string
+	var matchingVolumes []string
 	prefix := config.Containers.Prefix
 	for _, line := range strings.Split(string(volumeOutput), "\n") {
 		if strings.HasPrefix(line, prefix) {
-			mclVolumes = append(mclVolumes, line)
+			matchingVolumes = append(matchingVolumes, line)
 		}
 	}
 
-	if len(mclVolumes) == 0 {
-		fmt.Println("No MCL volumes found.")
+	if len(matchingVolumes) == 0 {
+		fmt.Println("No Maestro volumes found.")
 		return nil
 	}
 
-	// Get all MCL containers (including stopped)
+	// Get all Maestro containers (including stopped)
 	containerCmd := exec.Command("docker", "ps", "-a", "--filter", fmt.Sprintf("name=%s", prefix), "--format", "{{.Names}}")
 	containerOutput, err := containerCmd.Output()
 	if err != nil {
@@ -75,10 +75,10 @@ func runCleanupVolumes(cmd *cobra.Command, args []string) error {
 
 	// Find orphaned volumes
 	var orphaned []string
-	for _, vol := range mclVolumes {
+	for _, vol := range matchingVolumes {
 		// Extract container name from volume name
-		// Volume format: mcl-<name>-<number>-<type>
-		// Container format: mcl-<name>-<number>
+		// Volume format: <prefix><name>-<number>-<type>
+		// Container format: <prefix><name>-<number>
 		parts := strings.Split(vol, "-")
 		if len(parts) < 2 {
 			continue

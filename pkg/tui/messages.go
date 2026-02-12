@@ -40,10 +40,10 @@ type wizardPrevStepMsg struct{}
 
 // saveWizardConfigMsg is sent when wizard completes to save configuration
 type saveWizardConfigMsg struct {
-	memory      string
-	cpus        string
-	domains     []string
-	runAuthNow  bool // If true, exit TUI to run maestro auth
+	memory     string
+	cpus       string
+	domains    []string
+	runAuthNow bool // If true, exit TUI to run maestro auth
 }
 
 // updateWizardConfigMsg is sent to update wizard config fields and advance

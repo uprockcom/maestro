@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/uprockcom/maestro/pkg/paths"
@@ -263,7 +262,7 @@ func RefreshTokens(containerName string) error {
 	}
 
 	// Get all running containers to check their tokens
-	containers, err := GetRunningContainers("mcl-")
+	containers, err := GetRunningContainers("maestro-")
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
@@ -319,25 +318,16 @@ func RefreshTokens(containerName string) error {
 	return nil
 }
 
-// AddDomainToAllContainers adds a domain to all running containers' firewall
-func AddDomainToAllContainers(domain string) error {
-	// Get all running containers
-	cmd := exec.Command("docker", "ps", "--filter", "status=running", "--format", "{{.Names}}")
-	output, err := cmd.Output()
+// AddDomainToAllContainers adds a domain to all running maestro containers' firewall
+func AddDomainToAllContainers(domain, containerPrefix string) error {
+	containers, err := GetRunningContainers(containerPrefix)
 	if err != nil {
 		return fmt.Errorf("failed to list running containers: %w", err)
 	}
 
-	containerNames := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(containerNames) == 0 || (len(containerNames) == 1 && containerNames[0] == "") {
-		return nil // No running containers
-	}
-
-	// Add domain to each running container
-	for _, containerName := range containerNames {
-		if err := AddDomainToContainer(containerName, domain); err != nil {
-			// Log error but continue with other containers
-			fmt.Fprintf(os.Stderr, "Warning: failed to add domain to %s: %v\n", containerName, err)
+	for _, c := range containers {
+		if err := AddDomainToContainer(c.Name, domain); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to add domain to %s: %v\n", c.Name, err)
 		}
 	}
 

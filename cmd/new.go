@@ -47,12 +47,12 @@ var newCmd = &cobra.Command{
 	Long: `Create a new isolated development container with Claude Code.
 
 Examples:
-  mcl new "implement user authentication"
-  mcl new --file specs/auth-design.md
-  mcl new -f requirements.txt
-  mcl new "add tests" --no-connect
-  mcl new -e "/pr_review 123"     # Use exact prompt (no AI transformation)
-  mcl new -en "/help"              # Combine flags: exact + no-connect`,
+  maestro new "implement user authentication"
+  maestro new --file specs/auth-design.md
+  maestro new -f requirements.txt
+  maestro new "add tests" --no-connect
+  maestro new -e "/pr_review 123"     # Use exact prompt (no AI transformation)
+  maestro new -en "/help"              # Combine flags: exact + no-connect`,
 	RunE: runNew,
 }
 
@@ -111,46 +111,14 @@ func runNew(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Container name: %s\n", containerName)
 	fmt.Printf("Branch name: %s\n", branchName)
 
-	// Step 3: Build Docker image if needed
-	if err := ensureDockerImage(); err != nil {
-		return fmt.Errorf("failed to ensure Docker image: %w", err)
-	}
-
-	// Step 4: Start container
-	if err := startContainer(containerName); err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
-	}
-
-	// Step 5: Copy current directory to container
-	fmt.Println("Copying project files to container...")
-	if err := copyProjectToContainer(containerName); err != nil {
-		return fmt.Errorf("failed to copy project: %w", err)
-	}
-
-	// Step 6: Copy additional folders
-	if err := copyAdditionalFolders(containerName); err != nil {
-		return fmt.Errorf("failed to copy additional folders: %w", err)
-	}
-
-	// Step 7: Initialize git branch in container
-	if err := initializeGitBranch(containerName, branchName); err != nil {
-		return fmt.Errorf("failed to initialize git branch: %w", err)
-	}
-
-	// Step 7.1: Configure git user if specified
-	if err := configureGitUser(containerName); err != nil {
-		fmt.Printf("Warning: Failed to configure git user: %v\n", err)
-	}
-
-	// Step 7.5: Convert SSH GitHub remotes to HTTPS for gh authentication
-	if err := setupGitHubRemote(containerName); err != nil {
-		// Don't fail container creation, just warn
-		fmt.Printf("Warning: Failed to setup GitHub remote: %v\n", err)
-	}
-
-	// Step 8: Start tmux session with Claude
-	if err := startTmuxSession(containerName, branchName, planningPrompt, exactPrompt); err != nil {
-		return fmt.Errorf("failed to start tmux session: %w", err)
+	// Run the shared container setup pipeline
+	if err := setupContainer(ContainerSetupOptions{
+		ContainerName: containerName,
+		BranchName:    branchName,
+		Prompt:        planningPrompt,
+		ExactPrompt:   exactPrompt,
+	}); err != nil {
+		return err
 	}
 
 	fmt.Printf("\n✅ Container %s is ready!\n", containerName)
@@ -174,6 +142,90 @@ func runNew(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("Connect with: maestro connect %s\n", container.GetShortName(containerName, config.Containers.Prefix))
 		fmt.Printf("Detach with: Ctrl+b d\n")
+	}
+
+	return nil
+}
+
+// ContainerSetupOptions holds all parameters for the shared container setup pipeline.
+type ContainerSetupOptions struct {
+	ContainerName   string
+	BranchName      string
+	Prompt          string            // Task prompt sent to Claude
+	ExactPrompt     bool              // If true, prompt passed to Claude as-is (no planning wrapper)
+	Labels          map[string]string // Docker labels (e.g., maestro.parent)
+	ParentContainer string            // If set: copy workspace from this container instead of host cwd
+	SourceBranch    string            // If set (with ParentContainer): checkout this branch after copy
+}
+
+// setupContainer runs the shared container setup pipeline.
+// All four container creation paths (CLI, TUI, daemon, batch) funnel through here.
+func setupContainer(opts ContainerSetupOptions) error {
+	// 1. Ensure Docker image is available
+	if err := ensureDockerImage(); err != nil {
+		return fmt.Errorf("failed to ensure Docker image: %w", err)
+	}
+
+	// 2. Start container (with optional labels)
+	if err := startContainerWithLabels(opts.ContainerName, opts.Labels); err != nil {
+		return fmt.Errorf("failed to start container: %w", err)
+	}
+
+	// 3. Copy project files
+	if opts.ParentContainer != "" {
+		// Copy workspace from parent container (daemon/child path)
+		fmt.Printf("Copying workspace from parent container %s...\n", opts.ParentContainer)
+		if err := copyProjectFromContainer(opts.ParentContainer, opts.ContainerName); err != nil {
+			return fmt.Errorf("failed to copy project from parent: %w", err)
+		}
+		// Optionally checkout a specific branch in the copied workspace
+		if opts.SourceBranch != "" {
+			checkoutCmd := exec.Command("docker", "exec", opts.ContainerName, "sh", "-c",
+				fmt.Sprintf("cd /workspace && git checkout %s 2>/dev/null || git checkout -b %s", opts.SourceBranch, opts.SourceBranch))
+			if err := checkoutCmd.Run(); err != nil {
+				fmt.Printf("Warning: Failed to checkout branch %s: %v\n", opts.SourceBranch, err)
+			}
+		}
+	} else {
+		// Copy from host working directory (CLI, TUI, batch paths)
+		if err := copyProjectToContainer(opts.ContainerName); err != nil {
+			return fmt.Errorf("failed to copy project: %w", err)
+		}
+	}
+
+	// 4. Copy additional folders from host
+	if err := copyAdditionalFolders(opts.ContainerName); err != nil {
+		return fmt.Errorf("failed to copy additional folders: %w", err)
+	}
+
+	// 5. Initialize git branch
+	if err := initializeGitBranch(opts.ContainerName, opts.BranchName); err != nil {
+		return fmt.Errorf("failed to initialize git branch: %w", err)
+	}
+
+	// 6. Configure git user
+	if err := configureGitUser(opts.ContainerName); err != nil {
+		fmt.Printf("Warning: Failed to configure git user: %v\n", err)
+	}
+
+	// 7. Setup GitHub remote (SSH → HTTPS conversion)
+	if err := setupGitHubRemote(opts.ContainerName); err != nil {
+		fmt.Printf("Warning: Failed to setup GitHub remote: %v\n", err)
+	}
+
+	// 8. Write MAESTRO.md agent documentation
+	if err := writeMaestroMD(opts.ContainerName, opts.BranchName, opts.ParentContainer); err != nil {
+		fmt.Printf("Warning: Failed to write MAESTRO.md: %v\n", err)
+	}
+
+	// 9. Write Claude Code hooks for idle detection
+	if err := writeClaudeSettings(opts.ContainerName); err != nil {
+		fmt.Printf("Warning: Failed to write Claude settings: %v\n", err)
+	}
+
+	// 10. Start tmux session with Claude
+	if err := startTmuxSession(opts.ContainerName, opts.BranchName, opts.Prompt, opts.ExactPrompt); err != nil {
+		return fmt.Errorf("failed to start tmux session: %w", err)
 	}
 
 	return nil
@@ -474,7 +526,7 @@ func getNextContainerName(branchName string) (string, error) {
 	// CRITICAL: Limit total length to avoid hostname errors
 	// Linux hostname limit is 64 chars. We need room for prefix + base + suffix
 	// Format: {prefix}{basename}-{num}
-	// Example: mcl-feat-add-auth-1 (prefix=4, suffix=2, leaves 58 for basename)
+	// Example: maestro-feat-add-auth-1 (prefix + suffix, leaves room for basename)
 	maxBaseLength := 50 // Conservative limit leaving room for prefix/suffix
 	if len(baseName) > maxBaseLength {
 		baseName = baseName[:maxBaseLength]
@@ -553,9 +605,9 @@ func ensureDockerImage() error {
 		fmt.Println("Building Docker image locally...")
 		dockerDir := "docker"
 		if _, err := os.Stat(dockerDir); os.IsNotExist(err) {
-			// Try relative to mcl binary location
-			mclDir := filepath.Dir(os.Args[0])
-			dockerDir = filepath.Join(mclDir, "docker")
+			// Try relative to binary location
+			binDir := filepath.Dir(os.Args[0])
+			dockerDir = filepath.Join(binDir, "docker")
 		}
 
 		// Check if docker directory exists
@@ -573,6 +625,10 @@ func ensureDockerImage() error {
 }
 
 func startContainer(containerName string) error {
+	return startContainerWithLabels(containerName, nil)
+}
+
+func startContainerWithLabels(containerName string, labels map[string]string) error {
 	// Ensure Claude auth directory exists
 	authPath := expandPath(config.Claude.AuthPath)
 	if err := os.MkdirAll(authPath, 0755); err != nil {
@@ -652,12 +708,27 @@ func startContainer(containerName string) error {
 		"--cpus", config.Containers.Resources.CPUs,
 	}
 
+	// Add labels
+	for k, v := range labels {
+		args = append(args, "--label", fmt.Sprintf("%s=%s", k, v))
+	}
+
 	// Add cache volumes for persistence
 	args = append(args,
 		"-v", fmt.Sprintf("%s-npm:/home/node/.npm", containerName),
 		"-v", fmt.Sprintf("%s-uv:/home/node/.cache/uv", containerName),
 		"-v", fmt.Sprintf("%s-history:/commandhistory", containerName),
 	)
+
+	// Mount daemon IPC directory so containers can read fresh connection info (survives daemon restarts)
+	authDir := expandPath(config.Claude.AuthPath)
+	args = append(args,
+		"-v", fmt.Sprintf("%s:/home/node/.maestro/daemon:ro", authDir),
+	)
+
+	// Ensure host.docker.internal resolves inside the container.
+	// This is a no-op on Docker Desktop (Mac/Win) but required on native Linux Docker.
+	args = append(args, "--add-host=host.docker.internal:host-gateway")
 
 	// Mount host SSL certificates for corporate proxies (Zscaler, etc.)
 	// This allows the container to use the same CA trust store as the host
@@ -771,7 +842,7 @@ sed -i 's/^ZSH_THEME=.*/ZSH_THEME=""/' /home/node/.zshrc
 # Add custom prompt with readable symbols and colors
 cat >> /home/node/.zshrc << 'PROMPT_EOF'
 
-# Custom MCL prompt with colors and git status
+# Custom Maestro prompt with colors and git status
 autoload -Uz vcs_info
 precmd_vcs_info() { vcs_info }
 precmd_functions+=( precmd_vcs_info )
@@ -800,6 +871,12 @@ PROMPT='%F{green}%n%f  %F{blue}%~%f  %F{magenta}${vcs_info_msg_0_}%f %F{yellow}$
 PROMPT_EOF`)
 	if err := shellFixCmd.Run(); err != nil {
 		fmt.Printf("Warning: Failed to configure shell: %v\n", err)
+	}
+
+	// Create IPC requests directory in container
+	mkdirIPCCmd := exec.Command("docker", "exec", containerName, "mkdir", "-p", "/home/node/.maestro/requests")
+	if err := mkdirIPCCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to create IPC requests directory: %v\n", err)
 	}
 
 	// Copy credentials and config files to container if they exist
@@ -1473,21 +1550,6 @@ Please analyze this task and create a detailed implementation plan. Do not start
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Enable bell monitoring on the Claude window so we can detect when it needs attention
-	monitorCmd := exec.Command("docker", "exec", "-u", "node", containerName,
-		"tmux", "set-window-option", "-t", "main:0", "monitor-bell", "on")
-	if err := monitorCmd.Run(); err != nil {
-		fmt.Printf("Warning: Failed to enable bell monitoring: %v\n", err)
-	}
-
-	// Enable silence monitoring - triggers when Claude has no output for 10 seconds
-	// This catches when Claude is paused waiting for input
-	silenceCmd := exec.Command("docker", "exec", "-u", "node", containerName,
-		"tmux", "set-window-option", "-t", "main:0", "monitor-silence", "10")
-	if err := silenceCmd.Run(); err != nil {
-		fmt.Printf("Warning: Failed to enable silence monitoring: %v\n", err)
-	}
-
 	// Create a background script to send the initial prompt
 	// First accepts the bypass permissions prompt, then sends the task
 	autoInputScript := fmt.Sprintf(`#!/bin/sh
@@ -1863,6 +1925,212 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+// writeMaestroMD renders the MAESTRO.md template with container-specific values and writes it
+// to two locations inside the container:
+//   - /home/node/.maestro/MAESTRO.md  — canonical reference location
+//   - /home/node/.claude/CLAUDE.md    — auto-discovered by Claude Code at startup
+func writeMaestroMD(containerName, branchName, parentContainer string) error {
+	content := assets.MaestroMDTemplate
+	content = strings.ReplaceAll(content, "{{CONTAINER_NAME}}", containerName)
+	content = strings.ReplaceAll(content, "{{BRANCH_NAME}}", branchName)
+	content = strings.ReplaceAll(content, "{{MAESTRO_VERSION}}", version.Version)
+	if parentContainer == "" {
+		content = strings.ReplaceAll(content, "{{PARENT_CONTAINER}}", "none (top-level)")
+	} else {
+		content = strings.ReplaceAll(content, "{{PARENT_CONTAINER}}", parentContainer)
+	}
+
+	// Write to canonical location
+	writeCmd := exec.Command("docker", "exec", "-i", containerName, "sh", "-c",
+		"cat > /home/node/.maestro/MAESTRO.md")
+	writeCmd.Stdin = strings.NewReader(content)
+	if err := writeCmd.Run(); err != nil {
+		return fmt.Errorf("failed to write MAESTRO.md: %w", err)
+	}
+
+	// Write to ~/.claude/CLAUDE.md for auto-discovery by Claude Code
+	writeClaudeCmd := exec.Command("docker", "exec", "-i", containerName, "sh", "-c",
+		"cat > /home/node/.claude/CLAUDE.md")
+	writeClaudeCmd.Stdin = strings.NewReader(content)
+	if err := writeClaudeCmd.Run(); err != nil {
+		return fmt.Errorf("failed to write ~/.claude/CLAUDE.md: %w", err)
+	}
+
+	return nil
+}
+
+// writeClaudeSettings writes Claude Code hooks configuration to the container.
+// The hooks create/remove a flag file to signal when Claude is idle (waiting for input).
+//
+// Hook ordering for PreToolUse matters: the general hook (no matcher) fires first
+// and removes the idle flag. The user-blocking tools hook fires second and re-creates
+// it, because Claude is actually waiting for user input during those tools
+// (AskUserQuestion, EnterPlanMode, ExitPlanMode). PostToolUse removes the flag
+// when the user responds.
+//
+// For AskUserQuestion specifically, the structured question data (tool_input) is
+// captured to current-question.json so external tools can display it without
+// parsing tmux output. The file is removed on both success and failure/cancel.
+func writeClaudeSettings(containerName string) error {
+	settings := `{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "touch /home/node/.maestro/claude-idle"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rm -f /home/node/.maestro/claude-idle"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rm -f /home/node/.maestro/claude-idle"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion|EnterPlanMode|ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "touch /home/node/.maestro/claude-idle"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq '.tool_input' > /home/node/.maestro/current-question.json"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "AskUserQuestion|EnterPlanMode|ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rm -f /home/node/.maestro/claude-idle"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rm -f /home/node/.maestro/current-question.json"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rm -f /home/node/.maestro/current-question.json"
+          }
+        ]
+      }
+    ]
+  }
+}`
+	writeCmd := exec.Command("docker", "exec", "-i", containerName, "sh", "-c",
+		"cat > /home/node/.claude/settings.json")
+	writeCmd.Stdin = strings.NewReader(settings)
+	return writeCmd.Run()
+}
+
+// copyProjectFromContainer copies the workspace from a source container to a destination container
+func copyProjectFromContainer(srcContainer, dstContainer string) error {
+	// Use tar pipe to copy full workspace including .git
+	tarCmd := exec.Command("docker", "exec", srcContainer, "tar", "-cf", "-", "-C", "/workspace", ".")
+	dockerCmd := exec.Command("docker", "exec", "-i", dstContainer, "tar", "-xf", "-", "-C", "/workspace")
+
+	pipe, err := tarCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create pipe: %w", err)
+	}
+	dockerCmd.Stdin = pipe
+
+	if err := tarCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start tar from source: %w", err)
+	}
+	if err := dockerCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start tar to destination: %w", err)
+	}
+
+	tarErr := tarCmd.Wait()
+	dockerErr := dockerCmd.Wait()
+
+	if tarErr != nil {
+		return fmt.Errorf("tar from source failed: %w", tarErr)
+	}
+	if dockerErr != nil {
+		return fmt.Errorf("tar to destination failed: %w", dockerErr)
+	}
+
+	// Fix ownership
+	chownCmd := exec.Command("docker", "exec", dstContainer, "sh", "-c", "sudo chown -R node:node /workspace")
+	if err := chownCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to fix workspace ownership: %v\n", err)
+	}
+
+	return nil
+}
+
+// CreateContainerFromDaemon creates a new child container from a daemon IPC request.
+// This is called by the daemon when a container requests a sibling via maestro-request.
+func CreateContainerFromDaemon(task, parentContainer, branch string) (string, error) {
+	// Use exact mode: the parent agent crafted a specific prompt, pass it through unmodified.
+	// We still need a branch name for container naming, so generate one separately.
+	branchName, err := generateBranchNameOnly(task)
+	if err != nil {
+		branchName = generateSimpleBranch(task)
+	}
+
+	// Get next container name
+	containerName, err := getNextContainerName(branchName)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate container name: %w", err)
+	}
+
+	// Run the shared container setup pipeline
+	if err := setupContainer(ContainerSetupOptions{
+		ContainerName:   containerName,
+		BranchName:      branchName,
+		Prompt:          task,
+		ExactPrompt:     true,
+		Labels:          map[string]string{"maestro.parent": parentContainer},
+		ParentContainer: parentContainer,
+		SourceBranch:    branch,
+	}); err != nil {
+		return "", err
+	}
+
+	return containerName, nil
+}
+
 // CreateContainerFromTUI creates a new container with the given parameters (called from TUI)
 func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConnect, exact bool) error {
 	if taskDescription == "" {
@@ -1908,46 +2176,14 @@ func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConn
 	fmt.Printf("Container name: %s\n", containerName)
 	fmt.Printf("Branch name: %s\n", branchName)
 
-	// Step 3: Build Docker image if needed
-	if err := ensureDockerImage(); err != nil {
-		return fmt.Errorf("failed to ensure Docker image: %w", err)
-	}
-
-	// Step 4: Start container
-	if err := startContainer(containerName); err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
-	}
-
-	// Step 5: Copy current directory to container
-	fmt.Println("Copying project files to container...")
-	if err := copyProjectToContainer(containerName); err != nil {
-		return fmt.Errorf("failed to copy project: %w", err)
-	}
-
-	// Step 6: Copy additional folders
-	if err := copyAdditionalFolders(containerName); err != nil {
-		return fmt.Errorf("failed to copy additional folders: %w", err)
-	}
-
-	// Step 7: Initialize git branch in container
-	if err := initializeGitBranch(containerName, branchName); err != nil {
-		return fmt.Errorf("failed to initialize git branch: %w", err)
-	}
-
-	// Step 7.1: Configure git user if specified
-	if err := configureGitUser(containerName); err != nil {
-		fmt.Printf("Warning: Failed to configure git user: %v\n", err)
-	}
-
-	// Step 7.5: Convert SSH GitHub remotes to HTTPS for gh authentication
-	if err := setupGitHubRemote(containerName); err != nil {
-		// Don't fail container creation, just warn
-		fmt.Printf("Warning: Failed to setup GitHub remote: %v\n", err)
-	}
-
-	// Step 8: Start tmux session with Claude
-	if err := startTmuxSession(containerName, branchName, planningPrompt, exact); err != nil {
-		return fmt.Errorf("failed to start tmux session: %w", err)
+	// Run the shared container setup pipeline
+	if err := setupContainer(ContainerSetupOptions{
+		ContainerName: containerName,
+		BranchName:    branchName,
+		Prompt:        planningPrompt,
+		ExactPrompt:   exact,
+	}); err != nil {
+		return err
 	}
 
 	fmt.Printf("\n✅ Container %s is ready!\n", containerName)
@@ -1975,4 +2211,3 @@ func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConn
 
 	return nil
 }
-

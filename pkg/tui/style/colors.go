@@ -56,22 +56,22 @@ var OceanTideAnimShades = []string{
 // xterm-256 color cube: 16 + 36*r + 6*g + b where r,g,b ∈ [0,5]
 // Selected for pure green appearance (r=0, low blue component)
 var DaemonAnimShades = []string{
-	"48",  // r=0, g=5, b=0 - brightest green
-	"47",  // r=0, g=4, b=5
-	"43",  // r=0, g=4, b=3
-	"42",  // r=0, g=4, b=2
-	"41",  // r=0, g=4, b=1
-	"40",  // r=0, g=4, b=0
-	"37",  // r=0, g=3, b=3
-	"36",  // r=0, g=3, b=2
-	"35",  // r=0, g=3, b=1
-	"34",  // r=0, g=3, b=0
-	"30",  // r=0, g=2, b=2
-	"29",  // r=0, g=2, b=1
-	"28",  // r=0, g=2, b=0
-	"24",  // r=0, g=1, b=2
-	"23",  // r=0, g=1, b=1
-	"22",  // r=0, g=1, b=0
+	"48", // r=0, g=5, b=0 - brightest green
+	"47", // r=0, g=4, b=5
+	"43", // r=0, g=4, b=3
+	"42", // r=0, g=4, b=2
+	"41", // r=0, g=4, b=1
+	"40", // r=0, g=4, b=0
+	"37", // r=0, g=3, b=3
+	"36", // r=0, g=3, b=2
+	"35", // r=0, g=3, b=1
+	"34", // r=0, g=3, b=0
+	"30", // r=0, g=2, b=2
+	"29", // r=0, g=2, b=1
+	"28", // r=0, g=2, b=0
+	"24", // r=0, g=1, b=2
+	"23", // r=0, g=1, b=1
+	"22", // r=0, g=1, b=0
 }
 
 // GetOceanTideShade returns the Ocean Tide color for the given animation state (0-4)

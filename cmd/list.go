@@ -17,8 +17,8 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/spf13/cobra"
+	"github.com/uprockcom/maestro/pkg/container"
 )
 
 var listCmd = &cobra.Command{

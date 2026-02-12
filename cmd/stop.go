@@ -21,8 +21,8 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/spf13/cobra"
+	"github.com/uprockcom/maestro/pkg/container"
 )
 
 var stopCmd = &cobra.Command{

@@ -396,46 +396,11 @@ ADDITIONAL INSTRUCTION (execute after completing the task above):
 }
 
 // createBatchContainer creates a single container without connecting
-func createBatchContainer(containerName, branchName, planningPrompt string) error {
-	// Step 1: Ensure Docker image
-	if err := ensureDockerImage(); err != nil {
-		return fmt.Errorf("failed to ensure Docker image: %w", err)
-	}
-
-	// Step 2: Start container
-	if err := startContainer(containerName); err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
-	}
-
-	// Step 3: Copy project files
-	if err := copyProjectToContainer(containerName); err != nil {
-		return fmt.Errorf("failed to copy project: %w", err)
-	}
-
-	// Step 4: Copy additional folders
-	if err := copyAdditionalFolders(containerName); err != nil {
-		return fmt.Errorf("failed to copy additional folders: %w", err)
-	}
-
-	// Step 5: Initialize git branch
-	if err := initializeGitBranch(containerName, branchName); err != nil {
-		return fmt.Errorf("failed to initialize git branch: %w", err)
-	}
-
-	// Step 6: Configure git user
-	if err := configureGitUser(containerName); err != nil {
-		// Just warn, don't fail
-	}
-
-	// Step 7: Setup GitHub remote
-	if err := setupGitHubRemote(containerName); err != nil {
-		// Just warn, don't fail
-	}
-
-	// Step 8: Start tmux session
-	if err := startTmuxSession(containerName, branchName, planningPrompt, false); err != nil {
-		return fmt.Errorf("failed to start tmux session: %w", err)
-	}
-
-	return nil
+func createBatchContainer(containerName, branchName, prompt string) error {
+	return setupContainer(ContainerSetupOptions{
+		ContainerName: containerName,
+		BranchName:    branchName,
+		Prompt:        prompt,
+		ExactPrompt:   true,
+	})
 }

@@ -1,6 +1,18 @@
 #!/bin/bash
+#
 # Copyright 2025 Christopher O'Connell
-# All rights reserved
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -205,9 +217,25 @@ iptables -A INPUT -p udp --sport 53 -j ACCEPT
 iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
 iptables -A INPUT -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
 
-# Allow host network access
+# Allow host network access (Docker bridge)
 iptables -A INPUT -s "$HOST_NETWORK" -j ACCEPT
 iptables -A OUTPUT -d "$HOST_NETWORK" -j ACCEPT
+
+# Allow daemon IPC proxy to reach host.docker.internal (and ONLY that user)
+# This is the privilege-isolated path for container-to-daemon communication.
+# The "node" user (where Claude runs) cannot reach this IP directly.
+DOCKER_HOST_IP=$(getent hosts host.docker.internal | awk '{print $1}')
+if [ -n "$DOCKER_HOST_IP" ]; then
+    MAESTRO_IPC_UID=$(id -u maestro-ipc 2>/dev/null)
+    if [ -n "$MAESTRO_IPC_UID" ]; then
+        echo "Allowing maestro-ipc (uid $MAESTRO_IPC_UID) to reach host.docker.internal ($DOCKER_HOST_IP)"
+        iptables -A OUTPUT -d "$DOCKER_HOST_IP" -m owner --uid-owner "$MAESTRO_IPC_UID" -j ACCEPT
+    else
+        echo "WARNING: maestro-ipc user not found - daemon IPC will not work"
+    fi
+else
+    echo "WARNING: Could not resolve host.docker.internal - daemon IPC will not work"
+fi
 
 # Allow established connections
 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT

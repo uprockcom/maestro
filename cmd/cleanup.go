@@ -32,7 +32,7 @@ var (
 var cleanupCmd = &cobra.Command{
 	Use:   "cleanup",
 	Short: "Remove stopped containers",
-	Long:  `Remove stopped mcl containers and their associated volumes.`,
+	Long:  `Remove stopped Maestro containers and their associated volumes.`,
 	RunE:  runCleanup,
 }
 

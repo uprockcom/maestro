@@ -26,8 +26,8 @@ import (
 
 var authCmd = &cobra.Command{
 	Use:   "auth",
-	Short: "Authenticate Claude Code and GitHub CLI for MCL containers",
-	Long: `Authenticate Claude Code and optionally GitHub CLI for MCL containers.
+	Short: "Authenticate Claude Code and GitHub CLI for Maestro containers",
+	Long: `Authenticate Claude Code and optionally GitHub CLI for Maestro containers.
 
 This command will:
 1. Start a temporary container for Claude Code authentication
@@ -172,19 +172,19 @@ func runAuth(cmd *cobra.Command, cmdArgs []string) error {
 		return runBedrockAuth()
 	}
 
-	// Ensure MCL Claude directory exists
+	// Ensure auth directory exists
 	authPath := expandPath(config.Claude.AuthPath)
 	if err := os.MkdirAll(authPath, 0755); err != nil {
-		return fmt.Errorf("failed to create MCL Claude directory: %w", err)
+		return fmt.Errorf("failed to create auth directory: %w", err)
 	}
 
-	fmt.Printf("MCL Claude directory: %s\n", authPath)
+	fmt.Printf("Auth directory: %s\n", authPath)
 
 	// Nuke existing auth directory contents
 	fmt.Println("Clearing existing authentication data...")
 	entries, err := os.ReadDir(authPath)
 	if err != nil {
-		return fmt.Errorf("failed to read MCL Claude directory: %w", err)
+		return fmt.Errorf("failed to read auth directory: %w", err)
 	}
 	for _, entry := range entries {
 		entryPath := filepath.Join(authPath, entry.Name())
@@ -216,7 +216,7 @@ func runAuth(cmd *cobra.Command, cmdArgs []string) error {
 	fmt.Println("1. Complete the initial setup (choose theme, etc.)")
 	fmt.Println("2. Follow the OAuth login flow in your browser")
 	fmt.Println("3. Once fully authenticated and configured, press Ctrl+D or type 'exit'")
-	fmt.Println("4. Your credentials AND configuration will be saved for all future MCL containers")
+	fmt.Println("4. Your credentials AND configuration will be saved for all future Maestro containers")
 	fmt.Println("\n========================================================================")
 
 	// Start temporary auth container with RW mount (no --rm so we can copy files after exit)
@@ -330,10 +330,10 @@ func runAuth(cmd *cobra.Command, cmdArgs []string) error {
 }
 
 func setupGitHubAuth() error {
-	// Ensure MCL gh directory exists
-	mclGhPath := expandPath(config.GitHub.ConfigPath)
-	if err := os.MkdirAll(mclGhPath, 0755); err != nil {
-		return fmt.Errorf("failed to create MCL gh directory: %w", err)
+	// Ensure GitHub auth directory exists
+	ghPath := expandPath(config.GitHub.ConfigPath)
+	if err := os.MkdirAll(ghPath, 0755); err != nil {
+		return fmt.Errorf("failed to create GitHub auth directory: %w", err)
 	}
 
 	// Determine hostname (default to github.com)
@@ -342,15 +342,15 @@ func setupGitHubAuth() error {
 		hostname = "github.com"
 	}
 
-	fmt.Printf("\nGitHub CLI directory: %s\n", mclGhPath)
+	fmt.Printf("\nGitHub CLI directory: %s\n", ghPath)
 	fmt.Printf("GitHub hostname: %s\n", hostname)
 
 	// Clear existing GitHub auth data
 	fmt.Println("Clearing existing GitHub authentication data...")
-	entries, err := os.ReadDir(mclGhPath)
+	entries, err := os.ReadDir(ghPath)
 	if err == nil {
 		for _, entry := range entries {
-			entryPath := filepath.Join(mclGhPath, entry.Name())
+			entryPath := filepath.Join(ghPath, entry.Name())
 			os.RemoveAll(entryPath)
 		}
 	}
@@ -368,7 +368,7 @@ func setupGitHubAuth() error {
 	}
 
 	fmt.Println("\nStarting GitHub CLI authentication container...")
-	fmt.Println("This container has READ-WRITE access to:", mclGhPath)
+	fmt.Println("This container has READ-WRITE access to:", ghPath)
 	fmt.Println("\nPlease authenticate with GitHub:")
 	fmt.Println("1. The 'gh auth login' command will start automatically")
 	fmt.Println("2. Follow the prompts to authenticate (browser or token)")
@@ -379,7 +379,7 @@ func setupGitHubAuth() error {
 	args := []string{
 		"run", "-it",
 		"--name", ghAuthContainerName,
-		"-v", fmt.Sprintf("%s:/home/node/.config/gh", mclGhPath),
+		"-v", fmt.Sprintf("%s:/home/node/.config/gh", ghPath),
 		"-w", "/workspace",
 	}
 
@@ -413,12 +413,12 @@ func setupGitHubAuth() error {
 	exec.Command("docker", "rm", "-f", ghAuthContainerName).Run()
 
 	// Check if authentication was successful
-	hostsPath := filepath.Join(mclGhPath, "hosts.yml")
+	hostsPath := filepath.Join(ghPath, "hosts.yml")
 	if _, err := os.Stat(hostsPath); err == nil {
 		fmt.Println("\n✅ GitHub CLI authentication successful!")
 		fmt.Printf("Hostname: %s\n", hostname)
-		fmt.Printf("Configuration saved to: %s\n", mclGhPath)
-		fmt.Println("\nGitHub CLI will be available in all MCL containers when github.enabled is true.")
+		fmt.Printf("Configuration saved to: %s\n", ghPath)
+		fmt.Println("\nGitHub CLI will be available in all Maestro containers when github.enabled is true.")
 	} else {
 		return fmt.Errorf("hosts.yml not found - authentication may not have completed")
 	}
@@ -437,7 +437,7 @@ func syncCredentialsToContainers() error {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	// Filter for running MCL containers
+	// Filter for running Maestro containers
 	var runningContainers []string
 	for _, line := range strings.Split(string(output), "\n") {
 		if line == "" {
@@ -452,7 +452,7 @@ func syncCredentialsToContainers() error {
 		name := parts[0]
 		state := parts[1]
 
-		// Skip auth containers and non-MCL containers
+		// Skip auth containers and non-Maestro containers
 		if !strings.HasPrefix(name, config.Containers.Prefix) {
 			continue
 		}

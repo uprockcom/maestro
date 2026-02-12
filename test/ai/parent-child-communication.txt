@@ -1,0 +1,447 @@
+==============================================================================
+  Integration Test Procedure: Parent-Child Container Communication
+==============================================================================
+
+PURPOSE
+-------
+Verify the full parent-child IPC loop: spawning a child container, detecting
+when it becomes idle (waiting for input), reading its Claude messages, sending
+responses, and observing the complete lifecycle through to child exit.
+
+This test exercises every parent-facing IPC command:
+  - maestro-request new        (spawn child)
+  - maestro-request wait request  (lifecycle polling)
+  - maestro-request wait idle     (idle detection)
+  - maestro-request claude read   (read child messages)
+  - maestro-request claude send   (send message to child)
+  - maestro-request wait any      (composite wait)
+
+The child is instructed to tell an interactive knock-knock joke, which
+requires multiple rounds of back-and-forth, making it an ideal test for
+the read/send/idle cycle.
+
+IMPORTANT: The child is an LLM agent, so exact wording will vary between
+runs. Pass criteria focus on structural outcomes (idle detected, messages
+present, lifecycle transitions) rather than exact string matches.
+
+PREREQUISITES
+-------------
+- Running inside a Maestro-managed Docker container
+- Daemon is reachable: maestro-request status
+- Parent container has network access to create children
+
+TIMING EXPECTATIONS
+-------------------
+- Container creation (pending → fulfilled): 10-60s
+- Child startup to first idle: 10-30s after fulfilled
+- Each send → idle cycle: 5-20s
+- Child exit after final response: 5-30s
+- Total test duration: 2-5 minutes
+
+CHILD PROMPT
+------------
+The following prompt is designed to produce predictable, interactive behavior
+from the child agent. It explicitly instructs the child to stop and wait for
+input at two points, creating two idle cycles.
+
+  PROMPT:
+  You are going to tell me a knock-knock joke, interactively. Here is exactly
+  what to do, step by step:
+
+  1. Say ONLY "Knock, knock!" and nothing else. Then STOP and wait for my
+     response. Do NOT continue until I reply.
+  2. After I say "Who's there?", respond with ONLY a single name or word
+     (the joke setup, e.g. "Boo"). Then STOP and wait for my response.
+     Do NOT continue until I reply.
+  3. After I reply with "<name> who?", deliver the punchline
+     (e.g. "Don't cry, it's just a joke!").
+  4. After delivering the punchline, run: maestro-request done
+
+  IMPORTANT: You MUST stop and wait for input after steps 1 and 2. Do not
+  deliver the whole joke at once.
+
+
+==============================================================================
+TEST 1: Spawn child and wait for container creation
+==============================================================================
+
+Rationale:
+  The most basic parent operation: spawn a child and confirm the container
+  is created. Tests `maestro-request new` and `wait request ... fulfilled`.
+
+Commands:
+
+  # Spawn the child with the knock-knock prompt
+  OUTPUT=$(maestro-request new "You are going to tell me a knock-knock joke, interactively. Here is exactly what to do, step by step: 1. Say ONLY 'Knock, knock!' and nothing else. Then STOP and wait for my response. Do NOT continue until I reply. 2. After I say 'Who's there?', respond with ONLY a single name or word (the joke setup, e.g. 'Boo'). Then STOP and wait for my response. Do NOT continue until I reply. 3. After I reply with the follow-up (like 'Boo who?'), deliver the punchline (e.g. 'Don't cry, it is just a joke!'). 4. After delivering the punchline, run: maestro-request done. IMPORTANT: You MUST stop and wait for input after steps 1 and 2. Do not deliver the whole joke at once." 2>&1)
+  ID=$(echo "$OUTPUT" | grep -oP 'ID: \K[a-f0-9-]+')
+  echo "Request ID: $ID"
+
+  # Wait for container to be created
+  maestro-request wait request "$ID" fulfilled --timeout 120
+
+Pass criteria:
+  - `maestro-request new` exits 0 and prints "Request accepted (ID: <uuid>)"
+  - ID is a valid UUID (non-empty, matches [a-f0-9-]+ pattern)
+  - `wait request` exits 0
+  - JSON output has "status": "fulfilled"
+  - JSON output has "child_container" set to a non-empty string
+  - Wall clock: <= 120s (typically 10-30s)
+
+Fail conditions:
+  - Empty or missing ID (new command failed)
+  - wait request exits 1 (creation failed — check "error" field)
+  - wait request times out (daemon not processing requests)
+
+
+==============================================================================
+TEST 2: Detect first idle — child says "Knock, knock!"
+==============================================================================
+
+Rationale:
+  After the child container starts and Claude processes the prompt, it should
+  say "Knock, knock!" and stop to wait for input. The parent detects this
+  via `wait idle`. This tests the daemon's idle detection and the IPC path
+  back to the parent.
+
+Command:
+
+  maestro-request wait idle "$ID" --timeout 300
+
+Pass criteria:
+  - Exit code: 0
+  - JSON output has "status": "fulfilled"
+  - Wall clock: <= 120s after fulfilled (typically 10-30s)
+
+Fail conditions:
+  - Exit code 1 with "failed" status (child exited or Claude crashed)
+  - Timeout (child never became idle — it may have delivered the whole joke
+    without stopping, or Claude is still processing)
+
+Notes:
+  - If the child does not become idle, it likely ignored the "STOP and wait"
+    instruction. This is an LLM compliance issue, not an IPC bug. Re-run
+    with a more emphatic prompt.
+
+
+==============================================================================
+TEST 3: Read child messages — verify "Knock, knock!"
+==============================================================================
+
+Rationale:
+  After detecting idle, the parent reads the child's recent messages to see
+  what it said. This tests `claude read` end-to-end: the daemon captures
+  tmux pane content from the child container and returns it as structured
+  messages.
+
+Command:
+
+  maestro-request claude read "$ID" --last 5
+
+Pass criteria:
+  - Exit code: 0
+  - Human-readable output printed (lines with [role] timestamp format)
+  - JSON output has "status": "fulfilled"
+  - JSON "messages" array is non-empty
+  - At least one message contains "knock" (case-insensitive)
+  - Messages have "role", "content", and "timestamp" fields
+
+Fail conditions:
+  - Exit code 1 (read failed — child container may have exited)
+  - Empty messages array (tmux capture failed or parsing error)
+  - No message contains "knock" (child didn't follow instructions)
+
+Notes:
+  - The exact message format varies. Claude might say "Knock, knock!",
+    "Knock knock!", or format it differently. Check for substring "knock".
+  - Messages may include system/tool output mixed with Claude's responses.
+
+
+==============================================================================
+TEST 4: Send first response — "Who's there?"
+==============================================================================
+
+Rationale:
+  The parent sends the expected knock-knock response to the child. This tests
+  `claude send`: the daemon types the message into the child's tmux pane and
+  presses Enter. Claude in the child should then process it.
+
+Command:
+
+  maestro-request claude send "$ID" "Who's there?"
+
+Pass criteria:
+  - Exit code: 0
+  - Output: "Message sent successfully."
+
+Fail conditions:
+  - Exit code 1 (send failed — child container may have exited)
+  - Timeout (daemon couldn't reach child's tmux session)
+
+
+==============================================================================
+TEST 5: Detect second idle — child responds with joke setup
+==============================================================================
+
+Rationale:
+  After receiving "Who's there?", the child should respond with a name/word
+  (the joke setup) and stop again to wait for the follow-up. This tests a
+  second idle detection cycle, confirming the read/send/idle loop is
+  repeatable.
+
+Command:
+
+  maestro-request wait idle "$ID" --timeout 300
+
+Pass criteria:
+  - Exit code: 0
+  - JSON output has "status": "fulfilled"
+  - Wall clock: <= 60s (typically 5-15s)
+
+Fail conditions:
+  - Exit code 1 (child exited — it may have delivered the punchline early
+    and called done)
+  - Timeout (Claude is stuck or child ignored the "STOP and wait" instruction
+    for step 2)
+
+Notes:
+  - If the child delivered the punchline and called done without waiting,
+    this wait will fail with a "failed" status. That's an LLM compliance
+    issue, not a bug. The IPC worked correctly if the failure message
+    includes child exit information.
+
+
+==============================================================================
+TEST 6: Read child messages — verify joke setup word
+==============================================================================
+
+Rationale:
+  Read the child's latest messages to see the joke setup word (e.g., "Boo",
+  "Lettuce", "Atch"). The parent needs this to form the follow-up question.
+
+Command:
+
+  maestro-request claude read "$ID" --last 5
+
+Pass criteria:
+  - Exit code: 0
+  - JSON "messages" array is non-empty
+  - At least one assistant message contains new content beyond "knock"
+    (the setup word)
+  - Messages array length >= previous read (new messages appeared)
+
+Fail conditions:
+  - Exit code 1 (child exited between idle detection and read)
+  - Messages unchanged from TEST 3 (send didn't reach the child, or
+    Claude didn't produce new output)
+
+
+==============================================================================
+TEST 7: Send follow-up — "<name> who?"
+==============================================================================
+
+Rationale:
+  Send the knock-knock follow-up using the name from TEST 6. This tests
+  that `claude send` works for a second round of communication on the same
+  child container.
+
+Command:
+
+  # Extract the setup word from the previous read and form the follow-up.
+  # Example: if child said "Boo", send "Boo who?"
+  maestro-request claude send "$ID" "<name> who?"
+
+  # In practice, the agent running this test should parse the setup word
+  # from TEST 6's output and construct the appropriate follow-up.
+
+Pass criteria:
+  - Exit code: 0
+  - Output: "Message sent successfully."
+
+Fail conditions:
+  - Exit code 1 (child exited before send could complete)
+
+
+==============================================================================
+TEST 8: Wait for child exit — punchline delivered, done called
+==============================================================================
+
+Rationale:
+  After receiving the follow-up, the child should deliver the punchline and
+  call `maestro-request done`, which triggers the daemon to stop the
+  container. The parent confirms this via `wait request ... child_exited`.
+
+  Uses `wait any` with a safety timeout script to avoid hanging forever if
+  the child doesn't exit.
+
+Command:
+
+  maestro-request wait any \
+    "request $ID child_exited" \
+    "script sleep 300" \
+    --timeout 360
+
+Pass criteria:
+  - Exit code: 0
+  - "matched_type": "request"
+  - "success": true
+  - Result has "status": "child_exited"
+  - Result has "child_exited_at" set to a non-empty timestamp
+  - "others" shows the sleep spec as canceled
+  - Wall clock: <= 120s (typically 5-30s after sending the follow-up)
+
+Fail conditions:
+  - Exit code 1 (request reached "failed" status)
+  - Exit code 2 (timeout — child never exited, may not have called done)
+  - The sleep spec wins (child took too long or hung)
+
+Notes:
+  - If the child never calls `maestro-request done`, the container will
+    stay running. The sleep spec acts as a safety net.
+
+
+==============================================================================
+TEST 9 (optional): Final read — verify punchline was delivered
+==============================================================================
+
+Rationale:
+  After child exit, attempt to read the child's final messages. This tests
+  that `claude read` can retrieve messages from a stopped container (the
+  daemon should still be able to capture the tmux buffer if the container
+  hasn't been cleaned up yet).
+
+Command:
+
+  maestro-request claude read "$ID" --last 10
+
+Pass criteria:
+  - Exit code: 0 (container still exists, just stopped)
+    OR exit code 1 with a meaningful error (container removed)
+  - If successful, messages contain the punchline text
+
+Fail conditions:
+  - Hang or timeout (daemon stuck trying to reach dead container)
+
+Notes:
+  - This test may fail if the container is cleaned up quickly. That's
+    acceptable — the test is about graceful handling of the edge case,
+    not guaranteed success.
+
+
+==============================================================================
+FULL TEST WALKTHROUGH (for an agent to execute)
+==============================================================================
+
+This section provides a step-by-step script that a parent agent can follow.
+Each step includes the command, what to check, and how to proceed.
+
+Step 1 — Verify daemon connectivity:
+
+  maestro-request status
+  # Must exit 0. If not, abort.
+
+Step 2 — Spawn the child:
+
+  OUTPUT=$(maestro-request new "<knock-knock prompt from CHILD PROMPT section>" 2>&1)
+  ID=$(echo "$OUTPUT" | grep -oP 'ID: \K[a-f0-9-]+')
+  # Verify ID is non-empty. If empty, abort.
+
+Step 3 — Wait for container creation:
+
+  maestro-request wait request "$ID" fulfilled --timeout 120
+  # Must exit 0. Record child_container name from output.
+
+Step 4 — Wait for first idle (child says "Knock, knock!"):
+
+  maestro-request wait idle "$ID" --timeout 300
+  # Must exit 0.
+
+Step 5 — Read and verify "Knock, knock!":
+
+  maestro-request claude read "$ID" --last 5
+  # Must exit 0. Verify messages contain "knock".
+
+Step 6 — Send "Who's there?":
+
+  maestro-request claude send "$ID" "Who's there?"
+  # Must exit 0 with "Message sent successfully."
+
+Step 7 — Wait for second idle (child says setup word):
+
+  maestro-request wait idle "$ID" --timeout 300
+  # Must exit 0.
+
+Step 8 — Read and extract setup word:
+
+  maestro-request claude read "$ID" --last 5
+  # Must exit 0. Extract the setup word from the latest assistant message.
+  # Example: if "Boo" → follow-up is "Boo who?"
+
+Step 9 — Send follow-up:
+
+  maestro-request claude send "$ID" "<setup word> who?"
+  # Must exit 0 with "Message sent successfully."
+
+Step 10 — Wait for child exit:
+
+  maestro-request wait any "request $ID child_exited" "script sleep 300" --timeout 360
+  # Must exit 0 with matched_type "request".
+
+Step 11 — Summary:
+
+  If all steps passed:
+    - Container lifecycle: pending → fulfilled → child_exited  ✓
+    - Idle detection: 2 cycles detected                        ✓
+    - Message reading: 2 reads with valid content              ✓
+    - Message sending: 2 sends acknowledged                    ✓
+    - Child exit: detected via wait any                        ✓
+
+  Count: 10 IPC operations across 5 distinct command types.
+
+
+==============================================================================
+KNOWN VARIABILITY
+==============================================================================
+
+Since the child is an LLM agent, certain aspects are non-deterministic:
+
+1. JOKE CONTENT: The specific joke varies. "Boo" / "Don't cry" is common,
+   but the child might choose any knock-knock joke. The test doesn't
+   validate the joke itself — only that the interactive pattern works.
+
+2. INSTRUCTION COMPLIANCE: The child may occasionally deliver the whole
+   joke at once without stopping. If this happens, TEST 2 (first idle)
+   will succeed, but TEST 5 (second idle) will fail because the child
+   already exited. Re-run — this is an LLM issue, not an IPC bug.
+
+3. TIMING: Container creation, Claude startup, and response generation
+   all have variable latency. The timeouts are generous (300s) to
+   accommodate slow runs. Typical runs complete in 2-3 minutes.
+
+4. MESSAGE FORMAT: Claude's output may include tool use markers, thinking
+   blocks, or formatting. The `claude read` command captures raw tmux
+   content, so messages may not be perfectly clean. Check for substring
+   matches, not exact equality.
+
+5. SETUP WORD EXTRACTION: The agent running this test must parse the
+   setup word from `claude read` output. If parsing fails, a reasonable
+   fallback is to send a generic response like "Who?" — the child will
+   likely still deliver the punchline.
+
+
+==============================================================================
+BASELINE RESULTS
+==============================================================================
+
+(To be filled in after first successful run)
+
+  Test 1 (spawn + fulfilled):    __s
+  Test 2 (first idle):           __s
+  Test 3 (read "knock knock"):   __s
+  Test 4 (send "who's there"):   __s
+  Test 5 (second idle):          __s
+  Test 6 (read setup word):      __s
+  Test 7 (send follow-up):       __s
+  Test 8 (child_exited):         __s
+  Total:                         __s
+
+  Joke told: ___________________

@@ -20,9 +20,9 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/uprockcom/maestro/pkg/paths"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/uprockcom/maestro/pkg/paths"
 	"gopkg.in/yaml.v3"
 )
 

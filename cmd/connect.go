@@ -22,14 +22,14 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/spf13/cobra"
+	"github.com/uprockcom/maestro/pkg/container"
 )
 
 var connectCmd = &cobra.Command{
 	Use:   "connect [name]",
 	Short: "Connect to a running container",
-	Long: `Connect to the tmux session in a running mcl container.
+	Long: `Connect to the tmux session in a running Maestro container.
 
 If no name is provided:
   - Auto-connects if only one container is running
@@ -47,7 +47,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	// If no argument provided, show interactive selection
 	if len(args) == 0 {
-		// Check both configured prefix and legacy "mcl-" prefix for backward compatibility
+		// Get containers with configured prefix
 		containers, err := container.GetRunningContainers(config.Containers.Prefix)
 		if err != nil {
 			return fmt.Errorf("failed to get running containers: %w", err)

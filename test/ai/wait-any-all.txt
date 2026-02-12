@@ -1,0 +1,375 @@
+==============================================================================
+  Integration Test Procedure: maestro-request wait any / wait all
+==============================================================================
+
+PURPOSE
+-------
+Verify that `maestro-request wait any` (OR-logic) and `maestro-request wait all`
+(AND-logic) behave correctly under various conditions: normal completion,
+timeouts, failures, cancellation, mixed spec types, and real child container
+lifecycles.
+
+These are live integration tests that must run inside a Maestro container with
+a functioning daemon connection. They are not unit tests — they exercise the
+full IPC path and real process management.
+
+PREREQUISITES
+-------------
+- Running inside a Maestro-managed Docker container
+- `maestro-request` is in PATH and the daemon is reachable
+- Verify with: maestro-request status
+
+EXIT CODE REFERENCE
+-------------------
+  0 = success (matched spec succeeded, or all specs succeeded)
+  1 = failure (matched spec failed, or any spec in `wait all` failed)
+  2 = global timeout (no spec completed / not all completed in time)
+
+==============================================================================
+TEST 1: wait any — OR semantics with fast vs slow scripts
+==============================================================================
+
+Rationale:
+  The fundamental OR behavior: given two scripts of different durations, the
+  shorter one should win the race. The longer script should be reported as
+  canceled. Total wall time should be close to the shorter duration.
+
+Command:
+  maestro-request wait any "script sleep 1" "script sleep 10" --timeout 15
+
+Pass criteria:
+  - Exit code: 0
+  - JSON output field "matched_index": 0
+  - JSON output field "matched_spec": "script sleep 1"
+  - JSON output field "success": true
+  - JSON output field "result.exit_code": 0
+  - "others" array contains index 1 with status "canceled"
+  - Wall clock elapsed: <= 3s (should be ~1s)
+
+Fail conditions:
+  - Exit code != 0
+  - The 10s sleep wins instead of the 1s sleep
+  - Wall time approaches 10s (cancellation not working)
+
+
+==============================================================================
+TEST 2: wait all — AND semantics with two scripts
+==============================================================================
+
+Rationale:
+  The fundamental AND behavior: given two scripts, the command must wait for
+  BOTH to finish. Total wall time should be close to the slower script.
+
+Command:
+  maestro-request wait all "script sleep 1" "script sleep 3" --timeout 15
+
+Pass criteria:
+  - Exit code: 0
+  - JSON "results" array contains exactly 2 entries
+  - Both entries have "success": true
+  - Both entries have "result.exit_code": 0
+  - Wall clock elapsed: >= 2s and <= 5s (should be ~3s)
+
+Fail conditions:
+  - Exit code != 0
+  - Only 1 result returned (short-circuited on first completion)
+  - Wall time ~1s (didn't wait for the slower script)
+
+
+==============================================================================
+TEST 3: wait any — daemon spec resolves instantly vs slow script
+==============================================================================
+
+Rationale:
+  When the daemon is already reachable, the "daemon" spec should resolve
+  almost instantly, beating any script. This tests mixed spec types (daemon
+  + script) and verifies the daemon spec doesn't block.
+
+Command:
+  maestro-request wait any "daemon" "script sleep 10" --timeout 15
+
+Pass criteria:
+  - Exit code: 0
+  - "matched_type": "daemon"
+  - "matched_index": 0
+  - "success": true
+  - "result" contains daemon status fields (pid, running, containers, uptime)
+  - "others" shows index 1 canceled
+  - Wall clock elapsed: <= 2s (should be ~0s)
+
+Fail conditions:
+  - Exit code != 0
+  - The script spec wins instead of daemon
+  - Wall time >= 5s
+
+
+==============================================================================
+TEST 4: wait all — global timeout exits with code 2
+==============================================================================
+
+Rationale:
+  When not all specs can complete within the timeout, the command should exit
+  with code 2. This verifies timeout enforcement in AND mode.
+
+Command:
+  maestro-request wait all "script sleep 1" "script sleep 30" --timeout 3
+
+Pass criteria:
+  - Exit code: 2
+  - Stderr contains "Timeout" message
+  - Wall clock elapsed: >= 3s and <= 6s
+  - No JSON output on stdout (timeout exits before formatting results)
+
+Fail conditions:
+  - Exit code != 2
+  - Command hangs past the timeout
+  - Wall time ~30s (timeout not enforced)
+
+
+==============================================================================
+TEST 5: wait any — failing script is reported as a match with success=false
+==============================================================================
+
+Rationale:
+  A spec that completes (even with failure) counts as a match in OR mode.
+  The overall exit code should be 1 since the matched spec failed. This
+  ensures failures aren't silently ignored.
+
+Command:
+  maestro-request wait any "script false" "script sleep 10" --timeout 15
+
+Pass criteria:
+  - Exit code: 1
+  - "matched_spec": "script false"
+  - "success": false
+  - "result.exit_code": 1
+  - "others" shows index 1 canceled
+  - Wall clock elapsed: <= 2s (should be ~0s)
+
+Fail conditions:
+  - Exit code 0 (failure not propagated)
+  - Exit code 2 (treated as timeout instead of failure)
+  - The sleep spec matches instead of the failing script
+
+
+==============================================================================
+TEST 6: wait all — early failure cancels remaining specs
+==============================================================================
+
+Rationale:
+  In AND mode, if any spec fails, the remaining specs should be canceled
+  immediately and the command should exit with code 1. This verifies the
+  fail-fast behavior — it should NOT wait for the 30s sleep.
+
+Command:
+  maestro-request wait all "script false" "script sleep 30" --timeout 60
+
+Pass criteria:
+  - Exit code: 1
+  - JSON "results" array contains exactly 1 entry (the failed one)
+  - That entry has "success": false and "result.exit_code": 1
+  - Wall clock elapsed: <= 2s (should be ~0s)
+
+Fail conditions:
+  - Exit code 0 (failure not detected)
+  - Exit code 2 (treated as timeout)
+  - Wall time ~30s (didn't cancel the remaining spec)
+  - Results array contains 2 entries (waited for the long sleep)
+
+
+==============================================================================
+TEST 7: wait any — global timeout exits with code 2
+==============================================================================
+
+Rationale:
+  When no spec completes within the timeout, `wait any` should exit with
+  code 2. This verifies timeout enforcement in OR mode.
+
+Command:
+  maestro-request wait any "script sleep 30" --timeout 3
+
+Pass criteria:
+  - Exit code: 2
+  - Stderr contains "Timeout" message
+  - Wall clock elapsed: >= 3s and <= 6s
+  - No JSON output on stdout
+
+Fail conditions:
+  - Exit code != 2
+  - Command hangs past the timeout
+  - Wall time ~30s (timeout not enforced)
+
+
+==============================================================================
+TEST 8: Child container lifecycle — spawn, wait fulfilled, wait exited
+==============================================================================
+
+Rationale:
+  End-to-end test using real child containers. Verifies that request specs
+  work with actual container lifecycle events, and that `wait any` and
+  `wait all` integrate correctly with the daemon's request system.
+
+  This test spawns a child instructed to immediately call `maestro-request
+  done`, then uses composite waits to observe both the fulfilled and
+  child_exited transitions.
+
+Step 1 — Spawn the child:
+
+  OUTPUT=$(maestro-request new "Run 'maestro-request done' immediately after reading this prompt. Do not do anything else." 2>&1)
+  ID=$(echo "$OUTPUT" | grep -oP 'ID: \K[a-f0-9-]+')
+
+  Pass: ID is a non-empty UUID
+  Fail: Empty ID or error message
+
+Step 2 — Wait for fulfilled using wait any (OR with a safety timeout script):
+
+  maestro-request wait any \
+    "request $ID fulfilled" \
+    "script sleep 120" \
+    --timeout 180
+
+  Pass criteria:
+    - Exit code: 0
+    - "matched_type": "request"
+    - "matched_spec" contains the request ID and "fulfilled"
+    - "success": true
+    - "result.status": "fulfilled"
+    - "result.child_container" is a non-empty string
+    - "others" shows the sleep spec as canceled
+    - Wall clock elapsed: <= 120s (typically 10-30s for container creation)
+
+  Fail conditions:
+    - Exit code != 0
+    - The sleep spec wins (container creation took too long or failed)
+    - Status is not "fulfilled"
+
+Step 3 — Wait for child_exited using wait all (AND with daemon check):
+
+  maestro-request wait all \
+    "daemon" \
+    "request $ID child_exited" \
+    --timeout 300
+
+  Pass criteria:
+    - Exit code: 0
+    - "results" array contains 2 entries, both with "success": true
+    - The request result has "result.status": "child_exited"
+    - Wall clock elapsed: <= 300s (typically under 60s)
+
+  Fail conditions:
+    - Exit code != 0
+    - Child never exits (prompt not followed or maestro-request done broken)
+    - Timeout reached
+
+
+==============================================================================
+RUNNING ALL TESTS (copy-paste script)
+==============================================================================
+
+The following script runs tests 1-7 (the non-child tests) automatically and
+reports pass/fail. Test 8 must be run separately due to container spawn times.
+
+--- begin script ---
+
+#!/usr/bin/env bash
+set -uo pipefail
+
+PASS=0
+FAIL=0
+
+run_test() {
+    local test_num="$1"
+    local description="$2"
+    local expected_exit="$3"
+    shift 3
+    local cmd=("$@")
+
+    echo "=== TEST $test_num: $description ==="
+    START=$(date +%s)
+    OUTPUT=$("${cmd[@]}" 2>&1)
+    ACTUAL_EXIT=$?
+    END=$(date +%s)
+    ELAPSED=$((END - START))
+
+    echo "$OUTPUT"
+    echo "--- exit=$ACTUAL_EXIT elapsed=${ELAPSED}s (expected exit=$expected_exit) ---"
+
+    if [ "$ACTUAL_EXIT" -eq "$expected_exit" ]; then
+        echo "PASS"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL (expected exit $expected_exit, got $ACTUAL_EXIT)"
+        FAIL=$((FAIL + 1))
+    fi
+    echo ""
+}
+
+# Verify daemon is reachable
+maestro-request status > /dev/null 2>&1 || { echo "ABORT: daemon not reachable"; exit 1; }
+
+run_test 1 "wait any: 1s vs 10s sleep (OR, short wins)" 0 \
+    maestro-request wait any "script sleep 1" "script sleep 10" --timeout 15
+
+run_test 2 "wait all: 1s + 3s sleep (AND, waits for both)" 0 \
+    maestro-request wait all "script sleep 1" "script sleep 3" --timeout 15
+
+run_test 3 "wait any: daemon vs 10s sleep (daemon wins instantly)" 0 \
+    maestro-request wait any "daemon" "script sleep 10" --timeout 15
+
+run_test 4 "wait all: timeout (1s + 30s with 3s timeout)" 2 \
+    maestro-request wait all "script sleep 1" "script sleep 30" --timeout 3
+
+run_test 5 "wait any: failing script wins (false vs 10s sleep)" 1 \
+    maestro-request wait any "script false" "script sleep 10" --timeout 15
+
+run_test 6 "wait all: early failure cancels remaining (false + 30s)" 1 \
+    maestro-request wait all "script false" "script sleep 30" --timeout 60
+
+run_test 7 "wait any: timeout (30s sleep with 3s timeout)" 2 \
+    maestro-request wait any "script sleep 30" --timeout 3
+
+echo "============================================"
+echo "Results: $PASS passed, $FAIL failed (of 7)"
+echo "============================================"
+
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi
+
+--- end script ---
+
+
+==============================================================================
+TEST 8 (manual — child container lifecycle)
+==============================================================================
+
+Run separately since it spawns a real container and takes 30-120s:
+
+  # Spawn
+  OUTPUT=$(maestro-request new "Run 'maestro-request done' immediately after reading this prompt. Do not do anything else." 2>&1)
+  ID=$(echo "$OUTPUT" | grep -oP 'ID: \K[a-f0-9-]+')
+  echo "Child request ID: $ID"
+
+  # Wait for fulfilled (OR with safety sleep)
+  maestro-request wait any "request $ID fulfilled" "script sleep 120" --timeout 180
+  # Expect: exit 0, matched_type=request, result.status=fulfilled
+
+  # Wait for child_exited (AND with daemon)
+  maestro-request wait all "daemon" "request $ID child_exited" --timeout 300
+  # Expect: exit 0, 2 results, both success=true, request result.status=child_exited
+
+
+==============================================================================
+BASELINE RESULTS (2026-02-11)
+==============================================================================
+
+All 8 tests passed on initial run. Timing baselines:
+
+  Test 1: ~1s    (1s sleep won)
+  Test 2: ~3s    (waited for both)
+  Test 3: ~0s    (daemon instant)
+  Test 4: ~4s    (timeout at 3s)
+  Test 5: ~0s    (false instant)
+  Test 6: ~0s    (false instant, canceled 30s sleep)
+  Test 7: ~3s    (timeout at 3s)
+  Test 8: ~14s fulfilled, ~6s to child_exited after that

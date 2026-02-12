@@ -80,12 +80,12 @@ The configuration file lives at `~/.maestro/config.yml`. Here's a complete refer
 ```yaml
 claude:
   config_path: ~/.claude       # Your Claude auth directory
-  mcl_claude_path: ~/.maestro/.claude  # Maestro's centralized auth storage
+  auth_path: ~/.maestro/.claude        # Maestro's centralized auth storage
   default_mode: yolo           # Auto-approve mode
 
 containers:
-  prefix: mcl-                 # Container name prefix
-  image: mcl:latest            # Docker image name
+  prefix: maestro-              # Container name prefix
+  image: maestro:latest        # Docker image name
   resources:
     memory: 4g                 # Memory limit
     cpus: "2"                  # CPU limit
@@ -208,7 +208,7 @@ refactor-db-1     running  refactor/db    Δ5 ↓1    12h ago   ✗ EXPIRED 💤
   - `✓ Xh` = Token valid for X hours (green)
   - `⚠ Xh` = Token expires in < 24 hours (yellow warning)
   - `✗ EXPIRED` = Token has expired (red)
-- **🔔**: Container needs attention (tmux bell detected)
+- **🔔**: Container needs attention (Claude is idle, waiting for input)
 - **💤**: Container is dormant (Claude process has exited)
 
 ### Inside the Container
@@ -433,7 +433,7 @@ This ensures:
 Containers launch with `NET_ADMIN` capability to manage iptables rules:
 
 1. **Initialization**: `init-firewall.sh` runs at container startup
-2. **Custom chain**: Creates `DOCKER_MCL_FILTER` iptables chain
+2. **Custom chain**: Sets up iptables firewall rules
 3. **Default policy**: DROP all outgoing traffic
 4. **Whitelist**: Allow configured domains + GitHub API
 5. **Dynamic updates**: `maestro add-domain` modifies running containers

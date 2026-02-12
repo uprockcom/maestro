@@ -21,10 +21,10 @@ import (
 
 func TestGetContainerImage(t *testing.T) {
 	tests := []struct {
-		name            string
-		version         string
-		expectedSuffix  string
-		shouldBeLatest  bool
+		name           string
+		version        string
+		expectedSuffix string
+		shouldBeLatest bool
 	}{
 		{
 			name:           "dev build",

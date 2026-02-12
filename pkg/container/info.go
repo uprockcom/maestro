@@ -87,28 +87,13 @@ func GetBranchName(containerName string) string {
 	return strings.TrimSpace(string(output))
 }
 
-// CheckBellStatus checks if a container needs attention (bell or silence flags)
-func CheckBellStatus(containerName string) bool {
+// CheckIdleStatus checks if a container's Claude agent is idle (waiting for input).
+// Returns true when the claude-idle flag file exists, which is created by the
+// Claude Code Stop hook and removed by UserPromptSubmit/PreToolUse hooks.
+func CheckIdleStatus(containerName string) bool {
 	cmd := exec.Command("docker", "exec", containerName,
-		"tmux", "list-windows", "-t", "main", "-F", "#{window_bell_flag}:#{window_silence_flag}")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	// If any window has bell_flag=1 OR silence_flag=1, container needs attention
-	for _, line := range strings.Split(string(output), "\n") {
-		parts := strings.Split(strings.TrimSpace(line), ":")
-		if len(parts) == 2 {
-			bellFlag := parts[0]
-			silenceFlag := parts[1]
-			if bellFlag == "1" || silenceFlag == "1" {
-				return true
-			}
-		}
-	}
-
-	return false
+		"test", "-f", "/home/node/.maestro/claude-idle")
+	return cmd.Run() == nil
 }
 
 // IsClaudeRunning checks if Claude process is running in a container
@@ -241,7 +226,7 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 			detailWg.Add(1)
 			go func() {
 				defer detailWg.Done()
-				needsAttention := CheckBellStatus(basic.name)
+				needsAttention := CheckIdleStatus(basic.name)
 				mu.Lock()
 				info.NeedsAttention = needsAttention
 				mu.Unlock()
@@ -351,7 +336,7 @@ func GetAllContainers(prefix string) ([]Info, error) {
 				detailWg.Add(1)
 				go func() {
 					defer detailWg.Done()
-					needsAttention := CheckBellStatus(basic.name)
+					needsAttention := CheckIdleStatus(basic.name)
 					mu.Lock()
 					info.NeedsAttention = needsAttention
 					mu.Unlock()

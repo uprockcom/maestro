@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/spf13/cobra"
+	"github.com/uprockcom/maestro/pkg/container"
 )
 
 var (
@@ -170,22 +170,9 @@ func performClaudeRestart(containerName, shortName string) error {
 		return fmt.Errorf("failed to create new Claude window: %w", err)
 	}
 
-	// Step 4: Enable monitoring on the new window
+	// Step 4: Make window 0 active
 	time.Sleep(500 * time.Millisecond)
 
-	monitorCmd := exec.Command("docker", "exec", containerName,
-		"tmux", "set-window-option", "-t", "main:0", "monitor-bell", "on")
-	if err := monitorCmd.Run(); err != nil {
-		fmt.Printf("  Warning: Failed to enable bell monitoring: %v\n", err)
-	}
-
-	silenceCmd := exec.Command("docker", "exec", containerName,
-		"tmux", "set-window-option", "-t", "main:0", "monitor-silence", "10")
-	if err := silenceCmd.Run(); err != nil {
-		fmt.Printf("  Warning: Failed to enable silence monitoring: %v\n", err)
-	}
-
-	// Step 5: Make window 0 active
 	selectCmd := exec.Command("docker", "exec", containerName,
 		"tmux", "select-window", "-t", "main:0")
 	if err := selectCmd.Run(); err != nil {
@@ -221,7 +208,7 @@ func performFullRestart(containerName, shortName string) error {
 
 	// Step 3.5: Fix shell config for better terminal experience
 	checkPromptCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
-		"grep -q 'Custom MCL prompt' /home/node/.zshrc")
+		"grep -q 'Custom Maestro prompt' /home/node/.zshrc")
 	if err := checkPromptCmd.Run(); err != nil {
 		// Prompt not found, apply all shell fixes
 		shellFixCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
@@ -234,7 +221,7 @@ sed -i 's/^ZSH_THEME=.*/ZSH_THEME=""/' /home/node/.zshrc
 # Add custom prompt with readable symbols and colors
 cat >> /home/node/.zshrc << 'PROMPT_EOF'
 
-# Custom MCL prompt with colors and git status
+# Custom Maestro prompt with colors and git status
 autoload -Uz vcs_info
 precmd_vcs_info() { vcs_info }
 precmd_functions+=( precmd_vcs_info )
@@ -303,8 +290,6 @@ PROMPT_EOF`)
 
 		// Rename and configure windows
 		exec.Command("docker", "exec", containerName, "tmux", "rename-window", "-t", "main:0", "claude").Run()
-		exec.Command("docker", "exec", containerName, "tmux", "set-window-option", "-t", "main:0", "monitor-bell", "on").Run()
-		exec.Command("docker", "exec", containerName, "tmux", "set-window-option", "-t", "main:0", "monitor-silence", "10").Run()
 		exec.Command("docker", "exec", containerName, "tmux", "select-window", "-t", "main:0").Run()
 	}
 

@@ -44,7 +44,7 @@ func formatTaskForDisplay(c Info) string {
 
 // SortByPriority sorts containers by logical priority groups, then by creation date within each group
 // Priority order:
-// 1. Needs Attention (running with bell/silence flag)
+// 1. Needs Attention (running with idle flag from Claude Code hooks)
 // 2. Running (normal)
 // 3. Dormant (running but Claude not active)
 // 4. Stopped
@@ -56,14 +56,14 @@ func SortByPriority(containers []Info) []Info {
 
 	// Define priority function
 	getPriority := func(c Info) int {
+		if c.IsDormant {
+			return 2 // Dormant trumps stale idle flag
+		}
 		if c.NeedsAttention {
 			return 0 // Highest priority
 		}
-		if c.Status == "running" && !c.IsDormant {
+		if c.Status == "running" {
 			return 1
-		}
-		if c.IsDormant {
-			return 2
 		}
 		return 3 // Stopped containers lowest priority
 	}
@@ -110,10 +110,18 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 
 		for i, c := range sorted {
 			attention := ""
-			if c.NeedsAttention {
-				attention = "🔔"
-			} else if c.IsDormant {
+			// Dormant takes priority: if Claude isn't running, the idle flag
+			// file is stale and shouldn't be treated as "needs attention"
+			if c.IsDormant {
 				attention = "💤"
+			} else if c.NeedsAttention {
+				attention = "🔔"
+			}
+
+			// Derive display status: show "dormant" for containers where Claude exited
+			displayStatus := c.Status
+			if c.Status == "running" && c.IsDormant {
+				displayStatus = "dormant"
 			}
 
 			// Use default values for stopped containers
@@ -132,10 +140,10 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 			// Include number column if showing numbers
 			if opts.ShowNumbers {
 				fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					i+1, c.ShortName, c.Status, c.Branch, taskInfo, gitStatus, authStatus, attention)
+					i+1, c.ShortName, displayStatus, c.Branch, taskInfo, gitStatus, authStatus, attention)
 			} else {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					c.ShortName, c.Status, c.Branch, taskInfo, gitStatus, authStatus, attention)
+					c.ShortName, displayStatus, c.Branch, taskInfo, gitStatus, authStatus, attention)
 			}
 		}
 		w.Flush()
@@ -146,10 +154,10 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 
 		for i, c := range sorted {
 			status := ""
-			if c.NeedsAttention {
-				status = " 🔔 NEEDS ATTENTION"
-			} else if c.IsDormant {
+			if c.IsDormant {
 				status = " 💤 DORMANT"
+			} else if c.NeedsAttention {
+				status = " 🔔 NEEDS ATTENTION"
 			} else if c.Status != "running" {
 				status = " (stopped)"
 			}
@@ -160,10 +168,10 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 		// Simple list format (no numbers)
 		for _, c := range sorted {
 			status := ""
-			if c.NeedsAttention {
-				status = " 🔔"
-			} else if c.IsDormant {
+			if c.IsDormant {
 				status = " 💤"
+			} else if c.NeedsAttention {
+				status = " 🔔"
 			}
 			fmt.Printf("  %s (branch: %s)%s\n", c.ShortName, c.Branch, status)
 		}

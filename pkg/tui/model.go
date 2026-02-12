@@ -30,9 +30,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
-	"github.com/uprockcom/maestro/pkg/paths"
 	"github.com/mistakenelf/teacup/statusbar"
 	"github.com/spf13/viper"
+	"github.com/uprockcom/maestro/pkg/paths"
 	"go.dalton.dog/bubbleup"
 
 	"github.com/uprockcom/maestro/pkg/container"
@@ -868,7 +868,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					for _, domain := range addedDomains {
 						// Call add-domain command for each new domain
 						// This will apply to all running containers
-						container.AddDomainToAllContainers(domain)
+						container.AddDomainToAllContainers(domain, m.containerPrefix)
 					}
 				}()
 				toastMsg := fmt.Sprintf("Firewall saved. Adding %d new domain(s) to running containers...", len(addedDomains))

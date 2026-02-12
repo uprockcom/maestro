@@ -36,50 +36,50 @@ import (
 type ModalType int
 
 const (
-	ModalNone ModalType = iota
-	ModalInfo                  // Information message
-	ModalError                 // Error message (Crimson Pulse)
-	ModalConfirm               // Yes/No confirmation
-	ModalHelp                  // Help/keybindings
-	ModalActions               // Container actions menu
-	ModalContainerDetails      // Container info (i key)
-	ModalLoading               // Loading with progress bar
-	ModalForm                  // Interactive form with multiple fields
+	ModalNone             ModalType = iota
+	ModalInfo                       // Information message
+	ModalError                      // Error message (Crimson Pulse)
+	ModalConfirm                    // Yes/No confirmation
+	ModalHelp                       // Help/keybindings
+	ModalActions                    // Container actions menu
+	ModalContainerDetails           // Container info (i key)
+	ModalLoading                    // Loading with progress bar
+	ModalForm                       // Interactive form with multiple fields
 )
 
 // Modal represents a modal dialog
 type Modal struct {
 	Type           ModalType
 	Title          string
-	Content        string            // Main content (can be multi-line) - used if viewport is nil
-	Width          int               // Modal width (0 = auto)
-	Height         int               // Modal height (0 = auto)
-	Actions        []ModalAction     // Buttons
-	SelectedAction int               // Currently selected action index
-	progress       *progress.Model   // Progress bar for ModalLoading (nil if not used)
-	spinner        *spinner.Model    // Spinner for ModalLoading indeterminate (nil if not used)
-	viewport       *viewport.Model   // Viewport for scrollable content (nil if not used)
-	useViewport    bool              // Whether to use viewport for content
-	DisableEsc     bool              // Disable Esc key for modal dismissal (for wizard)
+	Content        string          // Main content (can be multi-line) - used if viewport is nil
+	Width          int             // Modal width (0 = auto)
+	Height         int             // Modal height (0 = auto)
+	Actions        []ModalAction   // Buttons
+	SelectedAction int             // Currently selected action index
+	progress       *progress.Model // Progress bar for ModalLoading (nil if not used)
+	spinner        *spinner.Model  // Spinner for ModalLoading indeterminate (nil if not used)
+	viewport       *viewport.Model // Viewport for scrollable content (nil if not used)
+	useViewport    bool            // Whether to use viewport for content
+	DisableEsc     bool            // Disable Esc key for modal dismissal (for wizard)
 
 	// Form fields (for ModalForm)
-	textarea      *textarea.Model   // Multiline text input
-	textinputs    []textinput.Model // Text input fields
-	checkboxes    []bool            // Checkbox states
-	focusedField  int               // Currently focused field index
-	fieldLabels   []string          // Labels for form fields
+	textarea     *textarea.Model   // Multiline text input
+	textinputs   []textinput.Model // Text input fields
+	checkboxes   []bool            // Checkbox states
+	focusedField int               // Currently focused field index
+	fieldLabels  []string          // Labels for form fields
 
 	// Mouse click state for textarea scroll tracking
-	lastTextareaLine   int  // Cursor line after last click
-	lastScrollOffset   int  // Estimated scroll offset at last click
-	scrollOffsetValid  bool // Whether lastScrollOffset is valid
+	lastTextareaLine  int  // Cursor line after last click
+	lastScrollOffset  int  // Estimated scroll offset at last click
+	scrollOffsetValid bool // Whether lastScrollOffset is valid
 }
 
 // ModalAction represents a button in the modal
 type ModalAction struct {
-	Label    string
-	Key      string // Keyboard shortcut (e.g., "y", "n", "enter")
-	IsPrimary bool  // Primary actions highlighted
+	Label     string
+	Key       string // Keyboard shortcut (e.g., "y", "n", "enter")
+	IsPrimary bool   // Primary actions highlighted
 	OnSelect  func() tea.Msg
 }
 

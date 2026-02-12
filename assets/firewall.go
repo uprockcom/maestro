@@ -21,3 +21,6 @@ var FirewallScript string
 
 //go:embed icon.png
 var NotificationIcon []byte
+
+//go:embed MAESTRO.md
+var MaestroMDTemplate string

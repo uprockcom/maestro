@@ -1,5 +1,16 @@
 # Copyright 2025 Christopher O'Connell
-# All rights reserved
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 FROM node:20
 
@@ -7,6 +18,11 @@ ARG TZ
 ENV TZ="$TZ"
 
 ARG CLAUDE_CODE_VERSION=latest
+
+# Add GitHub CLI official apt repository (Debian packages are too old)
+RUN mkdir -p /etc/apt/keyrings && \
+  wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null && \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
 
 # Install basic development tools, iptables/ipset, tmux, Python, and Go
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -46,11 +62,11 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-# Install Go 1.25.2 (architecture-aware)
+# Install Go 1.26.0 (architecture-aware)
 RUN ARCH=$(dpkg --print-architecture) && \
-  wget "https://go.dev/dl/go1.25.2.linux-${ARCH}.tar.gz" && \
-  tar -C /usr/local -xzf "go1.25.2.linux-${ARCH}.tar.gz" && \
-  rm "go1.25.2.linux-${ARCH}.tar.gz"
+  wget "https://go.dev/dl/go1.26.0.linux-${ARCH}.tar.gz" && \
+  tar -C /usr/local -xzf "go1.26.0.linux-${ARCH}.tar.gz" && \
+  rm "go1.26.0.linux-${ARCH}.tar.gz"
 
 # Set Go environment variables
 ENV PATH="/usr/local/go/bin:${PATH}"
@@ -96,7 +112,7 @@ RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhisto
 
 # Set `DEVCONTAINER` environment variable to help with orientation
 ENV DEVCONTAINER=true
-ENV MCL_CONTAINER=true
+ENV MAESTRO_CONTAINER=true
 
 # Create workspace and config directories and set permissions
 RUN mkdir -p /workspace /home/node/.claude /home/node/go && \
@@ -150,7 +166,7 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
   -a "source /usr/share/doc/fzf/examples/completion.zsh" \
   -a "export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" \
   -a "export PATH=/usr/local/go/bin:\$GOPATH/bin:\$JAVA_HOME/bin:\$GRADLE_HOME/bin:\$PATH" \
-  -a "export MCL_CONTAINER=true" \
+  -a "export MAESTRO_CONTAINER=true" \
   -x
 
 # Install Claude
@@ -161,18 +177,34 @@ RUN git config --global init.defaultBranch main && \
   git config --global user.email "maestro@container" && \
   git config --global user.name "Maestro Container"
 
-# Copy and set up firewall script
-COPY init-firewall.sh /usr/local/bin/
-COPY container-startup.sh /usr/local/bin/
-
+# Build daemon-ipc binary (privilege-isolated IPC proxy)
+COPY docker/daemon-ipc/main.go /tmp/daemon-ipc/main.go
 USER root
-RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/container-startup.sh && \
+RUN cd /tmp/daemon-ipc && \
+  CGO_ENABLED=0 go build -o /usr/local/bin/daemon-ipc main.go && \
+  rm -rf /tmp/daemon-ipc
+
+# Create dedicated user for daemon IPC (iptables uid-owner isolation)
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin maestro-ipc
+
+# Build maestro-request CLI
+COPY docker/maestro-request-go/ /tmp/maestro-request/
+RUN cd /tmp/maestro-request && \
+  CGO_ENABLED=0 go build -o /usr/local/bin/maestro-request . && \
+  rm -rf /tmp/maestro-request
+
+# Copy scripts (init-firewall.sh is the single source of truth from assets/)
+COPY assets/init-firewall.sh /usr/local/bin/
+COPY docker/container-startup.sh /usr/local/bin/
+
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/container-startup.sh /usr/local/bin/maestro-request /usr/local/bin/daemon-ipc && \
   echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /usr/sbin/dnsmasq" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /usr/bin/tee /etc/resolv.conf" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /bin/chown" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /bin/chmod" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /usr/sbin/update-ca-certificates" >> /etc/sudoers.d/node && \
+  echo "node ALL=(maestro-ipc) NOPASSWD: /usr/local/bin/daemon-ipc" >> /etc/sudoers.d/node && \
   chmod 0440 /etc/sudoers.d/node
 
 USER node

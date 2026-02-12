@@ -1,0 +1,6 @@
+# Only send what the Dockerfile needs
+*
+!assets/init-firewall.sh
+!docker/daemon-ipc/main.go
+!docker/container-startup.sh
+!docker/maestro-request-go/

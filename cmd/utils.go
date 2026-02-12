@@ -16,9 +16,7 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -35,39 +33,14 @@ func showDaemonNag() {
 		return
 	}
 
-	authDir := expandPath(config.Claude.AuthPath)
-	pidFile := filepath.Join(authDir, "daemon.pid")
-
-	// Check if daemon is running
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		// PID file doesn't exist - daemon not running
-		fmt.Println("\n💡 Tip: Start the daemon for automatic token refresh and notifications:")
-		fmt.Println("   maestro daemon start")
-		fmt.Println("   (Disable this message: add 'show_nag: false' to daemon config)")
-		return
+	// Use HTTP-based check with short timeout
+	if running, _ := isDaemonRunning(); running {
+		return // Daemon is running, don't nag
 	}
 
-	// Check if process is actually alive
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		// Invalid PID file - show nag
-		fmt.Println("\n💡 Tip: Start the daemon for automatic token refresh and notifications:")
-		fmt.Println("   maestro daemon start")
-		fmt.Println("   (Disable this message: add 'show_nag: false' to daemon config)")
-		return
-	}
-
-	// On Unix, check if process exists by sending signal 0
-	// This is more reliable than FindProcess which always succeeds on some platforms
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid))
-	if err := cmd.Run(); err != nil {
-		// Process doesn't exist
-		fmt.Println("\n💡 Tip: Start the daemon for automatic token refresh and notifications:")
-		fmt.Println("   maestro daemon start")
-		fmt.Println("   (Disable this message: add 'show_nag: false' to daemon config)")
-	}
-	// If ps succeeds, daemon is running - don't show nag
+	fmt.Println("\n💡 Tip: Start the daemon for automatic token refresh and notifications:")
+	fmt.Println("   maestro daemon start")
+	fmt.Println("   (Disable this message: add 'show_nag: false' to daemon config)")
 }
 
 // generateTmuxConfig creates a tmux configuration string with true color support
@@ -81,9 +54,8 @@ set -as terminal-features ",*:RGB"
 # Status bar configuration
 set -g status-left '[%s | %s] '
 set -g status-left-length 50
-set -g status-right '#{?window_bell_flag,🔔 ,} %%%%H:%%%%M'`, containerName, branchName)
+set -g status-right '%%%%H:%%%%M'`, containerName, branchName)
 }
-
 
 // resolveContainerName resolves a short name or full name to the actual container name
 func resolveContainerName(shortName string) string {
@@ -92,7 +64,7 @@ func resolveContainerName(shortName string) string {
 		return shortName
 	}
 
-	// If already has legacy prefix, return as-is (for backward compatibility)
+	// If already has legacy "mcl-" prefix, return as-is (for backward compatibility)
 	if strings.HasPrefix(shortName, "mcl-") {
 		return shortName
 	}

@@ -21,9 +21,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/paths"
-	"github.com/spf13/cobra"
 )
 
 var refreshTokensCmd = &cobra.Command{
@@ -68,7 +68,7 @@ func runRefreshTokens(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  ✗ Host: Could not read credentials (%v)\n", err)
 	}
 
-	// 2. Check all running containers (including legacy "mcl-" prefix for backward compatibility)
+	// 2. Check all running containers (including legacy prefix for backward compatibility)
 	containers, err := container.GetRunningContainers(config.Containers.Prefix)
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
