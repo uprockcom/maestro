@@ -1,0 +1,455 @@
+==============================================================================
+  Integration Test Procedure: AskUserQuestion / claude answer Flow
+==============================================================================
+
+PURPOSE
+-------
+Verify the structured question-answering loop between parent and child
+containers. When a child agent uses Claude's AskUserQuestion tool, the parent
+must be able to:
+  - Detect that the child is idle (blocked on a question)
+  - Read the pending question with its options via `claude read`
+  - Answer the question using `claude answer` (option selection + freeform text)
+  - Confirm the child received and acted on the answer
+
+This test exercises the `claude answer` command, which is distinct from
+`claude send`. While `claude send` injects freeform text, `claude answer`
+interacts with a structured AskUserQuestion prompt, selecting specific options
+and providing typed text responses.
+
+Commands exercised:
+  - maestro-request new              (spawn child)
+  - maestro-request wait request     (lifecycle polling)
+  - maestro-request wait idle        (idle detection on pending question)
+  - maestro-request claude read      (read messages + pending_question)
+  - maestro-request claude answer    (answer structured question)
+  - maestro-request claude send      (send follow-up instruction)
+
+Unlike the knock-knock test (parent-child-communication.txt) which uses
+`claude send` for free-form back-and-forth, this test validates the structured
+AskUserQuestion → claude answer path, including option selection with --select
+and freeform text with --text.
+
+IMPORTANT: The child is an LLM agent, so the exact question wording and options
+will vary between runs. Pass criteria focus on structural outcomes (pending
+question detected, answer delivered, child acknowledged) rather than exact
+string matches.
+
+PREREQUISITES
+-------------
+- Running inside a Maestro-managed Docker container
+- Daemon is reachable: maestro-request status
+- Parent container has network access to create children
+
+TIMING EXPECTATIONS
+-------------------
+- Container creation (pending -> fulfilled): 10-60s
+- Child startup to first idle (question asked): 15-45s after fulfilled
+  (child sleeps 5s, then Claude generates and asks a question)
+- Answer delivery to second idle: 5-20s
+- Child exit after done instruction: 5-15s
+- Total test duration: 2-5 minutes
+
+CHILD PROMPT
+------------
+The child is instructed to sleep briefly, then ask a question on a specific
+topic, using AskUserQuestion. The topic constraint (travel or cooking) ensures
+the question is predictable in theme but unpredictable in exact content — the
+parent cannot know the question in advance and must read it from the child.
+
+  PROMPT:
+  You have a simple task. First, sleep for 5 seconds using the Bash tool.
+  After sleeping, ask your parent a question about either travel or cooking
+  — pick whichever topic you prefer and ask something specific and
+  interesting. Use the AskUserQuestion tool to ask it. After you get an
+  answer, use the Bash tool to run: echo 'PARENT ANSWERED: <the answer you
+  received>' (substituting the actual answer text). Then stop and wait for
+  further instructions. Do NOT request done unless explicitly told to.
+
+Key design choices:
+  - The 5-second sleep ensures the parent has time to set up wait idle before
+    the question arrives.
+  - The topic constraint (travel or cooking) makes verification easier — we
+    can check the question is on-topic without knowing exact wording.
+  - The echo instruction forces the child to demonstrate it received and
+    parsed the answer, not just that the IPC command succeeded.
+  - The "wait for further instructions" keeps the child alive so the parent
+    can read the confirmation before instructing done.
+
+
+==============================================================================
+TEST 1: Spawn child and wait for container creation
+==============================================================================
+
+Rationale:
+  Baseline: spawn a child and confirm the container is created. Identical
+  pattern to other tests — verifies `new` and `wait request ... fulfilled`.
+
+Commands:
+
+  OUTPUT=$(maestro-request new "You have a simple task. First, sleep for 5 seconds using the Bash tool. After sleeping, ask your parent a question about either travel or cooking — pick whichever topic you prefer and ask something specific and interesting. Use the AskUserQuestion tool to ask it. After you get an answer, use the Bash tool to run: echo 'PARENT ANSWERED: <the answer you received>' (substituting the actual answer text). Then stop and wait for further instructions. Do NOT request done unless explicitly told to." 2>&1)
+  ID=$(echo "$OUTPUT" | grep -oP 'ID: \K[a-f0-9-]+')
+  echo "Request ID: $ID"
+
+  # Wait for container to be created
+  maestro-request wait request "$ID" fulfilled --timeout 120
+
+Pass criteria:
+  - `maestro-request new` exits 0 and prints "Request accepted (ID: <uuid>)"
+  - ID is a valid UUID (non-empty, matches [a-f0-9-]+ pattern)
+  - `wait request` exits 0
+  - JSON output has "status": "fulfilled"
+  - JSON output has "child_container" set to a non-empty string
+  - Wall clock: <= 120s (typically 10-30s)
+
+Fail conditions:
+  - Empty or missing ID (new command failed)
+  - wait request exits 1 (creation failed — check "error" field)
+  - wait request times out (daemon not processing requests)
+
+
+==============================================================================
+TEST 2: Wait for child to become idle — question should be pending
+==============================================================================
+
+Rationale:
+  After the child container starts, Claude processes the prompt, sleeps 5
+  seconds, then calls AskUserQuestion. This blocks the child, making it idle.
+  The parent detects this via `wait idle`. This is the critical test — idle
+  detection must fire specifically because AskUserQuestion is pending, not
+  just because Claude paused briefly.
+
+Command:
+
+  maestro-request wait idle "$ID" --timeout 300
+
+Pass criteria:
+  - Exit code: 0
+  - JSON output has "status": "fulfilled"
+  - Wall clock: <= 120s after fulfilled (typically 15-45s due to 5s sleep +
+    Claude processing time)
+
+Fail conditions:
+  - Exit code 1 with "failed" status (child exited or Claude crashed)
+  - Timeout (child never became idle — it may have skipped asking a question
+    and instead printed something and stopped)
+
+Notes:
+  - If the child doesn't become idle, it likely failed to call
+    AskUserQuestion. Check `claude read` output to diagnose.
+
+
+==============================================================================
+TEST 3: Read child messages — verify pending question exists
+==============================================================================
+
+Rationale:
+  After detecting idle, the parent reads the child's messages. The key
+  assertion is that the JSON output contains a "pending_question" field with
+  a structured question. This is what distinguishes an AskUserQuestion idle
+  from a regular idle (where the child just finished output and is waiting).
+
+Command:
+
+  maestro-request claude read "$ID" --last 10
+
+Pass criteria:
+  - Exit code: 0
+  - JSON output has "status": "fulfilled"
+  - JSON "messages" array is non-empty
+  - JSON output contains a "pending_question" field (NOT null)
+  - "pending_question.questions" is a non-empty array
+  - Each question has "question", "header", "options" fields
+  - "options" is a non-empty array with "label" and "description" per entry
+  - The question text relates to travel or cooking (substring match for
+    "travel", "cook", "cuisine", "destination", "recipe", "food", "flavor",
+    or similar topic keywords)
+
+Fail conditions:
+  - Exit code 1 (child container exited)
+  - Empty messages array (tmux capture failed)
+  - No "pending_question" in output (child didn't use AskUserQuestion, or
+    the daemon didn't capture it)
+  - Question is completely off-topic (child ignored the topic constraint)
+
+Notes:
+  - The exact question and option labels are LLM-generated and will vary.
+    The parent should extract one option label from the response for use in
+    TEST 4.
+  - The human-readable output (printed before JSON) will show a
+    "--- PENDING QUESTION ---" section with the question details.
+
+
+==============================================================================
+TEST 4: Answer the pending question with claude answer
+==============================================================================
+
+Rationale:
+  This is the core test. The parent uses `claude answer` to select one of
+  the options from the pending question and provide freeform text. The daemon
+  must route this answer back to the child's Claude session and unblock the
+  AskUserQuestion tool call.
+
+  The parent must extract an option label from TEST 3's output and use it
+  with --select. It should also provide --text with additional context.
+
+Command:
+
+  # Use the first option label from TEST 3's pending_question output.
+  # Example (will vary per run):
+  maestro-request claude answer "$ID" \
+    --select "<first option label from TEST 3>" \
+    --text "Some additional detail or explanation."
+
+  # Concrete example from baseline run:
+  maestro-request claude answer "$ID" \
+    --select "Spice + sweet" \
+    --text "Cardamom in coffee is a revelation."
+
+Pass criteria:
+  - Exit code: 0
+  - Output: "Question answered successfully."
+
+Fail conditions:
+  - Exit code 1 (child exited before answer could be delivered)
+  - Error message about no pending question (race condition or idle detection
+    was a false positive)
+  - Error about invalid option label (label mismatch — check for exact
+    string match with what claude read returned)
+
+
+==============================================================================
+TEST 5: Wait for child to process the answer and become idle again
+==============================================================================
+
+Rationale:
+  After receiving the answer, the child should:
+    1. Process the answer from AskUserQuestion
+    2. Run `echo 'PARENT ANSWERED: <answer>'` via Bash
+    3. Stop and wait for further instructions (becoming idle again)
+
+  The second idle detection confirms the full round-trip: question asked →
+  answer delivered → child acted on it → child is waiting again.
+
+Command:
+
+  maestro-request wait idle "$ID" --timeout 120
+
+Pass criteria:
+  - Exit code: 0
+  - JSON output has "status": "fulfilled"
+  - Wall clock: <= 60s (typically 5-20s)
+
+Fail conditions:
+  - Exit code 1 (child exited — it may have called done prematurely)
+  - Timeout (Claude is stuck processing the answer, or the child went into
+    an unexpected state)
+
+Notes:
+  - Unlike TEST 2, there should be NO pending_question this time. The child
+    should be idle because it finished its work and is waiting for
+    instructions, not because it's asking another question.
+
+
+==============================================================================
+TEST 6: Read child messages — confirm answer was received and echoed
+==============================================================================
+
+Rationale:
+  The final verification: read the child's messages and confirm it
+  acknowledged the answer. The child was instructed to echo the answer via
+  Bash, so we should see evidence of the answer text in the output.
+
+Command:
+
+  maestro-request claude read "$ID" --last 10
+
+Pass criteria:
+  - Exit code: 0
+  - JSON "messages" array has more entries than in TEST 3 (new messages
+    appeared after the answer was delivered)
+  - At least one assistant message references the answer content — look for
+    the selected option label or the freeform text (substring match)
+  - No "pending_question" in output (child is not blocked on a question)
+  - The child's message indicates it is waiting for further instructions
+
+Fail conditions:
+  - Exit code 1 (child exited)
+  - Messages unchanged from TEST 3 (answer was not delivered or not processed)
+  - No reference to the answer content (child didn't echo or acknowledge it)
+
+Notes:
+  - The child might paraphrase or summarize the answer rather than echoing
+    it verbatim. Look for the option label (e.g., "Spice + sweet") as a
+    reliable substring to match.
+  - The echo output from the Bash tool may or may not appear in the
+    assistant messages depending on how Claude formats tool results.
+
+
+==============================================================================
+TEST 7: Send done instruction and wait for child exit
+==============================================================================
+
+Rationale:
+  Clean up: instruct the child to call `maestro-request done` and confirm
+  the container exits. This tests `claude send` for a follow-up instruction
+  and `wait request ... child_exited` for lifecycle completion.
+
+Commands:
+
+  # Send the done instruction
+  maestro-request claude send "$ID" \
+    "Great work! You can now call maestro-request done to signal that you are finished."
+
+  # Wait for child to exit
+  maestro-request wait request "$ID" child_exited --timeout 120
+
+Pass criteria:
+  - `claude send` exits 0 with "Message sent successfully."
+  - `wait request` exits 0
+  - JSON output has "status": "child_exited"
+  - JSON output has "child_exited_at" set to a non-empty timestamp
+  - Wall clock: <= 60s (typically 5-15s)
+
+Fail conditions:
+  - `claude send` fails (child already exited)
+  - `wait request` times out (child didn't call done — it may have ignored
+    the instruction or `maestro-request done` failed inside the child)
+  - Status is "failed" instead of "child_exited"
+
+
+==============================================================================
+FULL TEST WALKTHROUGH (for an agent to execute)
+==============================================================================
+
+This section provides a step-by-step script that a parent agent can follow.
+Each step includes the command, what to check, and how to proceed.
+
+Step 1 — Verify daemon connectivity:
+
+  maestro-request status
+  # Must exit 0. If not, abort.
+
+Step 2 — Spawn the child:
+
+  OUTPUT=$(maestro-request new "<prompt from CHILD PROMPT section>" 2>&1)
+  ID=$(echo "$OUTPUT" | grep -oP 'ID: \K[a-f0-9-]+')
+  # Verify ID is non-empty. If empty, abort.
+
+Step 3 — Wait for container creation:
+
+  maestro-request wait request "$ID" fulfilled --timeout 120
+  # Must exit 0. Record child_container name from output.
+
+Step 4 — Wait for first idle (child asks a question):
+
+  maestro-request wait idle "$ID" --timeout 300
+  # Must exit 0.
+
+Step 5 — Read messages and extract the pending question:
+
+  maestro-request claude read "$ID" --last 10
+  # Must exit 0. Verify "pending_question" is present in JSON output.
+  # Extract one option label from pending_question.questions[0].options.
+  # Record the question text for verification.
+
+Step 6 — Answer the question:
+
+  maestro-request claude answer "$ID" \
+    --select "<option label from step 5>" \
+    --text "<some additional context>"
+  # Must exit 0 with "Question answered successfully."
+
+Step 7 — Wait for second idle (child processes answer):
+
+  maestro-request wait idle "$ID" --timeout 120
+  # Must exit 0.
+
+Step 8 — Read messages and confirm answer was received:
+
+  maestro-request claude read "$ID" --last 10
+  # Must exit 0. Verify:
+  #   - New messages appeared since step 5
+  #   - Child references the answer (option label or text appears)
+  #   - No pending_question (child is just waiting, not asking)
+
+Step 9 — Instruct child to request done:
+
+  maestro-request claude send "$ID" \
+    "Great work! You can now call maestro-request done to signal that you are finished."
+  # Must exit 0 with "Message sent successfully."
+
+Step 10 — Wait for child exit:
+
+  maestro-request wait request "$ID" child_exited --timeout 120
+  # Must exit 0 with "status": "child_exited".
+
+Step 11 — Summary:
+
+  If all steps passed:
+    - Container lifecycle: pending -> fulfilled -> child_exited     OK
+    - Idle detection: 2 cycles (question pending, then waiting)     OK
+    - Pending question: detected with structured options            OK
+    - claude answer: option selected + freeform text delivered      OK
+    - Answer receipt: child acknowledged and echoed the answer      OK
+    - Child exit: clean exit after done instruction                 OK
+
+  Count: 8 IPC operations across 6 distinct command types.
+
+
+==============================================================================
+KNOWN VARIABILITY
+==============================================================================
+
+Since the child is an LLM agent, certain aspects are non-deterministic:
+
+1. QUESTION TOPIC: The child chooses between travel and cooking. Either is
+   valid. The question itself will be different each run — it might ask about
+   favorite destinations, cooking techniques, flavor pairings, etc.
+
+2. QUESTION OPTIONS: The AskUserQuestion options (labels and descriptions)
+   are LLM-generated. There will typically be 2-4 options. The parent must
+   extract and use the exact label string when calling `claude answer`.
+
+3. ANSWER ACKNOWLEDGMENT: The child is instructed to echo the answer, but
+   the exact format varies. It might say "PARENT ANSWERED: Spice + sweet"
+   or summarize it as "Parent chose spice + sweet — cardamom in coffee."
+   Check for substring matches on the option label.
+
+4. TIMING: The 5-second sleep in the child prompt adds baseline latency.
+   Claude's processing time for generating a question and processing an
+   answer adds variable latency on top. Timeouts are generous to
+   accommodate slow runs.
+
+5. QUESTION TYPE: The child might use multiSelect: true or false. The test
+   works with either — `claude answer` supports both. If multiSelect is
+   true, a single --select still works.
+
+6. IDLE FALSE POSITIVES: In rare cases, idle detection might trigger before
+   the child calls AskUserQuestion (e.g., during tool execution pauses).
+   If `claude read` shows no pending_question, wait for idle again.
+
+
+==============================================================================
+BASELINE RESULTS (2026-02-13)
+==============================================================================
+
+First successful run results:
+
+  Test 1 (spawn + fulfilled):         ~18s
+  Test 2 (first idle — question):     ~30s
+  Test 3 (read pending question):     ~1s
+  Test 4 (claude answer):             ~1s
+  Test 5 (second idle — after answer): ~6s
+  Test 6 (read confirmation):         ~1s
+  Test 7 (send done + child_exited):  ~14s
+  Total:                              ~71s
+
+  Question topic: Cooking
+  Question asked: "What's the most unexpectedly delicious flavor combination
+                   you've ever discovered while cooking — something that sounds
+                   weird on paper but works brilliantly?"
+  Options offered: Sweet + savory, Acid + rich, Herb + fruit, Spice + sweet
+  Answer given: Spice + sweet (with text about cardamom in coffee)
+  Child confirmed: "Parent answered: Spice + sweet — cardamom in coffee and
+                    black pepper on fresh strawberries"

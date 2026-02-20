@@ -115,8 +115,9 @@ ENV DEVCONTAINER=true
 ENV MAESTRO_CONTAINER=true
 
 # Create workspace and config directories and set permissions
-RUN mkdir -p /workspace /home/node/.claude /home/node/go && \
-  chown -R node:node /workspace /home/node/.claude /home/node/go
+RUN mkdir -p /workspace /home/node/.claude /home/node/go \
+  /home/node/.maestro/state /home/node/.maestro/logs /home/node/.maestro/pending-messages && \
+  chown -R node:node /workspace /home/node/.claude /home/node/go /home/node/.maestro
 
 WORKDIR /workspace
 
@@ -193,11 +194,17 @@ RUN cd /tmp/maestro-request && \
   CGO_ENABLED=0 go build -o /usr/local/bin/maestro-request . && \
   rm -rf /tmp/maestro-request
 
+# Build maestro-agent (container-side agent process manager)
+COPY docker/maestro-agent/ /tmp/maestro-agent/
+RUN cd /tmp/maestro-agent && \
+  CGO_ENABLED=0 go build -o /usr/local/bin/maestro-agent . && \
+  rm -rf /tmp/maestro-agent
+
 # Copy scripts (init-firewall.sh is the single source of truth from assets/)
 COPY assets/init-firewall.sh /usr/local/bin/
 COPY docker/container-startup.sh /usr/local/bin/
 
-RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/container-startup.sh /usr/local/bin/maestro-request /usr/local/bin/daemon-ipc && \
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/container-startup.sh /usr/local/bin/maestro-request /usr/local/bin/daemon-ipc /usr/local/bin/maestro-agent && \
   echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /usr/sbin/dnsmasq" >> /etc/sudoers.d/node && \
   echo "node ALL=(root) NOPASSWD: /usr/bin/tee /etc/resolv.conf" >> /etc/sudoers.d/node && \

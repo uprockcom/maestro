@@ -1,0 +1,681 @@
+==============================================================================
+  Integration Test Procedure: maestro-agent Lifecycle Management
+==============================================================================
+
+PURPOSE
+-------
+Verify the maestro-agent container-side process manager correctly handles
+Claude's lifecycle: blocking Stop hook with concurrent watchers, message
+delivery via queue, user connection detection, idle wake-up, and the clear
+timer kill-restart failsafe.
+
+This test exercises the maestro-agent binary and its integration with Claude
+Code's hook system:
+  - Blocking Stop hook with queue/connected/script watchers
+  - Message queue delivery (stderr + exit 2)
+  - Connected watcher (tmux client detection, exit 0)
+  - Service idle wake-up (sends "continue" via tmux)
+  - Clear timer kill-restart (respawns Claude after timeout)
+  - Heartbeat generation and delivery
+
+IMPORTANT: Unlike the other integration tests in this directory, this test
+runs from the HOST machine, not from inside a container. It uses `docker exec`
+to inspect container internals. The test creates a dedicated container with a
+minimal dummy agent configuration.
+
+PREREQUISITES
+-------------
+- maestro binary built and available (`make build`)
+- Docker image built with maestro-agent (`make docker`)
+- No container named `maestro-test-lifecycle-1` currently running
+
+TIMING EXPECTATIONS
+-------------------
+- Container creation + Claude startup: 15-45s
+- Stop hook entry after Claude finishes: 5-15s
+- Queue watcher detection: 1-3s (polls every 1s)
+- Connected watcher detection: 2-4s (polls every 2s)
+- Service idle wake-up: 2-4s (polls every 2s)
+- Clear timer: configurable (use 60s for testing)
+- Kill-restart cycle: 5-15s
+- Total test duration: 5-10 minutes
+
+DUMMY AGENT CONFIGURATION
+--------------------------
+The test uses a minimal agent manifest and a trivial prompt. The agent has
+no real work to do — its only purpose is to process prompts, enter the Stop
+hook, and respond to lifecycle events.
+
+agent.yml:
+  type: test
+  bootstrap:
+    strategy: pipe
+    skill: ""
+    context:
+      files: []
+  on_stop:
+    watchers:
+      - queue
+      - connected
+  on_idle:
+    clear_after: 60
+  heartbeat:
+    interval: 0
+  on_message:
+    delivery: batch
+
+Bootstrap prompt:
+  You are a test agent. When you receive a message, acknowledge it briefly
+  (one sentence) and stop. Do not take any other action.
+
+This configuration:
+  - Has queue + connected watchers (no script watcher, to avoid git deps)
+  - Sets clear_after to 60s for quick testing
+  - Disables heartbeat (interval: 0) to avoid interference
+  - Uses a trivial prompt that processes quickly
+
+
+==============================================================================
+SETUP: Create test container
+==============================================================================
+
+Commands:
+
+  # Create a test container with a simple prompt
+  maestro new -en "You are a test agent. When you receive a message, acknowledge it briefly in one sentence and stop. Do not take any other action." test-lifecycle
+
+  # Note the container name from output (e.g., maestro-test-lifecycle-1)
+  CONTAINER="maestro-test-lifecycle-1"
+
+  # Wait for Claude to start (SessionStart hook fires)
+  sleep 15
+
+  # Write the test agent manifest
+  docker exec -i "$CONTAINER" sh -c 'cat > /home/node/.maestro/agent.yml' <<'EOF'
+  type: test
+  bootstrap:
+    strategy: pipe
+  on_stop:
+    watchers:
+      - queue
+      - connected
+  on_idle:
+    clear_after: 60
+  heartbeat:
+    interval: 0
+  on_message:
+    delivery: batch
+  EOF
+
+  # Verify setup
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  docker exec "$CONTAINER" cat /home/node/.claude/settings.json | grep -c "maestro-agent"
+
+Pass criteria:
+  - Container starts successfully
+  - agent-state file exists (value: "active" or "waiting")
+  - settings.json contains maestro-agent hook references (count >= 4)
+
+Fail conditions:
+  - Container fails to start (check `docker logs $CONTAINER`)
+  - No agent-state file (maestro-agent hooks not wired in settings.json)
+  - settings.json missing maestro-agent (writeClaudeSettings not working)
+
+
+==============================================================================
+TEST 1: Blocking Stop hook — enters waiting state
+==============================================================================
+
+Rationale:
+  After Claude processes the bootstrap prompt and finishes, the Stop hook
+  fires and enters a blocking wait with watchers. The state file should
+  show "waiting" and the maestro-agent hook process should be alive
+  (not a zombie).
+
+Commands:
+
+  # Wait for Claude to finish processing
+  sleep 30
+
+  # Check state
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+
+  # Verify hook process is alive (not defunct/zombie)
+  docker exec "$CONTAINER" ps aux | grep "maestro-agent hook stop" | grep -v grep | grep -v defunct
+
+  # Check logs for blocking wait entry
+  docker exec "$CONTAINER" grep "entering blocking wait" /home/node/.maestro/logs/maestro-agent.log
+
+Pass criteria:
+  - agent-state reads "waiting"
+  - A live (non-zombie) maestro-agent hook stop process exists
+  - Log contains "Stop hook: entering blocking wait"
+
+Fail conditions:
+  - State is "active" (Claude still processing — wait longer)
+  - State is "idle" with no hook process (hook exited prematurely — check
+    if the 24-hour timeout is set in settings.json)
+  - Hook process is zombie (<defunct>) — Claude's hook timeout killed it.
+    Verify settings.json has "timeout": 86400 on the Stop hook.
+  - No log file (InitLog failed — check directory permissions)
+
+
+==============================================================================
+TEST 2: Queue message delivery — watcher detects and delivers
+==============================================================================
+
+Rationale:
+  While the Stop hook is in blocking wait, queue a message. The queue
+  watcher (polling every 1s) should detect it, deliver it via stderr +
+  exit 2, and Claude should process it. State should transition:
+  waiting -> active (message delivered) -> waiting (new stop hook).
+
+Commands:
+
+  # Confirm state is "waiting" before proceeding
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: waiting
+
+  # Queue a test message
+  docker exec "$CONTAINER" bash -c \
+    'echo "Test message 1: please acknowledge." > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+
+  # Wait for delivery + processing
+  sleep 10
+
+  # Check state (should be back to "waiting" after processing)
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+
+  # Check logs for delivery
+  docker exec "$CONTAINER" grep "watcher fired" /home/node/.maestro/logs/maestro-agent.log | tail -1
+
+  # Verify queue is empty (message was consumed)
+  docker exec "$CONTAINER" bash -c 'ls /home/node/.maestro/pending-messages/*.txt 2>/dev/null | wc -l'
+
+Pass criteria:
+  - State returns to "waiting" (Claude processed message, new stop hook entered)
+  - Log shows 'watcher fired' with trigger 'queue(1)'
+  - Queue is empty (0 files)
+  - Delivery latency: < 5s from queue write to watcher fire (check log timestamps)
+
+Fail conditions:
+  - State stuck at "waiting" with message still in queue (watcher not polling)
+  - State is "active" after 10s (Claude still processing — wait longer)
+  - Queue not empty (DrainQueue failed — check file permissions)
+  - Log shows no watcher fire (hook process may have died)
+
+
+==============================================================================
+TEST 3: Connected watcher — user attach triggers exit 0
+==============================================================================
+
+Rationale:
+  When a user connects to the container's tmux session, the connected
+  watcher should detect it and the Stop hook should exit 0 (allow idle).
+  State transitions: waiting -> idle.
+
+Commands:
+
+  # Confirm state is "waiting"
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: waiting
+
+  # Connect to tmux (user attaches)
+  maestro connect test-lifecycle
+  # Wait ~3 seconds for the connected watcher to poll, then detach (Ctrl-B d)
+
+  # After detaching, check state
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+
+  # Check logs
+  docker exec "$CONTAINER" grep "connected" /home/node/.maestro/logs/maestro-agent.log | tail -1
+
+  # Verify stop hook process exited
+  docker exec "$CONTAINER" ps aux | grep "maestro-agent hook stop" | grep -v grep | grep -v defunct
+
+Pass criteria:
+  - State is "idle" after detach
+  - Log shows 'watcher fired' with trigger 'connected'
+  - No live maestro-agent hook stop process (it exited 0)
+
+Fail conditions:
+  - State still "waiting" (connected watcher not detecting tmux client —
+    check that `tmux list-clients -t main` returns output inside container)
+  - State jumped to "active" (a queued message beat the connected watcher)
+  - Hook process is zombie (crashed instead of clean exit)
+
+Timing note:
+  The connected watcher polls every 2 seconds. You must stay connected for
+  at least 3 seconds to guarantee detection. Connect, wait for the REPL
+  prompt to appear (stop hook finishes), then detach.
+
+
+==============================================================================
+TEST 4: Service idle wake-up — message arrives while idle
+==============================================================================
+
+Rationale:
+  When Claude is idle (at the REPL prompt, no stop hook running) and a
+  message arrives in the queue, the service should detect it, send
+  "continue" via tmux to wake Claude, and the prompt hook should deliver
+  the message. State: idle -> active.
+
+Commands:
+
+  # Confirm state is "idle" (from TEST 3)
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: idle
+
+  # Queue a message
+  docker exec "$CONTAINER" bash -c \
+    'echo "Test message 2: wake-up test." > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+
+  # Wait for service to detect and wake Claude
+  sleep 8
+
+  # Check state
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+
+  # Check logs for wake-up
+  docker exec "$CONTAINER" grep -E "waking Claude|Sending.*continue" /home/node/.maestro/logs/maestro-agent.log | tail -2
+
+  # Verify queue is empty
+  docker exec "$CONTAINER" bash -c 'ls /home/node/.maestro/pending-messages/*.txt 2>/dev/null | wc -l'
+
+Pass criteria:
+  - State is "active" or "waiting" (Claude woke up and processed the message)
+  - Log shows "Messages found while idle, waking Claude"
+  - Log shows "Sending 'continue' to wake Claude from idle"
+  - Queue is empty
+
+Fail conditions:
+  - State still "idle" with message in queue (service not detecting idle +
+    queued messages — check service process is running)
+  - Service not running (check: `ps aux | grep "maestro-agent service"`)
+  - "continue" sent but Claude didn't wake (tmux send-keys failed)
+
+
+==============================================================================
+TEST 5: Clear timer — kill-restart after idle timeout
+==============================================================================
+
+Rationale:
+  When Claude has been idle for longer than clear_after seconds and no user
+  is connected, the service performs a kill-restart: kills the old Claude
+  process, respawns the tmux pane with a fresh piped bootstrap, and waits
+  for the SessionStart hook to confirm readiness.
+
+  This test uses the 60s clear_after from the agent.yml written in SETUP.
+
+Commands:
+
+  # First, get Claude into idle state via quick connect/disconnect
+  # (wait for "waiting" state from previous test)
+  sleep 30
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: waiting
+
+  # Quick connect + disconnect to trigger connected watcher -> idle
+  maestro connect test-lifecycle
+  # Wait 3 seconds, then detach (Ctrl-B d)
+
+  # Confirm idle state and note the clear timer start
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: idle
+  docker exec "$CONTAINER" grep "Clear timer started" /home/node/.maestro/logs/maestro-agent.log | tail -1
+  # Note the timestamp — clear fires 60s later
+
+  # Wait 75 seconds for clear timer to fire + restart to complete
+  sleep 75
+
+  # Check state after restart
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+
+  # Check logs for the full kill-restart sequence
+  docker exec "$CONTAINER" grep -E "Clear timer expired|kill-restart|Killing Claude|restarted|ready after restart" \
+    /home/node/.maestro/logs/maestro-agent.log | tail -5
+
+  # Verify a new Claude process is running
+  docker exec "$CONTAINER" ps aux | grep "^node.*claude$" | grep -v grep | grep -v defunct
+
+  # Verify tmux session exists
+  docker exec "$CONTAINER" tmux list-sessions
+
+Pass criteria:
+  - State is "active" or "waiting" (Claude restarted and processing)
+  - Log shows this sequence:
+    1. "Clear timer expired, transitioning to clearing"
+    2. "Performing kill-restart clear"
+    3. "Killing Claude process via pgrep" (or "via PID file")
+    4. "Claude restarted, waiting for readiness"
+    5. "Claude ready after restart"
+  - A live (non-zombie) claude process exists
+  - Tmux session "main" exists
+  - Clear timer fired exactly clear_after seconds after "Clear timer started"
+
+Fail conditions:
+  - State stuck at "idle" (clear timer didn't fire — check clear_after
+    value in agent.yml)
+  - State is "clearing" or "starting" (restart stalled — check logs for
+    errors)
+  - Log shows "Kill-restart failed" (check error message)
+  - Log shows "Timeout waiting for Claude readiness" (Claude didn't start
+    properly — check if bootstrap prompt exists at /tmp/maestro-bootstrap.txt)
+  - No claude process after restart (kill succeeded but respawn failed —
+    check tmux session state)
+  - Log shows "Tmux respawn failed, creating new session" — this is
+    acceptable (fallback path), but respawn should work if Claude was the
+    only process in the pane
+
+
+==============================================================================
+TEST 6: Message preempts clear timer — no spurious restart
+==============================================================================
+
+Rationale:
+  If a message arrives while Claude is idle and the clear timer is running,
+  the service should wake Claude (cancelling the clear timer) instead of
+  letting the timer fire and doing a kill-restart.
+
+Commands:
+
+  # Get Claude into idle state again (wait for waiting, then connect/disconnect)
+  sleep 30
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: waiting
+
+  maestro connect test-lifecycle
+  # Wait 3 seconds, detach (Ctrl-B d)
+
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: idle
+
+  # Note the clear timer start time
+  docker exec "$CONTAINER" grep "Clear timer started" /home/node/.maestro/logs/maestro-agent.log | tail -1
+
+  # Wait 30 seconds (half the 60s clear_after), then queue a message
+  sleep 30
+  docker exec "$CONTAINER" bash -c \
+    'echo "Preemption test: this should wake Claude before clear timer fires." > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+
+  # Wait for wake-up
+  sleep 8
+
+  # Check state — should be active, NOT clearing
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+
+  # Wait past the original 60s mark (another 30s)
+  sleep 30
+
+  # Verify clear timer did NOT fire
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Count "Clear timer expired" entries — should NOT have a new one from this cycle
+  docker exec "$CONTAINER" grep -c "Clear timer expired" /home/node/.maestro/logs/maestro-agent.log
+
+Pass criteria:
+  - State went from "idle" -> "active" after message (not "clearing")
+  - After waiting past the 60s mark, no new "Clear timer expired" log entry
+  - Claude processed the message normally (state is "active" or "waiting")
+
+Fail conditions:
+  - State went to "clearing" (clear timer was not cancelled when Claude woke)
+  - New "Clear timer expired" entry appeared (timer ran despite wake-up)
+  - State stuck at "idle" (service didn't detect the queued message)
+
+
+==============================================================================
+TEST 7: Clean stderr — no log contamination in message delivery
+==============================================================================
+
+Rationale:
+  The Stop hook delivers messages to Claude via stderr (exit 2). Log output
+  from maestro-agent must NOT appear in stderr, or Claude will see log
+  lines mixed with the actual message content. The suppressStderr flag
+  in hook commands prevents this.
+
+Commands:
+
+  # Wait for "waiting" state
+  sleep 30
+  docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state
+  # Expected: waiting
+
+  # Queue a message with a known marker
+  docker exec "$CONTAINER" bash -c \
+    'echo "MARKER_CLEAN_STDERR_TEST" > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+
+  # Wait for delivery
+  sleep 10
+
+  # Capture tmux pane content and look for log-like lines
+  docker exec "$CONTAINER" tmux capture-pane -t main:0 -p -S -30 > /tmp/test-tmux-capture.txt
+
+  # Check for log contamination — these patterns should NOT appear in tmux output
+  grep -c '{"time":' /tmp/test-tmux-capture.txt
+  grep -c '\[INFO\]' /tmp/test-tmux-capture.txt
+  grep -c '\[DEBUG\]' /tmp/test-tmux-capture.txt
+
+  # The marker text SHOULD appear (it was delivered as a message)
+  grep -c 'MARKER_CLEAN_STDERR_TEST' /tmp/test-tmux-capture.txt
+
+Pass criteria:
+  - Zero matches for JSON log patterns ({"time":) in tmux capture
+  - Zero matches for [INFO] or [DEBUG] in tmux capture
+  - At least one match for MARKER_CLEAN_STDERR_TEST
+  - Log file still has entries (logging to file still works)
+
+Fail conditions:
+  - JSON log entries appear in tmux capture (suppressStderr not set)
+  - Marker text missing from tmux capture (message wasn't delivered)
+
+
+==============================================================================
+CLEANUP
+==============================================================================
+
+Commands:
+
+  maestro stop test-lifecycle
+  maestro cleanup
+
+  # Or to just stop without removing:
+  docker stop "$CONTAINER"
+
+
+==============================================================================
+FULL TEST WALKTHROUGH
+==============================================================================
+
+This section provides the complete sequence for running all tests. Each step
+includes wait times tuned for typical performance. Adjust if your machine is
+slower.
+
+  # --- SETUP ---
+  maestro new -en "You are a test agent. When you receive a message, acknowledge it briefly in one sentence and stop. Do not take any other action." test-lifecycle
+  CONTAINER="maestro-test-lifecycle-1"
+  sleep 15
+
+  # Write agent manifest
+  docker exec -i "$CONTAINER" sh -c 'cat > /home/node/.maestro/agent.yml' <<'MANIFEST'
+  type: test
+  bootstrap:
+    strategy: pipe
+  on_stop:
+    watchers:
+      - queue
+      - connected
+  on_idle:
+    clear_after: 60
+  heartbeat:
+    interval: 0
+  on_message:
+    delivery: batch
+  MANIFEST
+
+  # Verify setup
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state 2>/dev/null)
+  HOOKS=$(docker exec "$CONTAINER" grep -c "maestro-agent" /home/node/.claude/settings.json)
+  echo "State: $STATE, Hook refs: $HOOKS"
+  # Expected: State: active or waiting, Hook refs: >= 4
+
+  # --- TEST 1: Blocking Stop hook ---
+  sleep 30
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state)
+  HOOK_ALIVE=$(docker exec "$CONTAINER" ps aux | grep "maestro-agent hook stop" | grep -v grep | grep -v defunct | wc -l)
+  echo "TEST 1 — State: $STATE, Hook alive: $HOOK_ALIVE"
+  # PASS: State=waiting, Hook alive >= 1
+
+  # --- TEST 2: Queue message delivery ---
+  docker exec "$CONTAINER" bash -c 'echo "Test message 1: please acknowledge." > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+  sleep 15
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state)
+  QUEUE=$(docker exec "$CONTAINER" bash -c 'ls /home/node/.maestro/pending-messages/*.txt 2>/dev/null | wc -l')
+  TRIGGER=$(docker exec "$CONTAINER" grep "watcher fired" /home/node/.maestro/logs/maestro-agent.log | tail -1)
+  echo "TEST 2 — State: $STATE, Queue: $QUEUE, Trigger: $TRIGGER"
+  # PASS: State=waiting, Queue=0, Trigger contains queue(1)
+
+  # --- TEST 3: Connected watcher ---
+  echo "Connect to container now: maestro connect test-lifecycle"
+  echo "Wait 3 seconds for REPL prompt, then detach (Ctrl-B d)"
+  read -p "Press Enter after detaching..."
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state)
+  TRIGGER=$(docker exec "$CONTAINER" grep "connected" /home/node/.maestro/logs/maestro-agent.log | tail -1)
+  echo "TEST 3 — State: $STATE, Trigger: $TRIGGER"
+  # PASS: State=idle, Trigger contains "connected"
+
+  # --- TEST 4: Service idle wake-up ---
+  docker exec "$CONTAINER" bash -c 'echo "Test message 2: wake-up test." > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+  sleep 8
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state)
+  WOKE=$(docker exec "$CONTAINER" grep -c "waking Claude" /home/node/.maestro/logs/maestro-agent.log)
+  echo "TEST 4 — State: $STATE, Wake count: $WOKE"
+  # PASS: State=active or waiting, Wake count >= 1
+
+  # --- TEST 5: Clear timer kill-restart ---
+  sleep 30  # Wait for Claude to finish and enter stop hook
+  echo "Connect briefly and detach to trigger idle: maestro connect test-lifecycle"
+  read -p "Press Enter after detaching..."
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state)
+  echo "State before timer: $STATE (should be idle)"
+  echo "Waiting 75 seconds for clear timer..."
+  sleep 75
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state)
+  RESTARTED=$(docker exec "$CONTAINER" grep -c "Claude ready after restart" /home/node/.maestro/logs/maestro-agent.log)
+  CLAUDE_ALIVE=$(docker exec "$CONTAINER" ps aux | grep "claude" | grep -v grep | grep -v defunct | wc -l)
+  echo "TEST 5 — State: $STATE, Restarts: $RESTARTED, Claude alive: $CLAUDE_ALIVE"
+  # PASS: State=active or waiting, Restarts >= 1, Claude alive >= 1
+
+  # --- TEST 6: Message preempts clear timer ---
+  sleep 30  # Wait for stop hook
+  echo "Connect briefly and detach: maestro connect test-lifecycle"
+  read -p "Press Enter after detaching..."
+  CLEARS_BEFORE=$(docker exec "$CONTAINER" grep -c "Clear timer expired" /home/node/.maestro/logs/maestro-agent.log)
+  sleep 30  # Wait 30s (half of 60s clear_after)
+  docker exec "$CONTAINER" bash -c 'echo "Preemption test." > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+  sleep 8
+  STATE=$(docker exec "$CONTAINER" cat /home/node/.maestro/state/agent-state)
+  sleep 30  # Wait past the 60s mark
+  CLEARS_AFTER=$(docker exec "$CONTAINER" grep -c "Clear timer expired" /home/node/.maestro/logs/maestro-agent.log)
+  echo "TEST 6 — State: $STATE, Clears before: $CLEARS_BEFORE, Clears after: $CLEARS_AFTER"
+  # PASS: State=active or waiting, Clears after == Clears before (no new clear)
+
+  # --- TEST 7: Clean stderr ---
+  sleep 30  # Wait for stop hook
+  docker exec "$CONTAINER" bash -c 'echo "MARKER_CLEAN_STDERR_TEST" > /home/node/.maestro/pending-messages/$(date +%s%N).txt'
+  sleep 10
+  LOG_IN_TMUX=$(docker exec "$CONTAINER" tmux capture-pane -t main:0 -p -S -30 | grep -c '{"time":')
+  MARKER_IN_TMUX=$(docker exec "$CONTAINER" tmux capture-pane -t main:0 -p -S -30 | grep -c 'MARKER_CLEAN_STDERR_TEST')
+  echo "TEST 7 — Log lines in tmux: $LOG_IN_TMUX, Marker in tmux: $MARKER_IN_TMUX"
+  # PASS: Log lines = 0, Marker >= 1
+
+  # --- CLEANUP ---
+  maestro stop test-lifecycle
+  maestro cleanup
+
+  # --- SUMMARY ---
+  echo ""
+  echo "Test 1 (blocking stop hook):      State=waiting, hook alive"
+  echo "Test 2 (queue delivery):          Message delivered, queue drained"
+  echo "Test 3 (connected watcher):       User detected, state=idle"
+  echo "Test 4 (idle wake-up):            Service woke Claude on message"
+  echo "Test 5 (clear timer restart):     Kill-restart completed"
+  echo "Test 6 (message preempts clear):  No spurious restart"
+  echo "Test 7 (clean stderr):            No log contamination"
+
+
+==============================================================================
+KNOWN VARIABILITY
+==============================================================================
+
+1. CLAUDE PROCESSING TIME: The test agent's response time varies. The
+   "acknowledge briefly" prompt usually produces a 1-2 sentence response
+   in 5-15 seconds, but occasionally Claude will write more or use tools.
+   Increase sleep durations if tests are flaky due to timing.
+
+2. STOP HOOK ENTRY: After Claude finishes, the Stop hook fires. On rare
+   occasions Claude may make a second tool call before stopping, delaying
+   the stop hook. If TEST 1 shows state "active", wait longer.
+
+3. CLEAR TIMER PRECISION: The service loop polls every 2 seconds. The
+   clear timer fires via Go's time.Timer, which is precise. But the
+   service's state check adds up to 2s of lag. The kill-restart itself
+   takes 5-10s (kill + wait + respawn + Claude startup).
+
+4. TMUX SERVER DEATH: When Claude is killed during clear, the tmux server
+   may die if Claude was the only process. The respawn falls back to
+   creating a new session. Both paths are valid.
+
+5. ZOMBIE PROCESSES: Killed Claude processes may linger as zombies. This
+   is normal — the parent (tmux/shell) hasn't reaped them. Zombies don't
+   consume resources. When checking for "alive" processes, always filter
+   out "defunct" entries.
+
+6. CONNECTED WATCHER TIMING: The watcher polls every 2 seconds. If you
+   connect and disconnect within 1 second, the watcher may miss you.
+   Stay connected for at least 3 seconds.
+
+
+==============================================================================
+HOOK TIMEOUT CONFIGURATION
+==============================================================================
+
+CRITICAL: Claude Code hooks have a default timeout of 600 seconds (10
+minutes). The blocking Stop hook MUST have an extended timeout, or Claude
+will kill it after 10 minutes and the system will appear to work initially
+but fail under sustained operation.
+
+The settings.json Stop hook entry must include:
+
+  {
+    "type": "command",
+    "command": "maestro-agent hook stop",
+    "timeout": 86400
+  }
+
+The 86400 value is 24 hours in seconds. This is effectively infinite for
+our purposes — the clear timer (hours, not days) will restart things long
+before this timeout fires.
+
+If tests fail with the Stop hook becoming a zombie after ~10 minutes, this
+timeout is missing.
+
+
+==============================================================================
+BASELINE RESULTS (2026-02-18)
+==============================================================================
+
+First successful run on the manager container (arm64):
+
+  Test 1 (blocking stop hook):      PASS — state=waiting, hook PID alive
+  Test 2 (queue delivery):          PASS — 3s latency, queue drained
+  Test 3 (connected watcher):       PASS — detected in <3s, state=idle
+  Test 4 (idle wake-up):            PASS — service woke Claude in <4s
+  Test 5 (clear timer restart):     PASS — fired at exactly 60s, restart in 9s
+  Test 6 (message preempts clear):  PASS — no spurious clear after wake
+  Test 7 (clean stderr):            PASS — zero log lines in tmux output
+
+  Bugs found during initial testing:
+  - Stop hook killed after 600s (default hook timeout) — fixed with timeout: 86400
+  - Clear timer log spam every 2s while idle — fixed with clearTimerRunning flag
+  - performClear: no PID file, kill silently skipped — fixed with pgrep fallback
+  - performClear: tmux send-keys to dead pane — fixed with respawn-pane + new-session fallback

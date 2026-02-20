@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/uprockcom/maestro/pkg/container"
+	"github.com/uprockcom/maestro/pkg/notify"
 )
 
 // Config holds daemon configuration
@@ -45,6 +46,14 @@ type Config struct {
 	QuietHoursEnd      string
 	ContainerPrefix    string
 	CreateContainer    func(task, parentContainer, branch string) (string, error) // Callback for IPC child creation
+}
+
+// pendingApproval tracks a container-initiated resource request awaiting user approval
+type pendingApproval struct {
+	ContainerName string
+	RequestID     string
+	RequestType   string // "domain", "memory", "cpus", "ip"
+	RequestValue  string
 }
 
 // Daemon manages background monitoring and auto-refresh
@@ -63,6 +72,13 @@ type Daemon struct {
 	configDir           string
 	lockFile            *os.File       // held while daemon is running to prevent races
 	wg                  sync.WaitGroup // tracks background goroutines for clean shutdown
+	notifyEngine        *notify.Engine
+	localProvider       *notify.LocalProvider // direct ref for GetPending/Answer
+	nicknames           *NicknameStore
+	containerOps        ContainerOps
+	pendingApprovals    map[string]*pendingApproval
+	pendingApprovalsMu  sync.Mutex
+	lastTokenSync       time.Time
 }
 
 // ContainerState tracks container monitoring state
@@ -70,7 +86,7 @@ type ContainerState struct {
 	mu                     sync.Mutex // protects all fields below
 	Name                   string
 	AttentionStarted       *time.Time
-	LastNotified           *time.Time
+	LastIdleNotified       *time.Time // Last time an idle/attention notification was sent (scoped rate limit)
 	LastActivity           time.Time
 	LastTokenCheck         time.Time
 	NotificationSent       bool
@@ -79,6 +95,12 @@ type ContainerState struct {
 	LastTaskProgress       string // Last seen task progress (e.g., "2/5")
 	TaskCompletionNotified bool   // Whether we've notified about task completion
 	LastIPCCheck           time.Time
+	LastQuestionFile       string // Serialized question content for change detection
+	LastQuestionEventID    string // Event ID of the pending question notification
+	QuestionNotified       bool   // Whether we've notified for the current question
+	TokenExpiryNotified    bool   // Whether we've sent a token_expiring notification for current expiry
+	LastTokenExpiry        int64  // ExpiresAt millis — detect token refresh
+	WasClaudeRunning       bool   // Whether Claude was running in the last check cycle
 }
 
 // New creates a new daemon instance
@@ -98,13 +120,16 @@ func New(config Config, configDir string, iconData []byte) (*Daemon, error) {
 	token := hex.EncodeToString(tokenBytes)
 
 	d := &Daemon{
-		config:          config,
-		logFile:         logFile,
-		stopChan:        make(chan bool),
-		containerStates: make(map[string]*ContainerState),
-		startTime:       time.Now(),
-		ipcToken:        token,
-		configDir:       configDir,
+		config:           config,
+		logFile:          logFile,
+		stopChan:         make(chan bool),
+		containerStates:  make(map[string]*ContainerState),
+		startTime:        time.Now(),
+		ipcToken:         token,
+		configDir:        configDir,
+		nicknames:        NewNicknameStore(filepath.Join(configDir, "nicknames.yml")),
+		containerOps:     &dockerContainerOps{},
+		pendingApprovals: make(map[string]*pendingApproval),
 	}
 
 	// Check for terminal-notifier on macOS
@@ -131,6 +156,42 @@ func New(config Config, configDir string, iconData []byte) (*Daemon, error) {
 	}
 
 	return d, nil
+}
+
+// SetEngine configures the notification engine and local provider.
+func (d *Daemon) SetEngine(engine *notify.Engine, localProvider *notify.LocalProvider) {
+	d.notifyEngine = engine
+	d.localProvider = localProvider
+}
+
+// IconPath returns the cached icon path (for DesktopProvider setup).
+func (d *Daemon) IconPath() string { return d.iconPath }
+
+// HasTerminalNotifier returns whether terminal-notifier is available.
+func (d *Daemon) HasTerminalNotifier() bool { return d.hasTerminalNotifier }
+
+// IPCServer returns the daemon's IPC server (may be nil before Start is called).
+func (d *Daemon) IPCServer() *IPCServer { return d.ipcServer }
+
+// LogInfo exposes logging to external callers.
+func (d *Daemon) LogInfo(format string, args ...interface{}) { d.logInfo(format, args...) }
+
+// Nicknames returns the daemon's nickname store.
+func (d *Daemon) Nicknames() *NicknameStore { return d.nicknames }
+
+// sendNotification routes an event through the engine if available, else falls
+// back to the legacy notify() method.
+func (d *Daemon) sendNotification(event notify.Event) {
+	if d.notifyEngine != nil {
+		if event.Question != nil {
+			d.notifyEngine.AskQuestion(event)
+		} else {
+			d.notifyEngine.Notify(event)
+		}
+		return
+	}
+	// Legacy fallback
+	d.notify(event.Title, event.ShortName, event.Message)
 }
 
 // DaemonIPCInfo is the JSON structure written to daemon-ipc.json
@@ -279,13 +340,43 @@ func (d *Daemon) check() {
 		return
 	}
 
+	// Batch token sync: find freshest token and distribute to expired containers
+	d.syncTokensAcrossContainers(containers)
+
 	for _, container := range containers {
 		state := d.getOrCreateContainerState(container)
+
+		// Check dormant state (Claude process exited)
+		claudeRunning := d.isClaudeRunning(container)
+		state.mu.Lock()
+		wasPreviouslyRunning := state.WasClaudeRunning
+		state.WasClaudeRunning = claudeRunning
+		state.mu.Unlock()
+
+		if wasPreviouslyRunning && !claudeRunning {
+			d.logInfo("Claude became dormant in %s", d.getShortName(container))
+			if d.shouldNotify("dormant", state) {
+				shortName := d.getShortName(container)
+				event := notify.Event{
+					ID:            fmt.Sprintf("dormant-%s-%d", container, time.Now().UnixMilli()),
+					ContainerName: container,
+					ShortName:     shortName,
+					Title:         "Dormant",
+					Message:       "Claude process has exited",
+					Type:          notify.EventDormant,
+					Timestamp:     time.Now(),
+				}
+				d.sendNotification(event)
+			}
+		}
+
+		// Check for pending questions (fast path — no gating)
+		d.checkQuestionStatus(container, state)
 
 		// Check token expiry
 		d.checkTokenExpiry(container, state)
 
-		// Check attention status
+		// Check attention status (idle notifications — gated by threshold + rate limit)
 		d.checkAttentionStatus(container, state)
 
 		// Check task completion status
@@ -306,8 +397,174 @@ func (d *Daemon) check() {
 	d.cleanupStates(containers)
 }
 
-// checkTokenExpiry checks and refreshes tokens if needed
-func (d *Daemon) checkTokenExpiry(container string, state *ContainerState) {
+// checkQuestionStatus checks for pending questions every cycle with no gating.
+// Questions are time-sensitive (interactive Q&A) and should fire within one check cycle.
+func (d *Daemon) checkQuestionStatus(containerName string, state *ContainerState) {
+	// Only check if Claude is running
+	if !d.isClaudeRunning(containerName) {
+		return
+	}
+
+	qd, err := notify.ReadContainerQuestion(containerName)
+	if err != nil {
+		d.logError("Failed to read question from %s: %v", containerName, err)
+		return
+	}
+
+	state.mu.Lock()
+	if qd != nil {
+		// Serialize to compare with last known question
+		qdJSON, _ := json.Marshal(qd)
+		qdStr := string(qdJSON)
+
+		if qdStr != state.LastQuestionFile {
+			// New question detected — notify immediately
+			state.LastQuestionFile = qdStr
+			state.QuestionNotified = true
+
+			shortName := d.getShortName(containerName)
+			eventID := fmt.Sprintf("question-%s-%d", containerName, time.Now().UnixMilli())
+			state.LastQuestionEventID = eventID
+			state.mu.Unlock()
+
+			event := notify.Event{
+				ID:            eventID,
+				ContainerName: containerName,
+				ShortName:     shortName,
+				Title:         "Question",
+				Message:       "Has a question waiting for your answer",
+				Type:          notify.EventQuestion,
+				Timestamp:     time.Now(),
+				Question:      qd,
+			}
+			d.sendNotification(event)
+			d.logInfo("Question detected in %s, notifying immediately", shortName)
+			return
+		}
+		// Same question as before — already notified
+		state.mu.Unlock()
+	} else {
+		// No question file — if we previously had one, cancel the pending notification
+		prevEventID := state.LastQuestionEventID
+		state.LastQuestionFile = ""
+		state.LastQuestionEventID = ""
+		state.QuestionNotified = false
+		state.mu.Unlock()
+
+		if prevEventID != "" && d.notifyEngine != nil {
+			d.notifyEngine.CancelQuestionWithNotify(prevEventID)
+		}
+	}
+}
+
+// syncTokensAcrossContainers finds the freshest valid token and syncs it to all
+// containers (and the host) that have expired or older tokens. Runs once per check
+// cycle with a 5-minute rate limit.
+func (d *Daemon) syncTokensAcrossContainers(containers []string) {
+	d.mu.Lock()
+	if time.Since(d.lastTokenSync) < 5*time.Minute {
+		d.mu.Unlock()
+		return
+	}
+	d.lastTokenSync = time.Now()
+	d.mu.Unlock()
+
+	// Find the freshest valid token across host + all containers
+	freshest, err := container.FindFreshestToken(d.config.ContainerPrefix)
+	if err != nil {
+		d.logInfo("Token sync: no valid token found anywhere (%v)", err)
+		return
+	}
+	defer func() {
+		if freshest.IsTempFile {
+			os.Remove(freshest.Path)
+		}
+	}()
+
+	d.logInfo("Token sync: freshest token from %s (expires %s)", freshest.Source, freshest.ExpiresAt.Format(time.RFC1123))
+
+	synced := 0
+
+	// Sync to host if needed
+	hostCredPath := filepath.Join(d.configDir, ".credentials.json")
+	if freshest.Source != "host" {
+		needsHostSync := false
+		if hostCreds, err := readCredentials(hostCredPath); err != nil {
+			needsHostSync = true
+		} else if time.Now().UnixMilli() >= hostCreds.ClaudeAiOauth.ExpiresAt {
+			needsHostSync = true
+		} else if freshest.ExpiresAt.After(time.UnixMilli(hostCreds.ClaudeAiOauth.ExpiresAt)) {
+			needsHostSync = true
+		}
+
+		if needsHostSync {
+			data, err := os.ReadFile(freshest.Path)
+			if err == nil {
+				if err := os.WriteFile(hostCredPath, data, 0600); err == nil {
+					synced++
+					d.logInfo("Token sync: updated host credentials")
+				} else {
+					d.logError("Token sync: failed to write host credentials: %v", err)
+				}
+			}
+		}
+	}
+
+	// Sync to containers that need it
+	for _, containerName := range containers {
+		if containerName == freshest.Source {
+			continue
+		}
+
+		// Check container's current token
+		tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("maestro-sync-%s-%d.json", containerName, time.Now().Unix()))
+		copyCmd := exec.Command("docker", "cp",
+			fmt.Sprintf("%s:/home/node/.claude/.credentials.json", containerName),
+			tmpFile)
+
+		needsSync := false
+		if err := copyCmd.Run(); err != nil {
+			needsSync = true // No credentials at all
+		} else {
+			creds, err := readCredentials(tmpFile)
+			os.Remove(tmpFile)
+			if err != nil {
+				needsSync = true
+			} else if time.Now().UnixMilli() >= creds.ClaudeAiOauth.ExpiresAt {
+				needsSync = true
+			} else if freshest.ExpiresAt.After(time.UnixMilli(creds.ClaudeAiOauth.ExpiresAt)) {
+				needsSync = true
+			}
+		}
+
+		if needsSync {
+			destPath := fmt.Sprintf("%s:/home/node/.claude/.credentials.json", containerName)
+			syncCmd := exec.Command("docker", "cp", freshest.Path, destPath)
+			if err := syncCmd.Run(); err != nil {
+				d.logError("Token sync: failed to copy to %s: %v", d.getShortName(containerName), err)
+				continue
+			}
+
+			chownCmd := exec.Command("docker", "exec", "-u", "root", containerName,
+				"chown", "node:node", "/home/node/.claude/.credentials.json")
+			if err := chownCmd.Run(); err != nil {
+				d.logError("Token sync: failed to fix ownership on %s: %v", d.getShortName(containerName), err)
+			}
+
+			synced++
+			d.logInfo("Token sync: updated %s", d.getShortName(containerName))
+		}
+	}
+
+	if synced > 0 {
+		d.logInfo("Token sync complete: updated %d location(s) from %s", synced, freshest.Source)
+	}
+}
+
+// checkTokenExpiry sends notifications for tokens that are expiring soon or expired.
+// Actual token syncing is handled by syncTokensAcrossContainers() which runs before
+// the per-container loop.
+func (d *Daemon) checkTokenExpiry(containerName string, state *ContainerState) {
 	// Don't check too frequently (every 5 minutes is enough)
 	state.mu.Lock()
 	if time.Since(state.LastTokenCheck) < 5*time.Minute {
@@ -318,11 +575,11 @@ func (d *Daemon) checkTokenExpiry(container string, state *ContainerState) {
 	state.mu.Unlock()
 
 	// Extract credentials
-	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("maestro-creds-%s-%d.json", container, time.Now().Unix()))
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("maestro-creds-%s-%d.json", containerName, time.Now().Unix()))
 	defer os.Remove(tmpFile)
 
 	copyCmd := exec.Command("docker", "cp",
-		fmt.Sprintf("%s:/home/node/.claude/.credentials.json", container),
+		fmt.Sprintf("%s:/home/node/.claude/.credentials.json", containerName),
 		tmpFile)
 	if err := copyCmd.Run(); err != nil {
 		return // No credentials, skip
@@ -335,32 +592,50 @@ func (d *Daemon) checkTokenExpiry(container string, state *ContainerState) {
 
 	timeLeft := time.Until(time.UnixMilli(creds.ClaudeAiOauth.ExpiresAt))
 
-	// Refresh if below threshold
-	if timeLeft < d.config.TokenThreshold {
-		d.logInfo("Token expiring soon for %s (%.1fh left), refreshing...", container, timeLeft.Hours())
+	// Detect token changes (e.g. from batch sync) and clear notification flag
+	state.mu.Lock()
+	if creds.ClaudeAiOauth.ExpiresAt != state.LastTokenExpiry {
+		state.TokenExpiryNotified = false
+		state.LastTokenExpiry = creds.ClaudeAiOauth.ExpiresAt
+	}
+	alreadyNotified := state.TokenExpiryNotified
+	state.mu.Unlock()
 
-		if err := d.refreshToken(container); err != nil {
-			d.logError("Failed to refresh token for %s: %v", container, err)
-
-			// Send notification if enabled
-			if d.shouldNotify("token_expiring", state) {
-				d.notify("Token Expiring", d.getShortName(container),
-					fmt.Sprintf("Token expires in %.1fh and auto-refresh failed", timeLeft.Hours()))
-				state.mu.Lock()
-				state.LastNotified = timeNow()
-				state.mu.Unlock()
-			}
+	// Notify if token is expired or expiring within threshold
+	if timeLeft < d.config.TokenThreshold && !alreadyNotified && d.shouldNotify("token_expiring", state) {
+		shortName := d.getShortName(containerName)
+		var message string
+		if timeLeft <= 0 {
+			message = fmt.Sprintf("Token expired %.1fh ago — no fresh token available to sync", -timeLeft.Hours())
 		} else {
-			d.logInfo("Successfully refreshed token for %s", container)
+			message = fmt.Sprintf("Token expires in %.1fh", timeLeft.Hours())
 		}
+
+		event := notify.Event{
+			ID:            fmt.Sprintf("token-%s-%d", containerName, time.Now().UnixMilli()),
+			ContainerName: containerName,
+			ShortName:     shortName,
+			Title:         "Token Expiring",
+			Message:       message,
+			Type:          notify.EventTokenExpiring,
+			Timestamp:     time.Now(),
+		}
+		d.sendNotification(event)
+		state.mu.Lock()
+		state.TokenExpiryNotified = true
+		state.mu.Unlock()
 	}
 }
 
-// checkAttentionStatus monitors container attention state
-func (d *Daemon) checkAttentionStatus(container string, state *ContainerState) {
-	// Only treat idle flag as "needs attention" if Claude is actually running.
-	// When Claude exits, the flag file persists but is stale.
-	needsAttention := d.checkIdleStatus(container) && d.isClaudeRunning(container)
+// checkAttentionStatus monitors container idle/attention state via agent state.
+// Questions are handled separately by checkQuestionStatus(); this only sends
+// EventAttentionNeeded notifications, gated by the attention threshold and a
+// 30-minute idle-specific rate limit.
+func (d *Daemon) checkAttentionStatus(containerName string, state *ContainerState) {
+	// Read agent state — only idle/waiting are "needs attention".
+	// Question state is handled by checkQuestionStatus separately.
+	agentState := container.ReadAgentState(containerName)
+	needsAttention := (agentState == "idle" || agentState == "waiting") && d.isClaudeRunning(containerName)
 
 	state.mu.Lock()
 	if needsAttention {
@@ -373,32 +648,50 @@ func (d *Daemon) checkAttentionStatus(container string, state *ContainerState) {
 			newAttention = true
 		}
 
-		// Check if we should notify
+		// Check if we should notify (threshold + idle-specific rate limit)
+		// Skip if a question is already pending — the question notification is sufficient
 		attentionDuration := time.Since(*state.AttentionStarted)
-		shouldSend := !state.NotificationSent && attentionDuration >= d.config.AttentionThreshold
+		idleRateLimited := state.LastIdleNotified != nil && time.Since(*state.LastIdleNotified) < 30*time.Minute
+		hasQuestion := state.QuestionNotified
+		shouldSend := !state.NotificationSent && !hasQuestion && attentionDuration >= d.config.AttentionThreshold && !idleRateLimited
 		state.mu.Unlock()
 
 		if newAttention {
-			d.logInfo("Container %s needs attention", d.getShortName(container))
+			d.logInfo("Container %s needs attention", d.getShortName(containerName))
 		}
 
 		if shouldSend && d.shouldNotify("attention_needed", state) {
-			d.notify("Needs Attention", d.getShortName(container),
-				fmt.Sprintf("Has needed attention for %s", formatDuration(attentionDuration)))
+			shortName := d.getShortName(containerName)
+			event := notify.Event{
+				ID:            fmt.Sprintf("attn-%s-%d", containerName, time.Now().UnixMilli()),
+				ContainerName: containerName,
+				ShortName:     shortName,
+				Title:         "Needs Attention",
+				Message:       fmt.Sprintf("Has needed attention for %s", formatDuration(attentionDuration)),
+				Type:          notify.EventAttentionNeeded,
+				Timestamp:     time.Now(),
+			}
+
+			d.sendNotification(event)
+
 			state.mu.Lock()
 			state.NotificationSent = true
-			state.LastNotified = timeNow()
+			state.LastIdleNotified = timeNow()
 			state.mu.Unlock()
 		}
 	} else {
-		// Clear attention state
+		// Clear attention state — also clear LastIdleNotified so the next
+		// idle event can fire immediately after attention is resolved.
 		wasAttending := state.AttentionStarted != nil
 		state.AttentionStarted = nil
 		state.NotificationSent = false
+		if wasAttending {
+			state.LastIdleNotified = nil
+		}
 		state.mu.Unlock()
 
 		if wasAttending {
-			d.logInfo("Container %s attention resolved", d.getShortName(container))
+			d.logInfo("Container %s attention resolved", d.getShortName(containerName))
 		}
 	}
 }
@@ -438,12 +731,21 @@ func (d *Daemon) checkTaskStatus(containerName string, state *ContainerState) {
 	if shouldNotifyCompletion {
 		d.logInfo("Container %s completed all tasks (%s)", d.getShortName(containerName), summary.Progress)
 
+		// Send notification if type is enabled (no rate limit — TaskCompletionNotified dedup is sufficient)
 		if d.shouldNotify("tasks_completed", state) {
-			d.notify("Tasks Completed", d.getShortName(containerName),
-				fmt.Sprintf("Finished all tasks (%s)", summary.Progress))
+			shortName := d.getShortName(containerName)
+			event := notify.Event{
+				ID:            fmt.Sprintf("tasks-%s-%d", containerName, time.Now().UnixMilli()),
+				ContainerName: containerName,
+				ShortName:     shortName,
+				Title:         "Tasks Completed",
+				Message:       fmt.Sprintf("Finished all tasks (%s)", summary.Progress),
+				Type:          notify.EventTasksCompleted,
+				Timestamp:     time.Now(),
+			}
+			d.sendNotification(event)
 			state.mu.Lock()
 			state.TaskCompletionNotified = true
-			state.LastNotified = timeNow()
 			state.mu.Unlock()
 		}
 	}
@@ -458,14 +760,8 @@ func (d *Daemon) checkTaskStatus(containerName string, state *ContainerState) {
 	state.mu.Unlock()
 }
 
-// refreshToken refreshes the token for a container
-func (d *Daemon) refreshToken(containerName string) error {
-	// This will be implemented once we have the refresh-tokens command
-	// For now, just log that we would refresh
-	return fmt.Errorf("token refresh not yet implemented")
-}
-
-// shouldNotify checks if notification should be sent based on rules
+// shouldNotify checks if a notification type is enabled and not in quiet hours.
+// Rate limiting is handled per-notification-type by the caller.
 func (d *Daemon) shouldNotify(notifyType string, state *ContainerState) bool {
 	if !d.config.NotificationsOn {
 		return false
@@ -483,16 +779,8 @@ func (d *Daemon) shouldNotify(notifyType string, state *ContainerState) bool {
 		return false
 	}
 
-	// Check quiet hours
-	if d.isQuietHours() {
-		return false
-	}
-
-	// Rate limit: don't notify more than once per 30 minutes per container
-	state.mu.Lock()
-	rateLimited := state.LastNotified != nil && time.Since(*state.LastNotified) < 30*time.Minute
-	state.mu.Unlock()
-	if rateLimited {
+	// Check quiet hours — blockers bypass quiet hours
+	if notifyType != "blocker" && d.isQuietHours() {
 		return false
 	}
 
@@ -635,16 +923,13 @@ func (d *Daemon) getRunningContainers() ([]string, error) {
 	for _, line := range strings.Split(string(output), "\n") {
 		name := strings.TrimSpace(line)
 		if name != "" && strings.HasPrefix(name, prefix) {
+			if name == "maestro-signal-cli" {
+				continue
+			}
 			containers = append(containers, name)
 		}
 	}
 	return containers, nil
-}
-
-func (d *Daemon) checkIdleStatus(container string) bool {
-	cmd := exec.Command("docker", "exec", container,
-		"test", "-f", "/home/node/.maestro/claude-idle")
-	return cmd.Run() == nil
 }
 
 func (d *Daemon) isClaudeRunning(containerName string) bool {
@@ -688,6 +973,9 @@ func (d *Daemon) getOrCreateContainerState(name string) *ContainerState {
 }
 
 func (d *Daemon) cleanup() {
+	if d.notifyEngine != nil {
+		d.notifyEngine.Close()
+	}
 	if d.ipcServer != nil {
 		d.ipcServer.Stop()
 	}
@@ -722,6 +1010,69 @@ func (d *Daemon) logInfo(format string, args ...interface{}) {
 func (d *Daemon) logError(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("[ERROR] %s\n", msg)
+}
+
+// StartBackgroundTask runs a function in a tracked goroutine. The function
+// receives the daemon's stop channel so it can shut down gracefully.
+func (d *Daemon) StartBackgroundTask(fn func(stopChan <-chan bool)) {
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		fn(d.stopChan)
+	}()
+}
+
+// RegisterApproval stores a pending approval keyed by event ID
+func (d *Daemon) RegisterApproval(eventID string, approval *pendingApproval) {
+	d.pendingApprovalsMu.Lock()
+	d.pendingApprovals[eventID] = approval
+	d.pendingApprovalsMu.Unlock()
+}
+
+// PopApproval retrieves and removes a pending approval by event ID
+func (d *Daemon) PopApproval(eventID string) *pendingApproval {
+	d.pendingApprovalsMu.Lock()
+	approval, ok := d.pendingApprovals[eventID]
+	if ok {
+		delete(d.pendingApprovals, eventID)
+	}
+	d.pendingApprovalsMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return approval
+}
+
+// ExecuteApproval performs the approved resource action
+func (d *Daemon) ExecuteApproval(approval *pendingApproval, resp notify.Response) (bool, error) {
+	// Check if "Approve" was selected
+	approved := false
+	for _, s := range resp.Selections {
+		if s == "Approve" {
+			approved = true
+			break
+		}
+	}
+
+	if !approved {
+		return false, nil
+	}
+
+	var err error
+	switch approval.RequestType {
+	case "domain":
+		err = container.AddDomainToContainer(approval.ContainerName, approval.RequestValue)
+	case "memory":
+		err = container.UpdateContainerResources(approval.ContainerName, approval.RequestValue, "")
+	case "cpus":
+		err = container.UpdateContainerResources(approval.ContainerName, "", approval.RequestValue)
+	case "ip":
+		err = container.AddIPToContainer(approval.ContainerName, approval.RequestValue)
+	default:
+		err = fmt.Errorf("unknown request type: %s", approval.RequestType)
+	}
+
+	return true, err
 }
 
 // createChildContainer delegates to the configured CreateContainer callback

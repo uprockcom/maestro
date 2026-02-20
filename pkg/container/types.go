@@ -34,7 +34,7 @@ type Info struct {
 	Status         string
 	StatusDetails  string
 	Branch         string
-	NeedsAttention bool
+	AgentState     string    // maestro-agent state (starting, active, waiting, idle, question, clearing, connected)
 	IsDormant      bool      // Claude process not running
 	AuthStatus     string    // Token expiration status
 	LastActivity   string    // Time since last activity

@@ -21,7 +21,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,8 +32,15 @@ import (
 )
 
 const defaultPollInterval = 2 * time.Second
+const pendingMessagesDir = "/home/node/.maestro/pending-messages"
 
 var errRequestFailed = errors.New("request failed")
+
+// messageResult holds messages collected from the pending-messages queue.
+type messageResult struct {
+	Messages []string `json:"messages"`
+	Count    int      `json:"count"`
+}
 
 // --- Shared polling helpers ---
 
@@ -169,6 +179,67 @@ func pollIdleRequest(ctx context.Context, targetRequestID string, timeout int) (
 	}
 }
 
+// pollMessages polls the pending-messages directory for .txt files.
+// Checks immediately on first iteration (no initial delay) so pre-queued
+// messages are returned instantly. On each check it reads all .txt files
+// sorted by name, collects their contents, deletes them, and returns.
+// Returns (nil, ctx.Err()) on context cancellation.
+func pollMessages(ctx context.Context) (*messageResult, error) {
+	first := true
+	for {
+		if !first {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(defaultPollInterval):
+			}
+		}
+		first = false
+
+		entries, err := os.ReadDir(pendingMessagesDir)
+		if err != nil {
+			// Directory doesn't exist yet — keep polling
+			if os.IsNotExist(err) {
+				continue
+			}
+			continue
+		}
+
+		var names []string
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".txt") {
+				names = append(names, e.Name())
+			}
+		}
+
+		if len(names) == 0 {
+			continue
+		}
+
+		sort.Strings(names)
+
+		var messages []string
+		for _, name := range names {
+			path := filepath.Join(pendingMessagesDir, name)
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				continue
+			}
+			messages = append(messages, strings.TrimRight(string(data), "\n"))
+			_ = os.Remove(path)
+		}
+
+		if len(messages) == 0 {
+			continue
+		}
+
+		return &messageResult{
+			Messages: messages,
+			Count:    len(messages),
+		}, nil
+	}
+}
+
 // --- Cobra commands ---
 
 func waitCmd() *cobra.Command {
@@ -181,6 +252,7 @@ func waitCmd() *cobra.Command {
 	cmd.AddCommand(waitScriptCmd())
 	cmd.AddCommand(waitDaemonCmd())
 	cmd.AddCommand(waitIdleCmd())
+	cmd.AddCommand(waitMessageCmd())
 	cmd.AddCommand(waitAnyCmd())
 	cmd.AddCommand(waitAllCmd())
 	return cmd
@@ -408,5 +480,45 @@ Returns the request JSON on success, exits with code 1 on failure or timeout.`,
 	}
 
 	cmd.Flags().IntVar(&timeout, "timeout", 300, "Timeout in seconds")
+	return cmd
+}
+
+func waitMessageCmd() *cobra.Command {
+	var timeout int
+
+	cmd := &cobra.Command{
+		Use:   "message",
+		Short: "Wait for a message to be queued for this container",
+		Long: `Wait for a message to appear in the pending-messages queue.
+
+Messages are written to /home/node/.maestro/pending-messages/ as .txt files
+(typically by the host via "maestro message <container> <text>").
+
+If messages are already queued when this command starts, they are returned
+immediately with no delay. Otherwise polls every 2s until a message arrives.
+
+Returns JSON with the collected messages. Exit code 0 on message received,
+2 on timeout.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+			defer cancel()
+
+			result, err := pollMessages(ctx)
+			if err != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					fmt.Fprintf(os.Stderr, "Timeout: no message received within %ds\n", timeout)
+					os.Exit(2)
+				}
+				return err
+			}
+
+			data, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Fprintln(cmd.OutOrStdout(), string(data))
+			return nil
+		},
+	}
+
+	cmd.Flags().IntVar(&timeout, "timeout", 3600, "Timeout in seconds")
 	return cmd
 }

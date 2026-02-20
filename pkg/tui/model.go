@@ -36,6 +36,7 @@ import (
 	"go.dalton.dog/bubbleup"
 
 	"github.com/uprockcom/maestro/pkg/container"
+	"github.com/uprockcom/maestro/pkg/notify"
 	"github.com/uprockcom/maestro/pkg/system"
 	"github.com/uprockcom/maestro/pkg/tui/style"
 	"github.com/uprockcom/maestro/pkg/tui/views"
@@ -66,6 +67,14 @@ type Model struct {
 	operationInProgress bool                // Whether an operation is currently running
 	operationSpinner    spinner.Model       // Spinner for operations in statusbar
 
+	// Notification/question state
+	daemonClient         *DaemonClient
+	daemonConfigDir      string // Path to config dir for daemon reconnection
+	pendingQuestions     []notify.PendingQuestion
+	activeQuestionEvent  string   // Event ID of the question currently shown in a modal
+	questionIndex        int      // Current question index in a multi-question flow
+	questionAnswers      []string // Accumulated answers for multi-question (one per question)
+
 	// Wizard state
 	wizardMode        bool     // Whether we're in wizard/onboarding mode
 	wizardStep        int      // Current wizard step (0=animation, 1=prereq, 2=welcome, 3=auth, 4=firewall, 5=defaults, 6=completion)
@@ -80,16 +89,17 @@ type Model struct {
 // keyMap defines keybindings for different contexts
 type keyMap struct {
 	// Normal view keys
-	Up       key.Binding
-	Down     key.Binding
-	Connect  key.Binding
-	Actions  key.Binding
-	Info     key.Binding
-	New      key.Binding
-	Settings key.Binding
-	Firewall key.Binding
-	Help     key.Binding
-	Quit     key.Binding
+	Up        key.Binding
+	Down      key.Binding
+	Connect   key.Binding
+	Actions   key.Binding
+	Info      key.Binding
+	New       key.Binding
+	Settings  key.Binding
+	Firewall  key.Binding
+	Questions key.Binding
+	Help      key.Binding
+	Quit      key.Binding
 
 	// Modal keys (set dynamically based on modal type)
 	ModalSelect   key.Binding
@@ -104,13 +114,18 @@ type keyMap struct {
 
 // ShortHelp returns keybindings to be shown in the mini help view
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Connect, k.Actions, k.Info, k.New, k.Settings, k.Firewall, k.Help, k.Quit}
+	bindings := []key.Binding{k.Up, k.Connect, k.Actions, k.Info, k.New, k.Settings, k.Firewall}
+	if k.Questions.Enabled() {
+		bindings = append(bindings, k.Questions)
+	}
+	bindings = append(bindings, k.Help, k.Quit)
+	return bindings
 }
 
 // FullHelp returns keybindings for the expanded help view
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Down, k.Connect, k.Actions, k.Info, k.New, k.Settings, k.Firewall},
+		{k.Up, k.Down, k.Connect, k.Actions, k.Info, k.New, k.Settings, k.Firewall, k.Questions},
 		{k.Help, k.Quit},
 	}
 }
@@ -239,6 +254,19 @@ func NewWithCache(containerPrefix string, cached *CachedState) *Model {
 		relPath = "~" + strings.TrimPrefix(cwd, homeDir)
 	}
 
+	// Try to create daemon client (non-fatal if daemon not running)
+	authDir := viper.GetString("claude.auth_path")
+	if authDir == "" {
+		authDir = paths.AuthDir()
+	}
+	// Expand ~ in path
+	if strings.HasPrefix(authDir, "~") {
+		if h, err := os.UserHomeDir(); err == nil {
+			authDir = filepath.Join(h, authDir[1:])
+		}
+	}
+	daemonClient, _ := NewDaemonClient(authDir)
+
 	m := &Model{
 		containerPrefix:     containerPrefix,
 		help:                help.New(),
@@ -254,6 +282,8 @@ func NewWithCache(containerPrefix string, cached *CachedState) *Model {
 		animationFrame:      0,
 		operationInProgress: false,
 		operationSpinner:    opSpinner,
+		daemonClient:        daemonClient,
+		daemonConfigDir:     authDir,
 		keys: keyMap{
 			Up: key.NewBinding(
 				key.WithKeys("up", "k"),
@@ -272,8 +302,8 @@ func NewWithCache(containerPrefix string, cached *CachedState) *Model {
 				key.WithHelp("a", "actions"),
 			),
 			Info: key.NewBinding(
-				key.WithKeys("i"),
-				key.WithHelp("i", "details"),
+				key.WithKeys("d"),
+				key.WithHelp("d", "details"),
 			),
 			New: key.NewBinding(
 				key.WithKeys("n"),
@@ -286,6 +316,11 @@ func NewWithCache(containerPrefix string, cached *CachedState) *Model {
 			Firewall: key.NewBinding(
 				key.WithKeys("f"),
 				key.WithHelp("f", "firewall"),
+			),
+			Questions: key.NewBinding(
+				key.WithKeys("i"),
+				key.WithHelp("i", "questions"),
+				key.WithDisabled(),
 			),
 			Help: key.NewBinding(
 				key.WithKeys("?"),
@@ -372,8 +407,8 @@ func (m Model) Init() tea.Cmd {
 		return tea.Batch(m.alert.Init(), wizardAnimationTick())
 	}
 
-	// Normal mode: Start spinner, load containers, and initialize alert system
-	cmds := []tea.Cmd{m.loadContainers(), m.alert.Init()}
+	// Normal mode: Start spinner, load containers, fetch questions, and initialize alert system
+	cmds := []tea.Cmd{m.loadContainers(), m.fetchPendingQuestions(), m.alert.Init()}
 
 	// Start spinner animation if we're loading
 	if m.loading {
@@ -485,12 +520,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshTickMsg:
 		// Background refresh tick (30s)
 		// Skip refresh if modal is active or operation in progress
-		if m.modal != nil || m.operationInProgress {
-			return m, tea.Batch(refreshTick(), alertCmd)
+		cmds := []tea.Cmd{refreshTick(), alertCmd}
+		if m.modal == nil && !m.operationInProgress {
+			// Set syncing status and reload containers in background
+			m.operationStatus = "Syncing..."
+			cmds = append(cmds, m.loadContainers())
 		}
-		// Set syncing status and reload containers in background
-		m.operationStatus = "Syncing..."
-		return m, tea.Batch(m.loadContainers(), refreshTick(), alertCmd)
+		// Always poll for pending questions (even with modal open)
+		cmds = append(cmds, m.fetchPendingQuestions())
+		return m, tea.Batch(cmds...)
 
 	case exitWizardMsg:
 		// Exit wizard mode (Skip Wizard button)
@@ -663,6 +701,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.modal != nil {
 		var modalCmd tea.Cmd
 		m.modal, modalCmd = m.modal.Update(msg)
+		// If modal was dismissed via Esc (modalCmd == nil) while showing a question,
+		// dismiss the event from the daemon. When an action was selected (modalCmd != nil),
+		// don't dismiss — the action handler (submitQuestionMsg) will process it.
+		if m.modal == nil && m.activeQuestionEvent != "" && modalCmd == nil {
+			eventID := m.activeQuestionEvent
+			m.activeQuestionEvent = ""
+			dismissCmd := func() tea.Msg {
+				return dismissQuestionMsg{eventID: eventID}
+			}
+			return m, tea.Batch(alertCmd, dismissCmd)
+		}
 		return m, tea.Batch(modalCmd, alertCmd)
 	}
 
@@ -764,6 +813,155 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, toastCmd
 
+	case pendingQuestionsMsg:
+		if msg.err == nil {
+			m.pendingQuestions = msg.questions
+			if len(m.pendingQuestions) > 0 {
+				m.keys.Questions.SetEnabled(true)
+			} else {
+				m.keys.Questions.SetEnabled(false)
+			}
+			m.updateStatusBar()
+		} else {
+			// Connection failed — attempt reconnect
+			if m.daemonClient != nil {
+				if err := m.daemonClient.Reconnect(); err == nil {
+					// Reconnected — immediately re-fetch
+					return m, m.fetchPendingQuestions()
+				}
+			}
+			// Client was nil or reconnect failed — try creating a fresh client
+			// (daemon may have started after the TUI)
+			if client, err := NewDaemonClient(m.daemonConfigDir); err == nil && client != nil {
+				m.daemonClient = client
+				return m, m.fetchPendingQuestions()
+			}
+		}
+		return m, nil
+
+	case nextQuestionMsg:
+		// Multi-question flow: store this answer, advance to next question
+		m.questionAnswers = append(m.questionAnswers, msg.answer)
+		m.questionIndex++
+		if len(m.pendingQuestions) > 0 {
+			m.modal = m.createQuestionModal(m.pendingQuestions[0], m.questionIndex)
+		}
+		return m, nil
+
+	case submitQuestionMsg:
+		// User selected an answer in the (last) question modal — dispatch async HTTP call
+		m.modal = nil
+		m.activeQuestionEvent = "" // prevent double-dismiss from modal close detection
+		// Combine accumulated answers with the final selection
+		allSelections := append(m.questionAnswers, msg.selections...)
+		m.questionAnswers = nil
+		m.questionIndex = 0
+		client := m.daemonClient
+		eventID := msg.eventID
+		selections := allSelections
+		text := msg.text
+		cmd := func() tea.Msg {
+			if client == nil {
+				return answerQuestionMsg{eventID: eventID, err: fmt.Errorf("daemon not connected")}
+			}
+			err := client.AnswerNotification(eventID, selections, text)
+			return answerQuestionMsg{eventID: eventID, err: err}
+		}
+		return m, cmd
+
+	case otherQuestionMsg:
+		// User clicked "Other..." — replace modal with a text input form
+		m.modal = nil
+		// activeQuestionEvent stays set — this is still the same question
+
+		// Determine if more questions remain after this one
+		isLastQuestion := true
+		if len(m.pendingQuestions) > 0 {
+			pq := m.pendingQuestions[0]
+			if pq.Event.Question != nil {
+				isLastQuestion = m.questionIndex >= len(pq.Event.Question.Questions)-1
+			}
+		}
+
+		ti := textinput.New()
+		ti.Placeholder = "Type your answer..."
+		ti.Width = 80
+		ti.CharLimit = 500
+		ti.Focus()
+		ti.PromptStyle = lipgloss.NewStyle().Foreground(style.OceanTide)
+		ti.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+		ti.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
+
+		eventID := msg.eventID
+		lastQ := isLastQuestion
+		modal := &Modal{
+			Type:         ModalForm,
+			Title:        "Answer — " + msg.shortName,
+			Content:      msg.question + "\n",
+			Width:        90,
+			textinputs:   []textinput.Model{ti},
+			focusedField: 1, // focus the textinput (field 0 is textarea which is nil)
+			fieldLabels:  []string{"Your answer:"},
+			Actions: []ModalAction{
+				{Label: "Submit", Key: "enter", IsPrimary: true},
+				{Label: "Cancel", Key: "esc", IsPrimary: false},
+			},
+		}
+		modal.Actions[0].OnSelect = func() tea.Msg {
+			val := modal.textinputs[0].Value()
+			if lastQ {
+				return submitQuestionMsg{eventID: eventID, text: val}
+			}
+			return nextQuestionMsg{answer: val}
+		}
+		m.modal = modal
+		return m, nil
+
+	case dismissQuestionMsg:
+		// User dismissed a notification — remove it from daemon's pending list
+		m.modal = nil
+		m.activeQuestionEvent = "" // prevent double-dismiss from modal close detection
+		client := m.daemonClient
+		eventID := msg.eventID
+		cmd := func() tea.Msg {
+			if client != nil {
+				_ = client.DismissNotification(eventID)
+			}
+			return dismissQuestionResultMsg{eventID: eventID}
+		}
+		return m, cmd
+
+	case dismissQuestionResultMsg:
+		// Remove dismissed notification from local pending list
+		for i, pq := range m.pendingQuestions {
+			if pq.Event.ID == msg.eventID {
+				m.pendingQuestions = append(m.pendingQuestions[:i], m.pendingQuestions[i+1:]...)
+				break
+			}
+		}
+		if len(m.pendingQuestions) == 0 {
+			m.keys.Questions.SetEnabled(false)
+		}
+		m.updateStatusBar()
+		return m, nil
+
+	case answerQuestionMsg:
+		if msg.err != nil {
+			toastCmd := m.alert.NewAlertCmd("Error", "Failed to submit answer: "+msg.err.Error())
+			return m, toastCmd
+		}
+		// Remove answered question from pending list
+		for i, pq := range m.pendingQuestions {
+			if pq.Event.ID == msg.eventID {
+				m.pendingQuestions = append(m.pendingQuestions[:i], m.pendingQuestions[i+1:]...)
+				break
+			}
+		}
+		m.updateStatusBar()
+		toastCmd := m.alert.NewAlertCmd("Success", "Answer submitted")
+		return m, toastCmd
+
 	case views.ConnectRequestMsg:
 		// User pressed Enter to connect to a container
 		m.result = &TUIResult{
@@ -776,6 +974,106 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Show actions menu for container
 		m.modal = createActionsModal(msg.Container)
 		return m, nil
+
+	case showUpdateResourcesMsg:
+		// Fetch current resource values and show form
+		m.modal = nil
+		details, err := container.GetContainerDetails(msg.ContainerName, m.containerPrefix)
+		if err != nil {
+			m.modal = NewErrorModal("Error", "Failed to get container details: "+err.Error())
+			return m, nil
+		}
+
+		// Parse display format to Docker format (e.g. "8.0 GB" -> "8g", "4.0" -> "4")
+		currentMemory := details.Memory
+		if strings.HasSuffix(currentMemory, " GB") {
+			val := strings.TrimSuffix(currentMemory, " GB")
+			// Remove trailing ".0" for cleaner display
+			if strings.HasSuffix(val, ".0") {
+				val = strings.TrimSuffix(val, ".0")
+			}
+			currentMemory = val + "g"
+		}
+		currentCPUs := details.CPUs
+		if strings.HasSuffix(currentCPUs, ".0") {
+			currentCPUs = strings.TrimSuffix(currentCPUs, ".0")
+		}
+
+		// Create text inputs
+		memoryInput := textinput.New()
+		memoryInput.Placeholder = "e.g., 4g, 8g, 14g"
+		memoryInput.SetValue(currentMemory)
+		memoryInput.Width = 90
+		memoryInput.CharLimit = 10
+		memoryInput.PromptStyle = lipgloss.NewStyle().Foreground(style.OceanTide)
+		memoryInput.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		memoryInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+		memoryInput.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
+		memoryInput.Focus()
+
+		cpusInput := textinput.New()
+		cpusInput.Placeholder = "e.g., 1, 2, 4, 12"
+		cpusInput.SetValue(currentCPUs)
+		cpusInput.Width = 90
+		cpusInput.CharLimit = 5
+		cpusInput.PromptStyle = lipgloss.NewStyle().Foreground(style.DimGray)
+		cpusInput.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		cpusInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+		cpusInput.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
+
+		containerName := msg.ContainerName
+		modal := &Modal{
+			Type:         ModalForm,
+			Title:        "Update Resources",
+			Width:        100,
+			Height:       18,
+			textinputs:   []textinput.Model{memoryInput, cpusInput},
+			focusedField: 0,
+			fieldLabels: []string{
+				"Memory Limit:",
+				"CPU Limit:",
+			},
+			Actions: []ModalAction{
+				{Label: "Save", Key: "ctrl+s", IsPrimary: true},
+				{Label: "Cancel", Key: "esc", IsPrimary: false},
+			},
+		}
+
+		modal.Actions[0].OnSelect = func() tea.Msg {
+			memory := ""
+			cpus := ""
+			if len(modal.textinputs) > 0 {
+				memory = modal.textinputs[0].Value()
+			}
+			if len(modal.textinputs) > 1 {
+				cpus = modal.textinputs[1].Value()
+			}
+			return updateResourcesMsg{
+				containerName: containerName,
+				memory:        memory,
+				cpus:          cpus,
+			}
+		}
+
+		m.modal = modal
+		return m, nil
+
+	case updateResourcesMsg:
+		m.modal = nil
+		m.operationInProgress = true
+		m.operationStatus = "Updating resources..."
+
+		toastCmd := m.alert.NewAlertCmd("Info", fmt.Sprintf("Updating resources for %s...", msg.containerName))
+		operationCmd := func() tea.Msg {
+			err := container.UpdateContainerResources(msg.containerName, msg.memory, msg.cpus)
+			return dockerOperationResult{
+				action:        container.OperationUpdateResources,
+				containerName: msg.containerName,
+				success:       err == nil,
+				err:           err,
+			}
+		}
+		return m, tea.Batch(toastCmd, operationCmd, m.operationSpinner.Tick)
 
 	case createContainerMsg:
 		// User submitted create container form - exit TUI and return to CLI
@@ -912,6 +1210,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				actionVerb = "restarted"
 			} else if msg.action == container.OperationRefreshTokens {
 				actionVerb = "tokens refreshed for"
+			} else if msg.action == container.OperationUpdateResources {
+				actionVerb = "resources updated for"
 			}
 			toastCmd := m.alert.NewAlertCmd("Success", fmt.Sprintf("Container %s %s", msg.containerName, actionVerb))
 
@@ -947,7 +1247,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.modal = createHelpModal()
 			}
 			return m, nil
-		case "i":
+		case "d":
 			// Show container details for selected container
 			if m.homeView != nil && len(m.homeView.GetContainers()) > 0 {
 				selectedIdx := m.homeView.GetCursor()
@@ -961,6 +1261,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.modal = createContainerDetailsModal(details)
 					}
 				}
+			}
+			return m, nil
+		case "i":
+			// Show pending questions modal
+			if len(m.pendingQuestions) > 0 {
+				m.questionIndex = 0
+				m.questionAnswers = nil
+				m.modal = m.createQuestionModal(m.pendingQuestions[0], 0)
+				m.activeQuestionEvent = m.pendingQuestions[0].Event.ID
 			}
 			return m, nil
 		case "n":
@@ -996,7 +1305,8 @@ func createHelpModal() *Modal {
 
 Actions:
   a             Container actions menu
-  i             View container details
+  d             View container details
+  i             View pending questions
   ?             Show this help
   q             Quit Maestro
 
@@ -1763,6 +2073,14 @@ func createActionsModal(containerInfo container.Info) *Modal {
 				},
 			},
 			{
+				Label:     "Update Resources",
+				Key:       "u",
+				IsPrimary: false,
+				OnSelect: func() tea.Msg {
+					return showUpdateResourcesMsg{ContainerName: containerInfo.Name}
+				},
+			},
+			{
 				Label:     "Cancel",
 				Key:       "esc",
 				IsPrimary: false,
@@ -1826,6 +2144,11 @@ func (m Model) handleContainerAction(msg ContainerActionMsg) (tea.Model, tea.Cmd
 		operationCmd := m.performDockerOperation(msg.Action, msg.ContainerName)
 		return m, tea.Batch(toastCmd, operationCmd, m.operationSpinner.Tick)
 
+	case container.OperationUpdateResources:
+		// Handled by updateResourcesMsg — should not reach here via ContainerActionMsg
+		m.modal = NewErrorModal("Error", "Use the Update Resources form to update resources")
+		return m, nil
+
 	default:
 		m.modal = NewErrorModal("Error", "Unknown action: "+string(msg.Action))
 		return m, nil
@@ -1863,6 +2186,150 @@ func (m Model) performDockerOperation(action container.OperationType, containerN
 			err:           err,
 		}
 	}
+}
+
+// fetchPendingQuestions returns a Cmd that polls the daemon for pending questions.
+func (m Model) fetchPendingQuestions() tea.Cmd {
+	if m.daemonClient == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		questions, err := m.daemonClient.GetPendingNotifications()
+		return pendingQuestionsMsg{questions: questions, err: err}
+	}
+}
+
+// createQuestionModal creates a modal to display and answer a pending question.
+// questionIdx specifies which question in a multi-question AskUserQuestion call to show.
+func (m Model) createQuestionModal(pq notify.PendingQuestion, questionIdx int) *Modal {
+	event := pq.Event
+	totalQuestions := 0
+	if event.Question != nil {
+		totalQuestions = len(event.Question.Questions)
+	}
+
+	var content strings.Builder
+	content.WriteString(fmt.Sprintf("Container: %s\n\n", event.ShortName))
+
+	if totalQuestions > 0 && questionIdx < totalQuestions {
+		q := event.Question.Questions[questionIdx]
+		if totalQuestions > 1 {
+			content.WriteString(fmt.Sprintf("(%d/%d) ", questionIdx+1, totalQuestions))
+		}
+		content.WriteString(q.Question + "\n")
+	} else {
+		content.WriteString(event.Message + "\n")
+	}
+
+	actions := []ModalAction{}
+	isLastQuestion := questionIdx >= totalQuestions-1
+
+	// Multi-select uses a checkbox form; single-select uses action buttons
+	var checkboxes []bool
+	var fieldLabels []string
+	modalType := ModalActions
+
+	if totalQuestions > 0 && questionIdx < totalQuestions {
+		q := event.Question.Questions[questionIdx]
+
+		if q.MultiSelect {
+			// Multi-select: use checkboxes with a Confirm button
+			modalType = ModalForm
+			checkboxes = make([]bool, len(q.Options))
+			for _, opt := range q.Options {
+				fieldLabels = append(fieldLabels, opt.Label)
+			}
+
+			eventID := event.ID
+			opts := q.Options // capture for closure
+			actions = append(actions, ModalAction{
+				Label:     "Confirm",
+				Key:       "enter",
+				IsPrimary: true,
+				OnSelect: func() tea.Msg {
+					var selected []string
+					for i, checked := range checkboxes {
+						if checked && i < len(opts) {
+							selected = append(selected, opts[i].Label)
+						}
+					}
+					answer := strings.Join(selected, ", ")
+					if isLastQuestion {
+						return submitQuestionMsg{eventID: eventID, selections: selected}
+					}
+					return nextQuestionMsg{answer: answer}
+				},
+			})
+		} else {
+			// Single-select: action buttons with number keys
+			keys := []string{"1", "2", "3", "4"}
+			for i, opt := range q.Options {
+				if i >= len(keys) {
+					break
+				}
+				optLabel := opt.Label
+				eventID := event.ID
+				actions = append(actions, ModalAction{
+					Label:     fmt.Sprintf("%s: %s", keys[i], opt.Label),
+					Key:       keys[i],
+					IsPrimary: i == 0,
+					OnSelect: func() tea.Msg {
+						if isLastQuestion {
+							return submitQuestionMsg{eventID: eventID, selections: []string{optLabel}}
+						}
+						return nextQuestionMsg{answer: optLabel}
+					},
+				})
+			}
+			// Add "Other..." option for freeform text input
+			otherEventID := event.ID
+			otherShortName := event.ShortName
+			otherQuestion := q.Question
+			actions = append(actions, ModalAction{
+				Label:     "Other...",
+				Key:       "o",
+				IsPrimary: false,
+				OnSelect: func() tea.Msg {
+					return otherQuestionMsg{
+						eventID:   otherEventID,
+						shortName: otherShortName,
+						question:  otherQuestion,
+					}
+				},
+			})
+		}
+	}
+
+	dismissEventID := event.ID
+	actions = append(actions, ModalAction{
+		Label:     "Dismiss",
+		Key:       "esc",
+		IsPrimary: false,
+		OnSelect: func() tea.Msg {
+			return dismissQuestionMsg{eventID: dismissEventID}
+		},
+	})
+
+	title := "Question from " + event.ShortName
+	if totalQuestions > 1 {
+		title = fmt.Sprintf("Question %d/%d from %s", questionIdx+1, totalQuestions, event.ShortName)
+	}
+
+	modal := &Modal{
+		Type:           modalType,
+		Title:          title,
+		Content:        content.String(),
+		Width:          90,
+		Actions:        actions,
+		SelectedAction: 0,
+	}
+	if len(checkboxes) > 0 {
+		modal.checkboxes = checkboxes
+		modal.fieldLabels = fieldLabels
+		// Focus the first checkbox (field 0 = textarea (nil), then checkboxes start at 1)
+		modal.focusedField = 1
+	}
+	return modal
 }
 
 // getActiveKeys returns the appropriate keybindings based on current state
@@ -2223,10 +2690,22 @@ func (m *Model) updateStatusBar() {
 		Background(style.DimGray).
 		Render(pathText)
 
-	// Column 3: Operation status with spinner if operation in progress (PurpleHaze background)
+	// Column 3: Operation status / question badge (PurpleHaze background)
 	// Shows warning in red if Docker is unresponsive
 	var col3 string
-	if !m.dockerResponsive {
+	if len(m.pendingQuestions) > 0 {
+		// Show question badge
+		qText := fmt.Sprintf("Q %d question", len(m.pendingQuestions))
+		if len(m.pendingQuestions) != 1 {
+			qText += "s"
+		}
+		qText += " (i key)"
+		col3 = lipgloss.NewStyle().
+			Foreground(style.GhostWhite).
+			Background(style.SunsetGlow).
+			Bold(true).
+			Render(" " + qText + " ")
+	} else if !m.dockerResponsive {
 		// Docker not responding - show red warning
 		col3 = lipgloss.NewStyle().
 			Foreground(style.GhostWhite).

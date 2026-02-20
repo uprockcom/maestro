@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/uprockcom/maestro/pkg/container"
+	"github.com/uprockcom/maestro/pkg/notify"
 )
 
 // validRequestID matches UUID v4 format used for IPC request IDs
@@ -86,6 +87,9 @@ func NewIPCServer(d *Daemon, token string) (*IPCServer, error) {
 	mux.HandleFunc("POST /request", s.requireAuth(s.handleRequest))
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("POST /shutdown", s.requireAuth(s.handleShutdown))
+	mux.HandleFunc("GET /notifications/pending", s.requireAuth(s.handleGetPendingNotifications))
+	mux.HandleFunc("POST /notifications/answer", s.requireAuth(s.handleAnswerNotification))
+	mux.HandleFunc("POST /notifications/dismiss", s.requireAuth(s.handleDismissNotification))
 
 	s.server = &http.Server{
 		Handler:      mux,
@@ -202,6 +206,10 @@ func (s *IPCServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		s.handleReadMessages(w, req)
 	case IPCActionSendMessage:
 		s.handleSendMessage(w, req)
+	case IPCActionAnswerQuestion:
+		s.handleAnswerQuestion(w, req)
+	case IPCActionRequest:
+		s.handleResourceRequest(w, req)
 	default:
 		writeJSON(w, http.StatusBadRequest, IPCResponse{
 			Status: "error",
@@ -221,6 +229,14 @@ func (s *IPCServer) handleNewContainer(w http.ResponseWriter, req IPCRequest) {
 
 	s.daemon.logInfo("IPC: new container request from %s: %s", req.Parent, req.Task)
 
+	// Mark as in-flight so the recovery scanner (checkPendingRequests) won't
+	// pick up the same request while we're processing it.
+	if req.ID != "" {
+		s.inFlightMu.Lock()
+		s.inFlight[req.ID] = true
+		s.inFlightMu.Unlock()
+	}
+
 	// Return 202 Accepted immediately, process in background
 	writeJSON(w, http.StatusAccepted, IPCResponse{
 		Status: "accepted",
@@ -230,6 +246,13 @@ func (s *IPCServer) handleNewContainer(w http.ResponseWriter, req IPCRequest) {
 	s.daemon.wg.Add(1)
 	go func() {
 		defer s.daemon.wg.Done()
+		defer func() {
+			if req.ID != "" {
+				s.inFlightMu.Lock()
+				delete(s.inFlight, req.ID)
+				s.inFlightMu.Unlock()
+			}
+		}()
 		childName, err := s.daemon.createChildContainer(req.Task, req.Parent, req.Branch)
 		if err != nil {
 			s.daemon.logError("IPC: failed to create child container for %s: %v", req.Parent, err)
@@ -260,7 +283,20 @@ func (s *IPCServer) handleNotify(w http.ResponseWriter, req IPCRequest) {
 	// notify the user. The shouldNotify rate-limiting only applies to daemon-generated
 	// alerts (attention_needed, token_expiring), not explicit IPC requests.
 	if s.daemon.config.NotificationsOn && !s.daemon.isQuietHours() {
-		s.daemon.notify(req.Title, containerShort, req.Message)
+		if s.daemon.notifyEngine != nil {
+			event := notify.Event{
+				ID:            fmt.Sprintf("ipc-%s-%d", req.Parent, time.Now().UnixMilli()),
+				ContainerName: req.Parent,
+				ShortName:     containerShort,
+				Title:         req.Title,
+				Message:       req.Message,
+				Type:          notify.EventContainerNotification,
+				Timestamp:     time.Now(),
+			}
+			s.daemon.notifyEngine.Notify(event)
+		} else {
+			s.daemon.notify(req.Title, containerShort, req.Message)
+		}
 	}
 
 	s.daemon.logInfo("IPC: notification from %s: %s - %s", containerShort, req.Title, req.Message)
@@ -628,7 +664,7 @@ func (s *IPCServer) checkPendingRequests(containerName string, state *ContainerS
 							s.updateRequestFile(containerName, rf.ID, IPCRequestStatusFailed, "", "claude process exited (dormant)")
 							return
 						}
-						if container.CheckIdleStatus(childContainer) {
+						if isChildIdle(childContainer) {
 							s.updateRequestFile(containerName, rf.ID, IPCRequestStatusFulfilled, "", "")
 							return
 						}
@@ -682,12 +718,106 @@ func (s *IPCServer) checkPendingRequests(containerName string, state *ContainerS
 			s.inFlightMu.Lock()
 			delete(s.inFlight, reqFile.ID)
 			s.inFlightMu.Unlock()
+
+		case IPCActionAnswerQuestion:
+			// Safe to retry — writes a response file (idempotent)
+			s.daemon.wg.Add(1)
+			go func(rf IPCRequestFile) {
+				defer s.daemon.wg.Done()
+				defer func() {
+					s.inFlightMu.Lock()
+					delete(s.inFlight, rf.ID)
+					s.inFlightMu.Unlock()
+				}()
+				fakeReq := IPCRequest{
+					ID:              rf.ID,
+					Action:          rf.Action,
+					Parent:          containerName,
+					TargetRequestID: rf.TargetRequestID,
+				}
+				childContainer, err := s.resolveChildContainer(fakeReq)
+				if err != nil {
+					s.daemon.logError("IPC: recovery failed for answer_question %s: %v", rf.ID, err)
+					errMsg := err.Error()
+					s.updateRequestFile(containerName, rf.ID, IPCRequestStatusFailed, "", errMsg)
+					return
+				}
+				if err := container.WriteQuestionResponse(childContainer, rf.Selections, rf.Message); err != nil {
+					errMsg := err.Error()
+					s.updateRequestFile(containerName, rf.ID, IPCRequestStatusFailed, "", errMsg)
+					return
+				}
+				s.updateRequestFile(containerName, rf.ID, IPCRequestStatusFulfilled, "", "")
+			}(reqFile)
+
+		case IPCActionRequest:
+			// Re-create approval notification on daemon recovery
+			s.daemon.wg.Add(1)
+			go func(rf IPCRequestFile) {
+				defer s.daemon.wg.Done()
+				defer func() {
+					s.inFlightMu.Lock()
+					delete(s.inFlight, rf.ID)
+					s.inFlightMu.Unlock()
+				}()
+
+				containerShort := s.daemon.getShortName(containerName)
+				var questionText string
+				switch rf.RequestType {
+				case "domain":
+					questionText = fmt.Sprintf("Container %s requests firewall access to domain: %s", containerShort, rf.RequestValue)
+				case "memory":
+					questionText = fmt.Sprintf("Container %s requests memory increase to: %s", containerShort, rf.RequestValue)
+				case "cpus":
+					questionText = fmt.Sprintf("Container %s requests CPU increase to: %s", containerShort, rf.RequestValue)
+				case "ip":
+					questionText = fmt.Sprintf("Container %s requests firewall access to IP: %s", containerShort, rf.RequestValue)
+				default:
+					s.daemon.logError("IPC: recovery skipping request %s with unknown type %q", rf.ID, rf.RequestType)
+					return
+				}
+
+				eventID := fmt.Sprintf("request-%s-%s", containerName, rf.ID)
+				event := notify.Event{
+					ID:            eventID,
+					ContainerName: containerName,
+					ShortName:     containerShort,
+					Title:         "Resource Request",
+					Message:       questionText,
+					Type:          notify.EventQuestion,
+					Timestamp:     time.Now(),
+					Question: &notify.QuestionData{
+						Questions: []notify.QuestionItem{{
+							Question: questionText,
+							Header:   "Request",
+							Options: []notify.QuestionOption{
+								{Label: "Approve", Description: "Grant the request"},
+								{Label: "Deny", Description: "Reject the request"},
+							},
+						}},
+					},
+				}
+
+				s.daemon.RegisterApproval(eventID, &pendingApproval{
+					ContainerName: containerName,
+					RequestID:     rf.ID,
+					RequestType:   rf.RequestType,
+					RequestValue:  rf.RequestValue,
+				})
+				s.daemon.sendNotification(event)
+			}(reqFile)
 		}
 	}
 }
 
 // resolveChildContainer authenticates a parent→child request by reading the original
 // "new" request from the parent's filesystem and validating ownership.
+// isChildIdle checks if a child container's Claude is idle (waiting/idle/question state).
+func isChildIdle(containerName string) bool {
+	state := container.ReadAgentState(containerName)
+	return state == "idle" || state == "waiting" || state == "question"
+}
+
 func (s *IPCServer) resolveChildContainer(req IPCRequest) (string, error) {
 	if req.TargetRequestID == "" {
 		return "", fmt.Errorf("missing target_request_id")
@@ -777,7 +907,7 @@ func (s *IPCServer) handleWaitIdle(w http.ResponseWriter, req IPCRequest) {
 				}
 
 				// Check if idle
-				if container.CheckIdleStatus(childContainer) {
+				if isChildIdle(childContainer) {
 					s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFulfilled, "", "")
 					return
 				}
@@ -868,43 +998,60 @@ func (s *IPCServer) handleSendMessage(w http.ResponseWriter, req IPCRequest) {
 			return
 		}
 
-		// Write message to temp file in child container
-		writeCmd := exec.Command("docker", "exec", "-i", childContainer, "tee", "/tmp/maestro-msg")
-		writeCmd.Stdin = strings.NewReader(req.Message)
-		writeCmd.Stdout = nil
-		if err := writeCmd.Run(); err != nil {
-			s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFailed, "", "failed to write message to child: "+err.Error())
+		// If the child has a pending question, answer it via the hook's response
+		// file instead of injecting text into tmux (which would be ignored while
+		// the PreToolUse hook is blocking).
+		if qd, _ := notify.ReadContainerQuestion(childContainer); qd != nil {
+			s.daemon.logInfo("IPC: child %s has pending question, routing send_message as question answer", childContainer)
+			if err := container.WriteQuestionResponse(childContainer, nil, req.Message); err != nil {
+				s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFailed, "", err.Error())
+				return
+			}
+			s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFulfilled, "", "")
 			return
 		}
 
-		// Load into tmux buffer
-		loadCmd := exec.Command("docker", "exec", childContainer, "tmux", "load-buffer", "/tmp/maestro-msg")
-		if err := loadCmd.Run(); err != nil {
-			s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFailed, "", "failed to load tmux buffer: "+err.Error())
+		if err := container.InjectTextToContainer(childContainer, req.Message); err != nil {
+			s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFailed, "", err.Error())
 			return
 		}
 
-		// Paste into Claude pane
-		pasteCmd := exec.Command("docker", "exec", childContainer, "tmux", "paste-buffer", "-t", "main:0", "-d")
-		if err := pasteCmd.Run(); err != nil {
-			s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFailed, "", "failed to paste message: "+err.Error())
+		s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFulfilled, "", "")
+	}()
+}
+
+func (s *IPCServer) handleAnswerQuestion(w http.ResponseWriter, req IPCRequest) {
+	childContainer, err := s.resolveChildContainer(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  err.Error(),
+		})
+		return
+	}
+
+	if len(req.Selections) == 0 && req.Message == "" {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "missing required field: selections or message",
+		})
+		return
+	}
+
+	s.daemon.logInfo("IPC: answer_question request from %s for child %s", req.Parent, childContainer)
+
+	writeJSON(w, http.StatusAccepted, IPCResponse{
+		Status: "accepted",
+	})
+
+	s.daemon.wg.Add(1)
+	go func() {
+		defer s.daemon.wg.Done()
+
+		if err := container.WriteQuestionResponse(childContainer, req.Selections, req.Message); err != nil {
+			s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFailed, "", err.Error())
 			return
 		}
-
-		// Press enter
-		enterCmd := exec.Command("docker", "exec", childContainer, "tmux", "send-keys", "-t", "main:0", "C-m")
-		if err := enterCmd.Run(); err != nil {
-			s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFailed, "", "failed to send enter key: "+err.Error())
-			return
-		}
-
-		// Clean up temp file
-		cleanCmd := exec.Command("docker", "exec", childContainer, "rm", "-f", "/tmp/maestro-msg")
-		_ = cleanCmd.Run()
-
-		// Remove idle flag proactively (prevents race with hooks)
-		rmIdleCmd := exec.Command("docker", "exec", childContainer, "rm", "-f", "/home/node/.maestro/claude-idle")
-		_ = rmIdleCmd.Run()
 
 		s.updateRequestFile(req.Parent, req.ID, IPCRequestStatusFulfilled, "", "")
 	}()
@@ -937,6 +1084,22 @@ func (s *IPCServer) updateRequestFileWithMessages(containerName, requestID strin
 	reqFile.FulfilledAt = &now
 	reqFile.Messages = messages
 
+	// Include pending question from child container if one exists
+	if reqFile.TargetRequestID != "" {
+		// Resolve child container name from the original "new" request
+		fakeReq := IPCRequest{
+			ID:              reqFile.ID,
+			Action:          reqFile.Action,
+			Parent:          containerName,
+			TargetRequestID: reqFile.TargetRequestID,
+		}
+		if childContainer, err := s.resolveChildContainer(fakeReq); err == nil {
+			if qd, err := notify.ReadContainerQuestion(childContainer); err == nil && qd != nil {
+				reqFile.PendingQuestion = qd
+			}
+		}
+	}
+
 	updatedJSON, err := json.MarshalIndent(reqFile, "", "  ")
 	if err != nil {
 		s.daemon.logError("IPC: failed to marshal updated request file: %v", err)
@@ -949,6 +1112,204 @@ func (s *IPCServer) updateRequestFileWithMessages(containerName, requestID strin
 	if err := writeCmd.Run(); err != nil {
 		s.daemon.logError("IPC: failed to write updated request file %s in %s: %v", requestID, containerName, err)
 	}
+}
+
+func (s *IPCServer) handleGetPendingNotifications(w http.ResponseWriter, r *http.Request) {
+	if s.daemon.localProvider == nil {
+		writeJSON(w, http.StatusOK, []notify.PendingQuestion{})
+		return
+	}
+	all := s.daemon.localProvider.GetPending()
+	// Only surface interactive questions to the TUI — attention/token/task
+	// notifications are redundant since the TUI already shows container status.
+	questions := make([]notify.PendingQuestion, 0, len(all))
+	for _, pq := range all {
+		if pq.Event.Type == notify.EventQuestion || pq.Event.Type == notify.EventContainerNotification {
+			questions = append(questions, pq)
+		}
+	}
+	writeJSON(w, http.StatusOK, questions)
+}
+
+// answerRequest is the JSON body for POST /notifications/answer.
+type answerRequest struct {
+	EventID    string   `json:"event_id"`
+	Selections []string `json:"selections,omitempty"`
+	Text       string   `json:"text,omitempty"`
+}
+
+func (s *IPCServer) handleAnswerNotification(w http.ResponseWriter, r *http.Request) {
+	var req answerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "invalid JSON: " + err.Error(),
+		})
+		return
+	}
+	if req.EventID == "" {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "missing required field: event_id",
+		})
+		return
+	}
+
+	if s.daemon.notifyEngine == nil {
+		writeJSON(w, http.StatusServiceUnavailable, IPCResponse{
+			Status: "error",
+			Error:  "notification engine not initialized",
+		})
+		return
+	}
+
+	// Build the response text: use selections joined, or freeform text
+	responseText := req.Text
+	if responseText == "" && len(req.Selections) > 0 {
+		responseText = strings.Join(req.Selections, ", ")
+	}
+
+	// Route through the LocalProvider so its response channel gets fulfilled.
+	// The engine's AskQuestion goroutine is waiting on that channel; pushing
+	// the response there lets it flow through handleResponse → callback
+	// naturally, and clears the LocalProvider's pending map.
+	if s.daemon.localProvider != nil {
+		// Find the container name from the pending question
+		containerName := ""
+		for _, pq := range s.daemon.localProvider.GetPending() {
+			if pq.Event.ID == req.EventID {
+				containerName = pq.Event.ContainerName
+				break
+			}
+		}
+
+		resp := notify.Response{
+			EventID:       req.EventID,
+			ContainerName: containerName,
+			Text:          responseText,
+			Provider:      "local",
+			Selections:    req.Selections,
+		}
+		s.daemon.localProvider.Answer(req.EventID, resp)
+	} else {
+		// Fallback: submit directly to engine (no local provider configured)
+		resp := notify.Response{
+			EventID:    req.EventID,
+			Text:       responseText,
+			Provider:   "local",
+			Selections: req.Selections,
+		}
+		s.daemon.notifyEngine.SubmitAnswer(req.EventID, resp)
+	}
+
+	writeJSON(w, http.StatusOK, IPCResponse{Status: "ok"})
+}
+
+func (s *IPCServer) handleDismissNotification(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "invalid JSON: " + err.Error(),
+		})
+		return
+	}
+	if req.EventID == "" {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "event_id is required",
+		})
+		return
+	}
+
+	// Cancel in engine and notify all providers (local, Signal, Slack, etc.)
+	if s.daemon.notifyEngine != nil {
+		s.daemon.notifyEngine.CancelQuestionWithNotify(req.EventID)
+	}
+
+	writeJSON(w, http.StatusOK, IPCResponse{Status: "ok"})
+}
+
+func (s *IPCServer) handleResourceRequest(w http.ResponseWriter, req IPCRequest) {
+	// Validate request type
+	validTypes := map[string]bool{"domain": true, "memory": true, "cpus": true, "ip": true}
+	if !validTypes[req.RequestType] {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("invalid request_type %q (valid: domain, memory, cpus, ip)", req.RequestType),
+		})
+		return
+	}
+
+	if req.RequestValue == "" {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "missing required field: request_value",
+		})
+		return
+	}
+
+	s.daemon.logInfo("IPC: resource request from %s: %s=%s", req.Parent, req.RequestType, req.RequestValue)
+
+	// Return 202 Accepted immediately
+	writeJSON(w, http.StatusAccepted, IPCResponse{
+		Status: "accepted",
+	})
+
+	// Process in background
+	s.daemon.wg.Add(1)
+	go func() {
+		defer s.daemon.wg.Done()
+
+		containerShort := s.daemon.getShortName(req.Parent)
+		var questionText string
+		switch req.RequestType {
+		case "domain":
+			questionText = fmt.Sprintf("Container %s requests firewall access to domain: %s", containerShort, req.RequestValue)
+		case "memory":
+			questionText = fmt.Sprintf("Container %s requests memory increase to: %s", containerShort, req.RequestValue)
+		case "cpus":
+			questionText = fmt.Sprintf("Container %s requests CPU increase to: %s", containerShort, req.RequestValue)
+		case "ip":
+			questionText = fmt.Sprintf("Container %s requests firewall access to IP: %s", containerShort, req.RequestValue)
+		}
+
+		eventID := fmt.Sprintf("request-%s-%s", req.Parent, req.ID)
+		event := notify.Event{
+			ID:            eventID,
+			ContainerName: req.Parent,
+			ShortName:     containerShort,
+			Title:         "Resource Request",
+			Message:       questionText,
+			Type:          notify.EventQuestion,
+			Timestamp:     time.Now(),
+			Question: &notify.QuestionData{
+				Questions: []notify.QuestionItem{{
+					Question: questionText,
+					Header:   "Request",
+					Options: []notify.QuestionOption{
+						{Label: "Approve", Description: "Grant the request"},
+						{Label: "Deny", Description: "Reject the request"},
+					},
+				}},
+			},
+		}
+
+		s.daemon.RegisterApproval(eventID, &pendingApproval{
+			ContainerName: req.Parent,
+			RequestID:     req.ID,
+			RequestType:   req.RequestType,
+			RequestValue:  req.RequestValue,
+		})
+		s.daemon.sendNotification(event)
+	}()
+}
+
+// UpdateRequestFile is a public wrapper around updateRequestFile for use by the daemon callback
+func (s *IPCServer) UpdateRequestFile(containerName, requestID string, status IPCRequestStatus, childContainer, errMsg string) {
+	s.updateRequestFile(containerName, requestID, status, childContainer, errMsg)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

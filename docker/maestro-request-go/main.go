@@ -38,6 +38,7 @@ func main() {
 	root.AddCommand(statusCmd())
 	root.AddCommand(waitCmd())
 	root.AddCommand(claudeCmd())
+	root.AddCommand(requestCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

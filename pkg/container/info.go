@@ -25,6 +25,18 @@ import (
 	"time"
 )
 
+// infraContainers are maestro infrastructure containers that should be excluded
+// from user-facing listings, stop, and cleanup operations.
+var infraContainers = map[string]bool{
+	"maestro-signal-cli": true,
+}
+
+// IsInfraContainer returns true if the container is a maestro infrastructure
+// container (e.g. signal-cli) that should not appear in user-facing listings.
+func IsInfraContainer(name string) bool {
+	return infraContainers[name]
+}
+
 // ReadCredentials loads and parses credentials from a file path
 func ReadCredentials(path string) (*Credentials, error) {
 	data, err := os.ReadFile(path)
@@ -77,23 +89,58 @@ func GetShortName(containerName, prefix string) string {
 	return containerName
 }
 
-// GetBranchName retrieves the current git branch from a container
-func GetBranchName(containerName string) string {
-	cmd := exec.Command("docker", "exec", containerName, "git", "-C", "/workspace", "branch", "--show-current")
+// GetLabel reads a Docker label from a container.
+func GetLabel(containerName, label string) string {
+	cmd := exec.Command("docker", "inspect", "-f", fmt.Sprintf("{{index .Config.Labels %q}}", label), containerName)
 	output, err := cmd.Output()
 	if err != nil {
-		return "unknown"
+		return ""
 	}
-	return strings.TrimSpace(string(output))
+	val := strings.TrimSpace(string(output))
+	if val == "<no value>" {
+		return ""
+	}
+	return val
 }
 
-// CheckIdleStatus checks if a container's Claude agent is idle (waiting for input).
-// Returns true when the claude-idle flag file exists, which is created by the
-// Claude Code Stop hook and removed by UserPromptSubmit/PreToolUse hooks.
-func CheckIdleStatus(containerName string) bool {
+// getWorkspaceDir returns the primary git workspace directory for a container.
+// For multi-path projects this is read from the maestro.workspace label;
+// for single-path and ad-hoc containers it defaults to /workspace.
+func getWorkspaceDir(containerName string) string {
+	if ws := GetLabel(containerName, "maestro.workspace"); ws != "" {
+		return ws
+	}
+	return "/workspace"
+}
+
+// GetBranchName retrieves the current git branch from a container.
+// For multi-path projects, it uses the maestro.workspace label to identify
+// the primary repo directory. Falls back to /workspace for single-path and ad-hoc containers.
+func GetBranchName(containerName string) string {
+	gitDir := getWorkspaceDir(containerName)
+
+	cmd := exec.Command("docker", "exec", containerName, "git", "-C", gitDir, "branch", "--show-current")
+	output, err := cmd.Output()
+	if err == nil {
+		if branch := strings.TrimSpace(string(output)); branch != "" {
+			return branch
+		}
+	}
+
+	return "unknown"
+}
+
+// ReadAgentState reads the maestro-agent state from the container.
+// Returns the state string (starting, active, waiting, idle, clearing, connected)
+// or empty string if the state file doesn't exist (pre-maestro-agent containers).
+func ReadAgentState(containerName string) string {
 	cmd := exec.Command("docker", "exec", containerName,
-		"test", "-f", "/home/node/.maestro/claude-idle")
-	return cmd.Run() == nil
+		"cat", "/home/node/.maestro/state/agent-state")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 // IsClaudeRunning checks if Claude process is running in a container
@@ -176,6 +223,9 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
+		if IsInfraContainer(name) {
+			continue
+		}
 
 		// Parse creation time
 		createdAt, err := time.Parse("2006-01-02 15:04:05 -0700 MST", parts[3])
@@ -222,13 +272,13 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 				mu.Unlock()
 			}()
 
-			// Bell status
+			// Agent state
 			detailWg.Add(1)
 			go func() {
 				defer detailWg.Done()
-				needsAttention := CheckIdleStatus(basic.name)
+				agentState := ReadAgentState(basic.name)
 				mu.Lock()
-				info.NeedsAttention = needsAttention
+				info.AgentState = agentState
 				mu.Unlock()
 			}()
 
@@ -283,6 +333,9 @@ func GetAllContainers(prefix string) ([]Info, error) {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
+		if IsInfraContainer(name) {
+			continue
+		}
 
 		// Parse creation time
 		createdAt, err := time.Parse("2006-01-02 15:04:05 -0700 MST", parts[3])
@@ -332,13 +385,13 @@ func GetAllContainers(prefix string) ([]Info, error) {
 					mu.Unlock()
 				}()
 
-				// Bell status
+				// Agent state
 				detailWg.Add(1)
 				go func() {
 					defer detailWg.Done()
-					needsAttention := CheckIdleStatus(basic.name)
+					agentState := ReadAgentState(basic.name)
 					mu.Lock()
-					info.NeedsAttention = needsAttention
+					info.AgentState = agentState
 					mu.Unlock()
 				}()
 
@@ -448,8 +501,10 @@ func formatDuration(d time.Duration) string {
 // GetGitStatus gets git status indicators for a container
 // Returns a fixed-width string for proper column alignment
 func GetGitStatus(containerName string) string {
+	wsDir := getWorkspaceDir(containerName)
+
 	// Check if git repo exists
-	checkCmd := exec.Command("docker", "exec", containerName, "test", "-d", "/workspace/.git")
+	checkCmd := exec.Command("docker", "exec", containerName, "test", "-d", wsDir+"/.git")
 	if err := checkCmd.Run(); err != nil {
 		return padGitStatus("-")
 	}
@@ -458,7 +513,7 @@ func GetGitStatus(containerName string) string {
 
 	// Check for uncommitted changes
 	statusCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
-		"cd /workspace && git status --porcelain 2>/dev/null | wc -l")
+		fmt.Sprintf("cd %s && git status --porcelain 2>/dev/null | wc -l", wsDir))
 	if output, err := statusCmd.Output(); err == nil {
 		count := strings.TrimSpace(string(output))
 		if count != "0" {
@@ -468,7 +523,7 @@ func GetGitStatus(containerName string) string {
 
 	// Check commits ahead of remote
 	aheadCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
-		"cd /workspace && git rev-list --count @{u}..HEAD 2>/dev/null")
+		fmt.Sprintf("cd %s && git rev-list --count @{u}..HEAD 2>/dev/null", wsDir))
 	if output, err := aheadCmd.Output(); err == nil {
 		count := strings.TrimSpace(string(output))
 		if count != "0" && count != "" {
@@ -478,7 +533,7 @@ func GetGitStatus(containerName string) string {
 
 	// Check commits behind remote
 	behindCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
-		"cd /workspace && git rev-list --count HEAD..@{u} 2>/dev/null")
+		fmt.Sprintf("cd %s && git rev-list --count HEAD..@{u} 2>/dev/null", wsDir))
 	if output, err := behindCmd.Output(); err == nil {
 		count := strings.TrimSpace(string(output))
 		if count != "0" && count != "" {

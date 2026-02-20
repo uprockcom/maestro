@@ -32,6 +32,7 @@ func claudeCmd() *cobra.Command {
 
 	cmd.AddCommand(claudeReadCmd())
 	cmd.AddCommand(claudeSendCmd())
+	cmd.AddCommand(claudeAnswerCmd())
 	return cmd
 }
 
@@ -108,6 +109,16 @@ Prints messages in human-readable format, followed by JSON to stdout.`,
 						for _, msg := range r.Messages {
 							fmt.Fprintf(cmd.OutOrStdout(), "[%s] %s\n", msg.Role, msg.Timestamp)
 							fmt.Fprintln(cmd.OutOrStdout(), msg.Content)
+							fmt.Fprintln(cmd.OutOrStdout())
+						}
+						// Show pending question if present
+						if len(r.PendingQuestion) > 0 {
+							fmt.Fprintln(cmd.OutOrStdout(), "--- PENDING QUESTION ---")
+							var pq map[string]interface{}
+							if json.Unmarshal(r.PendingQuestion, &pq) == nil {
+								pqJSON, _ := json.MarshalIndent(pq, "", "  ")
+								fmt.Fprintln(cmd.OutOrStdout(), string(pqJSON))
+							}
 							fmt.Fprintln(cmd.OutOrStdout())
 						}
 						// Also output full JSON
@@ -222,5 +233,111 @@ The message is typed into the Claude pane and Enter is pressed.`,
 		},
 	}
 
+	return cmd
+}
+
+func claudeAnswerCmd() *cobra.Command {
+	var selections []string
+	var text string
+
+	cmd := &cobra.Command{
+		Use:   "answer <request-id>",
+		Short: "Answer a pending question in a child container's Claude session",
+		Long: `Answer a pending AskUserQuestion prompt in a child container.
+
+The request-id must be from a "maestro-request new" command that created the child.
+Use --select to choose option(s) and/or --text for freeform input.
+
+Examples:
+  maestro-request claude answer <id> --select "Option A"
+  maestro-request claude answer <id> --select "Option A" --select "Option B"
+  maestro-request claude answer <id> --text "Custom answer"
+  maestro-request claude answer <id> --select "Other" --text "Details here"`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			targetRequestID := args[0]
+
+			if len(selections) == 0 && text == "" {
+				fmt.Fprintf(os.Stderr, "Error: at least one --select or --text is required\n")
+				os.Exit(1)
+			}
+
+			id, err := generateUUID()
+			if err != nil {
+				return err
+			}
+
+			parent := hostname()
+
+			reqJSON, _ := json.Marshal(map[string]interface{}{
+				"id":                id,
+				"action":            "answer_question",
+				"parent":            parent,
+				"target_request_id": targetRequestID,
+				"selections":        selections,
+				"message":           text,
+			})
+
+			rf := &RequestFile{
+				ID:              id,
+				Action:          "answer_question",
+				Parent:          parent,
+				Status:          "pending",
+				RequestedAt:     nowUTC(),
+				TargetRequestID: targetRequestID,
+				Message:         text,
+			}
+			if err := writeRequestFile(rf); err != nil {
+				return err
+			}
+
+			if !daemonAvailable() {
+				fmt.Fprintf(os.Stderr, "Error: daemon not available\n")
+				os.Exit(1)
+			}
+
+			resp, err := daemonCall("POST", "/request", string(reqJSON))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			var result map[string]interface{}
+			if json.Unmarshal([]byte(resp), &result) == nil {
+				if status, _ := result["status"].(string); status == "error" {
+					errMsg, _ := result["error"].(string)
+					fmt.Fprintf(os.Stderr, "Error: %s\n", errMsg)
+					os.Exit(1)
+				}
+			}
+
+			// Poll until fulfilled or failed
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				r, err := readRequestFile(id)
+				if err == nil {
+					switch r.Status {
+					case "fulfilled":
+						fmt.Fprintln(cmd.OutOrStdout(), "Question answered successfully.")
+						return nil
+					case "failed":
+						data, _ := json.MarshalIndent(r, "", "  ")
+						fmt.Fprintln(cmd.OutOrStdout(), string(data))
+						os.Exit(1)
+					}
+				}
+
+				if time.Now().After(deadline) {
+					fmt.Fprintf(os.Stderr, "Timeout: answer_question did not complete within 30s\n")
+					os.Exit(1)
+				}
+
+				time.Sleep(defaultPollInterval)
+			}
+		},
+	}
+
+	cmd.Flags().StringArrayVar(&selections, "select", nil, "Selected option label (repeatable for multi-select)")
+	cmd.Flags().StringVar(&text, "text", "", "Freeform text answer (for 'Other' or standalone)")
 	return cmd
 }

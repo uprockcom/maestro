@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/uprockcom/maestro/pkg/paths"
@@ -31,7 +32,8 @@ const (
 	OperationStop          OperationType = "stop"
 	OperationRestart       OperationType = "restart"
 	OperationDelete        OperationType = "delete"
-	OperationRefreshTokens OperationType = "refresh-tokens"
+	OperationRefreshTokens      OperationType = "refresh-tokens"
+	OperationUpdateResources    OperationType = "update-resources"
 )
 
 // StopContainer stops a running container
@@ -315,6 +317,37 @@ func RefreshTokens(containerName string) error {
 		return fmt.Errorf("failed to fix credentials ownership: %w", err)
 	}
 
+	return nil
+}
+
+// UpdateContainerResources updates memory and/or CPU limits on a running container
+func UpdateContainerResources(containerName, memory, cpus string) error {
+	args := []string{"update"}
+
+	if memory != "" {
+		args = append(args, "--memory", memory, "--memory-swap", memory)
+	}
+	if cpus != "" {
+		args = append(args, "--cpus", cpus)
+	}
+
+	args = append(args, containerName)
+
+	cmd := exec.Command("docker", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to update container resources: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	return nil
+}
+
+// AddIPToContainer adds an IP address to a container's firewall whitelist
+func AddIPToContainer(containerName, ip string) error {
+	cmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
+		fmt.Sprintf("ipset add allowed-domains %s 2>/dev/null || true", ip))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to add IP to container firewall: %w", err)
+	}
 	return nil
 }
 

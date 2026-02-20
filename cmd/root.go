@@ -115,10 +115,37 @@ type Config struct {
 				Start string `mapstructure:"start"`
 				End   string `mapstructure:"end"`
 			} `mapstructure:"quiet_hours"`
+			Providers struct {
+				Desktop struct {
+					Enabled  bool     `mapstructure:"enabled"`
+					NotifyOn []string `mapstructure:"notify_on"`
+				} `mapstructure:"desktop"`
+				Local struct {
+					Enabled  bool     `mapstructure:"enabled"`
+					NotifyOn []string `mapstructure:"notify_on"`
+				} `mapstructure:"local"`
+				Slack struct {
+					Enabled  bool     `mapstructure:"enabled"`
+					AppToken string   `mapstructure:"app_token"`
+					BotToken string   `mapstructure:"bot_token"`
+					UserID   string   `mapstructure:"user_id"`
+					NotifyOn []string `mapstructure:"notify_on"`
+				} `mapstructure:"slack"`
+				Signal struct {
+					Enabled       bool     `mapstructure:"enabled"`
+					Number        string   `mapstructure:"number"`
+					Recipient     string   `mapstructure:"recipient"`
+					ContainerPort int      `mapstructure:"container_port"`
+					URL           string   `mapstructure:"url"`
+					APIKey        string   `mapstructure:"api_key"`
+					NotifyOn      []string `mapstructure:"notify_on"`
+				} `mapstructure:"signal"`
+			} `mapstructure:"providers"`
 		} `mapstructure:"notifications"`
 	} `mapstructure:"daemon"`
 
-	Apps map[string]string `mapstructure:"apps"` // name -> source path
+	Apps     map[string]string          `mapstructure:"apps"`     // name -> source path
+	Projects map[string]ProjectConfig   `mapstructure:"projects"` // name -> project config
 }
 
 var rootCmd = &cobra.Command{
@@ -344,6 +371,13 @@ func initConfig() {
 	viper.SetDefault("daemon.notifications.notify_on", []string{"attention_needed", "token_expiring", "tasks_completed", "container_notification"})
 	viper.SetDefault("daemon.notifications.quiet_hours.start", "")
 	viper.SetDefault("daemon.notifications.quiet_hours.end", "")
+	viper.SetDefault("daemon.notifications.providers.desktop.enabled", true)
+	viper.SetDefault("daemon.notifications.providers.local.enabled", true)
+	viper.SetDefault("daemon.notifications.providers.slack.enabled", false)
+	viper.SetDefault("daemon.notifications.providers.signal.enabled", false)
+	viper.SetDefault("daemon.notifications.providers.signal.container_port", 8080)
+	viper.SetDefault("daemon.notifications.providers.signal.url", "")
+	viper.SetDefault("daemon.notifications.providers.signal.api_key", "")
 	viper.SetDefault("apps", map[string]string{})
 	viper.SetDefault("wizard.always_run", false)
 	viper.SetDefault("wizard.resume_after_auth", false)

@@ -15,8 +15,18 @@ This document catalogs every special file inside a Maestro container — what cr
 ├── .claude.json                     # Claude Code config (copied from host, note: in home, not .claude/)
 ├── .maestro/
 │   ├── MAESTRO.md                   # Agent-facing docs (canonical location)
-│   ├── claude-idle                  # Flag file: Claude is waiting for input
-│   ├── current-question.json        # Structured AskUserQuestion data (when active)
+│   ├── claude-idle                  # Backward-compat flag: Claude is blocked (idle or question)
+│   ├── current-question.json        # Structured AskUserQuestion data (tool_input JSON)
+│   ├── question-response.txt        # Daemon-written answer to current question
+│   ├── state/
+│   │   ├── agent-state              # Current state (starting|active|waiting|idle|question|clearing)
+│   │   ├── claude-pid               # Main Claude process PID
+│   │   ├── session-ready            # Touched by SessionStart hook
+│   │   └── maestro-agent.pid        # Background service PID
+│   ├── logs/
+│   │   └── maestro-agent.log        # Structured JSON log (append-only)
+│   ├── pending-messages/
+│   │   └── {timestamp}.txt          # Queued messages (nanosecond timestamp filenames)
 │   ├── daemon/
 │   │   └── daemon-ipc.json          # Daemon connection info (read-only mount from host)
 │   └── requests/
@@ -63,6 +73,7 @@ These files exist in every container from the moment it's created.
 
 | Path | Source | Purpose |
 |---|---|---|
+| `/usr/local/bin/maestro-agent` | `docker/maestro-agent/` (CGO_ENABLED=0 go build) | Container-side agent lifecycle manager. Handles all Claude Code hooks, state machine, message queue, structured logging. Subcommands: `hook stop\|session-start\|prompt\|pre-tool-use\|ask\|post-tool-use`, `service`, `status`. |
 | `/usr/local/bin/daemon-ipc` | `docker/daemon-ipc/main.go` (CGO_ENABLED=0 go build) | Privilege-isolated IPC proxy. Runs as `maestro-ipc` user. Only process allowed through firewall to reach host. |
 | `/usr/local/bin/maestro-request` | `docker/maestro-request-go/` (CGO_ENABLED=0 go build) | Container-side CLI for IPC: `new`, `done`, `notify`, `status`, `wait`, `claude` subcommands. |
 | `/usr/local/bin/init-firewall.sh` | `assets/init-firewall.sh` | Firewall setup: iptables rules, ipset whitelist, dnsmasq DNS filtering, GitHub IP detection. |
@@ -127,18 +138,18 @@ These files are created by `cmd/new.go` functions after the container starts but
 |---|---|---|
 | `/home/node/.claude/settings.json` | `writeClaudeSettings()` | JSON |
 
-Hook events configured:
+Hook events configured (all hooks are maestro-agent subcommands):
 
-| Event | Matcher | Action |
-|---|---|---|
-| `Stop` | (all) | `touch claude-idle` |
-| `UserPromptSubmit` | (all) | `rm -f claude-idle` |
-| `PreToolUse` | (all) | `rm -f claude-idle` |
-| `PreToolUse` | `AskUserQuestion\|EnterPlanMode\|ExitPlanMode` | `touch claude-idle` |
-| `PreToolUse` | `AskUserQuestion` | `jq '.tool_input' > current-question.json` |
-| `PostToolUse` | `AskUserQuestion\|EnterPlanMode\|ExitPlanMode` | `rm -f claude-idle` |
-| `PostToolUse` | `AskUserQuestion` | `rm -f current-question.json` |
-| `PostToolUseFailure` | `AskUserQuestion` | `rm -f current-question.json` |
+| Event | Matcher | Command | Purpose |
+|---|---|---|---|
+| `Stop` | (all) | `maestro-agent hook stop` (timeout 86400) | Blocking wait for messages/user connection |
+| `SessionStart` | (all) | `maestro-agent hook session-start` | Readiness signal, compaction context |
+| `UserPromptSubmit` | (all) | `maestro-agent hook prompt` | Message delivery on wake-up |
+| `PreToolUse` | (all) | `maestro-agent hook pre-tool-use` | State → active |
+| `PreToolUse` | `AskUserQuestion\|EnterPlanMode\|ExitPlanMode` | `maestro-agent hook pre-tool-use --idle` | State → idle (user-blocking tool) |
+| `PreToolUse` | `AskUserQuestion` | `maestro-agent hook ask` (timeout 86400) | Blocking wait for answer or user connection |
+| `PostToolUse` | `AskUserQuestion\|EnterPlanMode\|ExitPlanMode` | `maestro-agent hook post-tool-use` | State → active, cleanup question file |
+| `PostToolUseFailure` | `AskUserQuestion` | `maestro-agent hook post-tool-use` | State → active, cleanup question file |
 
 ### Tmux & Session Setup
 
@@ -187,24 +198,33 @@ Hook events configured:
 
 Created during Claude's session by hooks, maestro-request commands, or the daemon.
 
-### Idle Detection Flag
+### Agent State
+
+| Path | Format | Written By | Read By |
+|---|---|---|---|
+| `/home/node/.maestro/state/agent-state` | Text (`starting\|active\|waiting\|idle\|question\|clearing`) | All maestro-agent hooks via `WriteState()` | Daemon via `ReadAgentState()`, TUI for status display |
+| `/home/node/.maestro/claude-idle` | Empty flag file | `WriteState()` (for `idle` and `question` states) | Backward-compat: daemon idle detection |
+
+The daemon reads `agent-state` to determine container status for the TUI and CLI:
+- `active` → Working (Claude is processing)
+- `waiting` → Waiting (Stop hook blocking, awaiting messages/user)
+- `idle` → Idle (Claude at prompt, no activity)
+- `question` → Question (AskUserQuestion blocking, awaiting answer)
+- `starting` → Starting (Claude booting)
+- `clearing` → Clearing (kill-restart in progress)
+
+The `claude-idle` flag is maintained for backward compatibility. `WriteState()` touches it for both `idle` and `question` states (both mean "Claude is blocked") and removes it for all other states.
+
+### Question/Response Protocol
 
 | Path | Format | Created By | Deleted By |
 |---|---|---|---|
-| `/home/node/.maestro/claude-idle` | Empty flag file | `Stop` hook, `PreToolUse` hook (blocking tools) | `UserPromptSubmit` hook, `PreToolUse` hook (general), `PostToolUse` hook (blocking tools), daemon `send_message` handler |
+| `/home/node/.maestro/current-question.json` | JSON | `maestro-agent hook ask` (extracts `tool_input` from stdin) | `maestro-agent hook post-tool-use` (AskUserQuestion), or `hook ask` on response delivery |
+| `/home/node/.maestro/question-response.txt` | Text | Daemon (writes answer) | `maestro-agent hook ask` (reads then removes on delivery) |
 
-The daemon checks this flag + Claude process status to determine container attention state:
-- Flag exists + Claude running = **needs attention** (idle, waiting for input)
-- Flag exists + Claude not running = **stale flag** (dormant, ignore)
-- Flag absent = **active** (working)
+**Question flow:** Ask hook writes `tool_input` to `current-question.json` and sets state to `question`. The daemon reads the question file, presents it to the user, and writes the answer to `question-response.txt`. The ask hook detects the response file, delivers the content to Claude via stderr + exit 2, and cleans up both files.
 
-### Question Data Capture
-
-| Path | Format | Created By | Deleted By |
-|---|---|---|---|
-| `/home/node/.maestro/current-question.json` | JSON | `PreToolUse` hook (AskUserQuestion) | `PostToolUse` hook (AskUserQuestion), `PostToolUseFailure` hook (AskUserQuestion) |
-
-Contains the `tool_input` from AskUserQuestion — the structured question data with questions array, options, headers, and multiSelect flags. Allows external tools to display questions without parsing tmux output.
+**Important:** The ask hook removes any stale `question-response.txt` before entering its blocking wait. The daemon must write the response AFTER seeing "question" state, not before.
 
 ### IPC Request Files
 

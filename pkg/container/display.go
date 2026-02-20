@@ -20,6 +20,23 @@ import (
 	"text/tabwriter"
 )
 
+// formatAgentStateIndicator returns a short state indicator for the CLI table
+func formatAgentStateIndicator(c Info) string {
+	if c.IsDormant {
+		return "💤"
+	}
+	switch c.AgentState {
+	case "question":
+		return "❓"
+	case "idle", "waiting":
+		return "🔔"
+	case "active":
+		return "●"
+	default:
+		return "-"
+	}
+}
+
 // formatTaskForDisplay returns a formatted task string for display in the list
 func formatTaskForDisplay(c Info) string {
 	if c.Status != "running" {
@@ -44,8 +61,9 @@ func formatTaskForDisplay(c Info) string {
 
 // SortByPriority sorts containers by logical priority groups, then by creation date within each group
 // Priority order:
-// 1. Needs Attention (running with idle flag from Claude Code hooks)
-// 2. Running (normal)
+// 0. Question (agent has a pending question)
+// 1. Idle/Waiting (agent needs attention)
+// 2. Active/Running (agent working normally)
 // 3. Dormant (running but Claude not active)
 // 4. Stopped
 // Within each group, sorts by creation date (newest first)
@@ -56,16 +74,20 @@ func SortByPriority(containers []Info) []Info {
 
 	// Define priority function
 	getPriority := func(c Info) int {
+		if c.Status != "running" {
+			return 4 // Stopped
+		}
 		if c.IsDormant {
-			return 2 // Dormant trumps stale idle flag
+			return 3 // Dormant
 		}
-		if c.NeedsAttention {
+		switch c.AgentState {
+		case "question":
 			return 0 // Highest priority
-		}
-		if c.Status == "running" {
+		case "idle", "waiting":
 			return 1
+		default:
+			return 2 // active, starting, clearing, connected, or empty
 		}
-		return 3 // Stopped containers lowest priority
 	}
 
 	// Sort by priority, then by creation date
@@ -101,22 +123,15 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 
 		// Add number column header if showing numbers
 		if opts.ShowNumbers {
-			fmt.Fprintln(w, "#\tNAME\tSTATUS\tBRANCH\tTASK\tGIT\tAUTH\tATTENTION")
-			fmt.Fprintln(w, "-\t----\t------\t------\t----\t---\t----\t---------")
+			fmt.Fprintln(w, "#\tNAME\tSTATUS\tBRANCH\tTASK\tGIT\tAUTH\tSTATE")
+			fmt.Fprintln(w, "-\t----\t------\t------\t----\t---\t----\t-----")
 		} else {
-			fmt.Fprintln(w, "NAME\tSTATUS\tBRANCH\tTASK\tGIT\tAUTH\tATTENTION")
-			fmt.Fprintln(w, "----\t------\t------\t----\t---\t----\t---------")
+			fmt.Fprintln(w, "NAME\tSTATUS\tBRANCH\tTASK\tGIT\tAUTH\tSTATE")
+			fmt.Fprintln(w, "----\t------\t------\t----\t---\t----\t-----")
 		}
 
 		for i, c := range sorted {
-			attention := ""
-			// Dormant takes priority: if Claude isn't running, the idle flag
-			// file is stale and shouldn't be treated as "needs attention"
-			if c.IsDormant {
-				attention = "💤"
-			} else if c.NeedsAttention {
-				attention = "🔔"
-			}
+			stateIndicator := formatAgentStateIndicator(c)
 
 			// Derive display status: show "dormant" for containers where Claude exited
 			displayStatus := c.Status
@@ -140,10 +155,10 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 			// Include number column if showing numbers
 			if opts.ShowNumbers {
 				fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					i+1, c.ShortName, displayStatus, c.Branch, taskInfo, gitStatus, authStatus, attention)
+					i+1, c.ShortName, displayStatus, c.Branch, taskInfo, gitStatus, authStatus, stateIndicator)
 			} else {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					c.ShortName, displayStatus, c.Branch, taskInfo, gitStatus, authStatus, attention)
+					c.ShortName, displayStatus, c.Branch, taskInfo, gitStatus, authStatus, stateIndicator)
 			}
 		}
 		w.Flush()
@@ -156,7 +171,9 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 			status := ""
 			if c.IsDormant {
 				status = " 💤 DORMANT"
-			} else if c.NeedsAttention {
+			} else if c.AgentState == "question" {
+				status = " ❓ QUESTION"
+			} else if c.AgentState == "idle" || c.AgentState == "waiting" {
 				status = " 🔔 NEEDS ATTENTION"
 			} else if c.Status != "running" {
 				status = " (stopped)"
@@ -170,7 +187,9 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 			status := ""
 			if c.IsDormant {
 				status = " 💤"
-			} else if c.NeedsAttention {
+			} else if c.AgentState == "question" {
+				status = " ❓"
+			} else if c.AgentState == "idle" || c.AgentState == "waiting" {
 				status = " 🔔"
 			}
 			fmt.Printf("  %s (branch: %s)%s\n", c.ShortName, c.Branch, status)

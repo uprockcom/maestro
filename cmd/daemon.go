@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -27,7 +28,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/uprockcom/maestro/assets"
+	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/daemon"
+	"github.com/uprockcom/maestro/pkg/notify"
+	"github.com/uprockcom/maestro/pkg/notify/signal"
 )
 
 // daemonIPCFilePath returns the path to daemon-ipc.json using the configured auth path.
@@ -360,6 +364,89 @@ func runDaemonBackground(cmd *cobra.Command, args []string) error {
 	d, err := daemon.New(daemonConfig, authDir, assets.NotificationIcon)
 	if err != nil {
 		return fmt.Errorf("failed to create daemon: %w", err)
+	}
+
+	// Build notification providers
+	var providers []notify.Provider
+
+	if config.Daemon.Notifications.Providers.Desktop.Enabled {
+		desktopProvider := notify.NewDesktopProvider(d.IconPath(), d.HasTerminalNotifier())
+		providers = append(providers, desktopProvider)
+	}
+
+	var localProvider *notify.LocalProvider
+	if config.Daemon.Notifications.Providers.Local.Enabled {
+		localProvider = notify.NewLocalProvider()
+		providers = append(providers, localProvider)
+	}
+
+	if config.Daemon.Notifications.Providers.Signal.Enabled {
+		port := config.Daemon.Notifications.Providers.Signal.ContainerPort
+		if port == 0 {
+			port = 8080
+		}
+		signalProvider := signal.New(signal.Config{
+			Number:    config.Daemon.Notifications.Providers.Signal.Number,
+			Recipient: config.Daemon.Notifications.Providers.Signal.Recipient,
+			Port:      port,
+			URL:       config.Daemon.Notifications.Providers.Signal.URL,
+			APIKey:    config.Daemon.Notifications.Providers.Signal.APIKey,
+		}, d, d.LogInfo)
+		providers = append(providers, signalProvider)
+	}
+
+	// Response callback: handle approval responses or write answer to container's
+	// question-response.txt file. The maestro-agent ask hook picks it up and
+	// feeds it to Claude via stderr.
+	callback := func(resp notify.Response) error {
+		// Check if this is a resource request approval
+		if approval := d.PopApproval(resp.EventID); approval != nil {
+			approved, err := d.ExecuteApproval(approval, resp)
+			if ipcSrv := d.IPCServer(); ipcSrv != nil {
+				if approved {
+					ipcSrv.UpdateRequestFile(approval.ContainerName, approval.RequestID, daemon.IPCRequestStatusFulfilled, "", "")
+				} else {
+					ipcSrv.UpdateRequestFile(approval.ContainerName, approval.RequestID, daemon.IPCRequestStatusFailed, "", "Request denied by user")
+				}
+			}
+			return err
+		}
+
+		// Original behavior: write question response
+		if resp.ContainerName == "" {
+			return fmt.Errorf("no container name in response")
+		}
+		return container.WriteQuestionResponse(resp.ContainerName, resp.Selections, resp.Text)
+	}
+
+	providerNotifyOn := make(map[string][]string)
+	if len(config.Daemon.Notifications.Providers.Desktop.NotifyOn) > 0 {
+		providerNotifyOn["desktop"] = config.Daemon.Notifications.Providers.Desktop.NotifyOn
+	}
+	if len(config.Daemon.Notifications.Providers.Local.NotifyOn) > 0 {
+		providerNotifyOn["local"] = config.Daemon.Notifications.Providers.Local.NotifyOn
+	}
+	if len(config.Daemon.Notifications.Providers.Slack.NotifyOn) > 0 {
+		providerNotifyOn["slack"] = config.Daemon.Notifications.Providers.Slack.NotifyOn
+	}
+	if len(config.Daemon.Notifications.Providers.Signal.NotifyOn) > 0 {
+		providerNotifyOn["signal"] = config.Daemon.Notifications.Providers.Signal.NotifyOn
+	}
+
+	engine := notify.NewEngine(providers, callback, d.LogInfo, providerNotifyOn)
+	d.SetEngine(engine, localProvider)
+
+	// Start Signal provider's background goroutine (container + poll loop)
+	for _, p := range providers {
+		if sp, ok := p.(*signal.SignalProvider); ok {
+			d.StartBackgroundTask(func(stopChan <-chan bool) {
+				ctx, cancel := context.WithCancel(context.Background())
+				go func() { <-stopChan; cancel() }()
+				if err := sp.Run(ctx); err != nil {
+					d.LogInfo("Signal provider stopped: %v", err)
+				}
+			})
+		}
 	}
 
 	return d.Start()

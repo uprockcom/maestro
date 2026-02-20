@@ -76,9 +76,14 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			containerName = selected.Name
 		}
 	} else {
-		// Argument provided - resolve container name
+		// Argument provided - check nickname first, then resolve container name
 		shortName := args[0]
-		containerName = resolveContainerName(shortName)
+		store := getNicknameStore()
+		if resolved, ok := store.Get(shortName); ok {
+			containerName = resolved
+		} else {
+			containerName = resolveContainerName(shortName)
+		}
 
 		// Check if container exists (include stopped containers with -a)
 		checkCmd := exec.Command("docker", "ps", "-a", "--filter", fmt.Sprintf("name=^%s$", containerName), "--format", "{{.State}}")

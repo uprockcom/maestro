@@ -85,7 +85,13 @@ func runRestart(cmd *cobra.Command, args []string) error {
 		containerName = selected.Name
 	} else {
 		shortName = args[0]
-		containerName = resolveContainerName(shortName)
+		// Check nickname first
+		store := getNicknameStore()
+		if resolved, ok := store.Get(shortName); ok {
+			containerName = resolved
+		} else {
+			containerName = resolveContainerName(shortName)
+		}
 	}
 
 	if fullRestart {

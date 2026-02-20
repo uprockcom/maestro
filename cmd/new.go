@@ -36,9 +36,12 @@ import (
 )
 
 var (
-	specFile    string
-	noConnect   bool
-	exactPrompt bool
+	specFile      string
+	noConnect     bool
+	exactPrompt  bool
+	flagProject   string
+	flagNoProject bool
+	flagNick      string
 )
 
 var newCmd = &cobra.Command{
@@ -61,6 +64,9 @@ func init() {
 	newCmd.Flags().StringVarP(&specFile, "file", "f", "", "Read task specification from file")
 	newCmd.Flags().BoolVarP(&noConnect, "no-connect", "n", false, "Don't automatically connect after creation")
 	newCmd.Flags().BoolVarP(&exactPrompt, "exact", "e", false, "Use exact prompt without AI transformation")
+	newCmd.Flags().StringVarP(&flagProject, "project", "p", "", "Use a named project from config")
+	newCmd.Flags().BoolVar(&flagNoProject, "no-project", false, "Force ad-hoc mode even inside a project directory")
+	newCmd.Flags().StringVar(&flagNick, "nick", "", "Assign a nickname to the new container")
 }
 
 func runNew(cmd *cobra.Command, args []string) error {
@@ -87,6 +93,15 @@ func runNew(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Creating container for: %s\n", truncateString(taskDescription, 80))
 
+	// Resolve project
+	project, projectName, err := resolveProject(flagProject, flagNoProject)
+	if err != nil {
+		return fmt.Errorf("project resolution failed: %w", err)
+	}
+	if projectName != "" {
+		fmt.Printf("Project: %s\n", projectName)
+	}
+
 	// Step 1: Generate branch name and planning prompt using Claude
 	branchName, planningPrompt, err := generateBranchAndPrompt(taskDescription, exactPrompt)
 	if err != nil {
@@ -103,7 +118,7 @@ func runNew(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 2: Get next container number
-	containerName, err := getNextContainerName(branchName)
+	containerName, err := getNextContainerName(branchName, projectName)
 	if err != nil {
 		return fmt.Errorf("failed to generate container name: %w", err)
 	}
@@ -111,14 +126,36 @@ func runNew(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Container name: %s\n", containerName)
 	fmt.Printf("Branch name: %s\n", branchName)
 
+	// Build labels
+	labels := map[string]string{}
+	if projectName != "" {
+		labels["maestro.project"] = projectName
+	}
+	if project != nil && !project.IsSinglePath() {
+		labels["maestro.workspace"] = "/workspace/" + filepath.Base(project.PrimaryPath())
+	}
+
 	// Run the shared container setup pipeline
 	if err := setupContainer(ContainerSetupOptions{
 		ContainerName: containerName,
 		BranchName:    branchName,
 		Prompt:        planningPrompt,
 		ExactPrompt:   exactPrompt,
+		Labels:        labels,
+		Project:       project,
+		ProjectName:   projectName,
 	}); err != nil {
 		return err
+	}
+
+	// Assign nickname if requested
+	if flagNick != "" {
+		store := getNicknameStore()
+		if err := store.Set(flagNick, containerName); err != nil {
+			fmt.Printf("Warning: Failed to save nickname: %v\n", err)
+		} else {
+			fmt.Printf("Nickname: %s\n", flagNick)
+		}
 	}
 
 	fmt.Printf("\n✅ Container %s is ready!\n", containerName)
@@ -156,6 +193,8 @@ type ContainerSetupOptions struct {
 	Labels          map[string]string // Docker labels (e.g., maestro.parent)
 	ParentContainer string            // If set: copy workspace from this container instead of host cwd
 	SourceBranch    string            // If set (with ParentContainer): checkout this branch after copy
+	Project         *ProjectConfig    // If set: use project paths instead of cwd
+	ProjectName     string            // For Docker label and container name prefix
 }
 
 // setupContainer runs the shared container setup pipeline.
@@ -172,7 +211,19 @@ func setupContainer(opts ContainerSetupOptions) error {
 	}
 
 	// 3. Copy project files
-	if opts.ParentContainer != "" {
+	if opts.Project != nil {
+		if !opts.Project.IsSinglePath() {
+			// Multi-path project: copy each repo to /workspace/<basename>/
+			if err := copyMultiPathProject(opts.ContainerName, opts.Project.ExpandedPaths()); err != nil {
+				return fmt.Errorf("failed to copy multi-path project: %w", err)
+			}
+		} else {
+			// Single-path project: copy from specified path to /workspace/
+			if err := copyProjectToContainerFrom(opts.ContainerName, opts.Project.ExpandedPath()); err != nil {
+				return fmt.Errorf("failed to copy project from path: %w", err)
+			}
+		}
+	} else if opts.ParentContainer != "" {
 		// Copy workspace from parent container (daemon/child path)
 		fmt.Printf("Copying workspace from parent container %s...\n", opts.ParentContainer)
 		if err := copyProjectFromContainer(opts.ParentContainer, opts.ContainerName); err != nil {
@@ -193,14 +244,33 @@ func setupContainer(opts ContainerSetupOptions) error {
 		}
 	}
 
-	// 4. Copy additional folders from host
-	if err := copyAdditionalFolders(opts.ContainerName); err != nil {
-		return fmt.Errorf("failed to copy additional folders: %w", err)
+	// 4. Copy additional folders from host (skip if project is set — project IS the complete set)
+	if opts.Project == nil {
+		if err := copyAdditionalFolders(opts.ContainerName); err != nil {
+			return fmt.Errorf("failed to copy additional folders: %w", err)
+		}
+	}
+
+	// 4b. For multi-path projects, symlink primary repo's skills to workspace root
+	if opts.Project != nil && !opts.Project.IsSinglePath() {
+		if err := linkPrimarySkills(opts.ContainerName, opts.Project); err != nil {
+			fmt.Printf("Warning: Failed to link primary skills: %v\n", err)
+		}
 	}
 
 	// 5. Initialize git branch
-	if err := initializeGitBranch(opts.ContainerName, opts.BranchName); err != nil {
-		return fmt.Errorf("failed to initialize git branch: %w", err)
+	if opts.Project != nil && !opts.Project.IsSinglePath() {
+		// Multi-path: create branch in each repo
+		for _, p := range opts.Project.ExpandedPaths() {
+			dir := "/workspace/" + filepath.Base(p)
+			if err := initializeGitBranchInDir(opts.ContainerName, opts.BranchName, dir); err != nil {
+				fmt.Printf("Warning: Failed to init git branch in %s: %v\n", dir, err)
+			}
+		}
+	} else {
+		if err := initializeGitBranch(opts.ContainerName, opts.BranchName); err != nil {
+			return fmt.Errorf("failed to initialize git branch: %w", err)
+		}
 	}
 
 	// 6. Configure git user
@@ -209,12 +279,21 @@ func setupContainer(opts ContainerSetupOptions) error {
 	}
 
 	// 7. Setup GitHub remote (SSH → HTTPS conversion)
-	if err := setupGitHubRemote(opts.ContainerName); err != nil {
-		fmt.Printf("Warning: Failed to setup GitHub remote: %v\n", err)
+	if opts.Project != nil && !opts.Project.IsSinglePath() {
+		for _, p := range opts.Project.ExpandedPaths() {
+			dir := "/workspace/" + filepath.Base(p)
+			if err := setupGitHubRemoteInDir(opts.ContainerName, dir); err != nil {
+				fmt.Printf("Warning: Failed to setup GitHub remote in %s: %v\n", dir, err)
+			}
+		}
+	} else {
+		if err := setupGitHubRemote(opts.ContainerName); err != nil {
+			fmt.Printf("Warning: Failed to setup GitHub remote: %v\n", err)
+		}
 	}
 
 	// 8. Write MAESTRO.md agent documentation
-	if err := writeMaestroMD(opts.ContainerName, opts.BranchName, opts.ParentContainer); err != nil {
+	if err := writeMaestroMD(opts.ContainerName, opts.BranchName, opts.ParentContainer, opts.Project); err != nil {
 		fmt.Printf("Warning: Failed to write MAESTRO.md: %v\n", err)
 	}
 
@@ -518,15 +597,21 @@ func generateSimpleBranch(description string) string {
 	return fmt.Sprintf("feat/%s", desc)
 }
 
-func getNextContainerName(branchName string) (string, error) {
+func getNextContainerName(branchName string, projectName ...string) (string, error) {
 	// Convert branch to container-friendly name
 	baseName := strings.ReplaceAll(branchName, "/", "-")
 	baseName = regexp.MustCompile(`[^a-z0-9-]+`).ReplaceAllString(baseName, "-")
 
+	// If project name is provided, prefix with it
+	if len(projectName) > 0 && projectName[0] != "" {
+		projPrefix := regexp.MustCompile(`[^a-z0-9-]+`).ReplaceAllString(strings.ToLower(projectName[0]), "-")
+		baseName = projPrefix + "-" + baseName
+	}
+
 	// CRITICAL: Limit total length to avoid hostname errors
 	// Linux hostname limit is 64 chars. We need room for prefix + base + suffix
 	// Format: {prefix}{basename}-{num}
-	// Example: maestro-feat-add-auth-1 (prefix + suffix, leaves room for basename)
+	// Example: maestro-insight-feat-auth-1 (prefix + project + suffix, leaves room for basename)
 	maxBaseLength := 50 // Conservative limit leaving room for prefix/suffix
 	if len(baseName) > maxBaseLength {
 		baseName = baseName[:maxBaseLength]
@@ -1365,6 +1450,156 @@ func copyProjectToContainer(containerName string) error {
 	return nil
 }
 
+// copyProjectToContainerFrom copies a project from a specified source path (instead of cwd) to /workspace/
+func copyProjectToContainerFrom(containerName, sourcePath string) error {
+	useCompression := config.Sync.Compress == nil || *config.Sync.Compress
+
+	fmt.Printf("Copying source code from %s to %s...\n", sourcePath, containerName)
+	startTime := time.Now()
+
+	// Build exclude arguments
+	excludeArgs := []string{"--exclude=node_modules", "--exclude=.git"}
+	for _, pattern := range readMaestroIgnore(sourcePath) {
+		excludeArgs = append(excludeArgs, "--exclude="+pattern)
+	}
+
+	var tarCmd, dockerCmd *exec.Cmd
+	if useCompression {
+		tarArgs := append([]string{"-czf", "-"}, excludeArgs...)
+		tarArgs = append(tarArgs, ".")
+		tarCmd = exec.Command("tar", tarArgs...)
+		dockerCmd = exec.Command("docker", "exec", "-i", containerName, "tar", "-xzf", "-", "-C", "/workspace")
+	} else {
+		tarArgs := append([]string{"-cf", "-"}, excludeArgs...)
+		tarArgs = append(tarArgs, ".")
+		tarCmd = exec.Command("tar", tarArgs...)
+		dockerCmd = exec.Command("docker", "exec", "-i", containerName, "tar", "-xf", "-", "-C", "/workspace")
+	}
+	tarCmd.Dir = sourcePath
+
+	pipe, err := tarCmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	pr := &progressReader{reader: pipe, containerName: containerName}
+	dockerCmd.Stdin = pr
+
+	if err := tarCmd.Start(); err != nil {
+		return err
+	}
+	if err := dockerCmd.Start(); err != nil {
+		return err
+	}
+
+	tarErr := tarCmd.Wait()
+	dockerErr := dockerCmd.Wait()
+
+	bytesRead := pr.getBytesRead()
+	duration := time.Since(startTime)
+
+	if tarErr != nil {
+		return tarErr
+	}
+	if dockerErr != nil {
+		return dockerErr
+	}
+
+	speed := float64(bytesRead) / duration.Seconds() / 1024 / 1024
+	fmt.Printf("  Copied %s in %.1fs (%.1f MB/s)\n", formatBytes(bytesRead), duration.Seconds(), speed)
+
+	// Copy .git separately if it exists
+	gitDir := filepath.Join(sourcePath, ".git")
+	if _, err := os.Stat(gitDir); err == nil {
+		gitCmd := exec.Command("docker", "cp", gitDir, fmt.Sprintf("%s:/workspace/", containerName))
+		if err := gitCmd.Run(); err != nil {
+			fmt.Printf("Warning: Failed to copy .git: %v\n", err)
+		}
+	}
+
+	// Fix ownership
+	chownCmd := exec.Command("docker", "exec", containerName, "sh", "-c", "sudo chown -R node:node /workspace")
+	if err := chownCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to fix ownership: %v\n", err)
+	}
+
+	return nil
+}
+
+// copyMultiPathProject copies multiple repos to /workspace/<basename>/ each.
+func copyMultiPathProject(containerName string, paths []string) error {
+	useCompression := config.Sync.Compress == nil || *config.Sync.Compress
+
+	for _, sourcePath := range paths {
+		baseName := filepath.Base(sourcePath)
+		destDir := "/workspace/" + baseName
+		fmt.Printf("Copying %s to %s:%s...\n", baseName, containerName, destDir)
+
+		// Create destination directory
+		mkdirCmd := exec.Command("docker", "exec", containerName, "mkdir", "-p", destDir)
+		if err := mkdirCmd.Run(); err != nil {
+			return fmt.Errorf("failed to create %s: %w", destDir, err)
+		}
+
+		// Build exclude arguments
+		excludeArgs := []string{"--exclude=node_modules", "--exclude=.git"}
+		for _, pattern := range readMaestroIgnore(sourcePath) {
+			excludeArgs = append(excludeArgs, "--exclude="+pattern)
+		}
+
+		var tarCmd, dockerCmd *exec.Cmd
+		if useCompression {
+			tarArgs := append([]string{"-czf", "-"}, excludeArgs...)
+			tarArgs = append(tarArgs, ".")
+			tarCmd = exec.Command("tar", tarArgs...)
+			dockerCmd = exec.Command("docker", "exec", "-i", containerName, "tar", "-xzf", "-", "-C", destDir)
+		} else {
+			tarArgs := append([]string{"-cf", "-"}, excludeArgs...)
+			tarArgs = append(tarArgs, ".")
+			tarCmd = exec.Command("tar", tarArgs...)
+			dockerCmd = exec.Command("docker", "exec", "-i", containerName, "tar", "-xf", "-", "-C", destDir)
+		}
+		tarCmd.Dir = sourcePath
+
+		pipe, err := tarCmd.StdoutPipe()
+		if err != nil {
+			return err
+		}
+		dockerCmd.Stdin = pipe
+
+		if err := tarCmd.Start(); err != nil {
+			return err
+		}
+		if err := dockerCmd.Start(); err != nil {
+			return err
+		}
+
+		if tarErr := tarCmd.Wait(); tarErr != nil {
+			return fmt.Errorf("tar of %s failed: %w", baseName, tarErr)
+		}
+		if dockerErr := dockerCmd.Wait(); dockerErr != nil {
+			return fmt.Errorf("extract of %s failed: %w", baseName, dockerErr)
+		}
+
+		// Copy .git separately
+		gitDir := filepath.Join(sourcePath, ".git")
+		if _, err := os.Stat(gitDir); err == nil {
+			gitCmd := exec.Command("docker", "cp", gitDir, fmt.Sprintf("%s:%s/", containerName, destDir))
+			if err := gitCmd.Run(); err != nil {
+				fmt.Printf("Warning: Failed to copy .git for %s: %v\n", baseName, err)
+			}
+		}
+	}
+
+	// Fix ownership
+	chownCmd := exec.Command("docker", "exec", containerName, "sh", "-c", "sudo chown -R node:node /workspace")
+	if err := chownCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to fix ownership: %v\n", err)
+	}
+
+	return nil
+}
+
 func copyAdditionalFolders(containerName string) error {
 	for _, folder := range config.Sync.AdditionalFolders {
 		expandedPath := expandPath(folder)
@@ -1381,6 +1616,51 @@ func copyAdditionalFolders(containerName string) error {
 			fmt.Printf("Warning: Failed to copy %s: %v\n", folder, err)
 		}
 	}
+	return nil
+}
+
+// linkPrimarySkills creates /workspace/.claude/commands/ and symlinks commands
+// from the primary repo into it so Claude discovers skills when starting at /workspace.
+// Also symlinks the primary repo's CLAUDE.md to /workspace/CLAUDE.md.
+// The workspace-level commands/ is a real directory, so workspace-specific commands
+// can be added later without conflicting with subproject commands.
+func linkPrimarySkills(containerName string, project *ProjectConfig) error {
+	primaryBase := filepath.Base(project.PrimaryPath())
+	primaryDir := "/workspace/" + primaryBase
+
+	// Create workspace-level .claude/commands/ directory
+	mkdirCmd := exec.Command("docker", "exec", containerName, "mkdir", "-p", "/workspace/.claude/commands")
+	if err := mkdirCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create /workspace/.claude/commands: %w", err)
+	}
+
+	// Symlink each command from primary repo's .claude/commands/ into workspace
+	linkScript := fmt.Sprintf(`
+if [ -d "%s/.claude/commands" ]; then
+  for cmd in %s/.claude/commands/*; do
+    [ -e "$cmd" ] && ln -s "$cmd" /workspace/.claude/commands/ 2>/dev/null
+  done
+fi
+`, primaryDir, primaryDir)
+	linkCmd := exec.Command("docker", "exec", containerName, "sh", "-c", linkScript)
+	if err := linkCmd.Run(); err != nil {
+		return fmt.Errorf("failed to symlink commands: %w", err)
+	}
+
+	// Symlink primary CLAUDE.md to workspace root
+	claudeMDScript := fmt.Sprintf(`[ -f "%s/CLAUDE.md" ] && ln -s "%s/CLAUDE.md" /workspace/CLAUDE.md 2>/dev/null; true`,
+		primaryDir, primaryDir)
+	claudeMDCmd := exec.Command("docker", "exec", containerName, "sh", "-c", claudeMDScript)
+	if err := claudeMDCmd.Run(); err != nil {
+		return fmt.Errorf("failed to symlink CLAUDE.md: %w", err)
+	}
+
+	// Fix ownership
+	chownCmd := exec.Command("docker", "exec", containerName, "sh", "-c", "sudo chown -R node:node /workspace/.claude")
+	if err := chownCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to fix ownership on /workspace/.claude: %v\n", err)
+	}
+
 	return nil
 }
 
@@ -1405,6 +1685,63 @@ func initializeGitBranch(containerName, branchName string) error {
 	cmd := exec.Command("docker", "exec", containerName, "sh", "-c",
 		fmt.Sprintf("cd /workspace && git checkout -b %s 2>/dev/null || git checkout %s", branchName, branchName))
 	return cmd.Run()
+}
+
+// initializeGitBranchInDir creates a git branch in a specific directory inside the container.
+func initializeGitBranchInDir(containerName, branchName, dir string) error {
+	// Add safe.directory
+	safeCmd := exec.Command("docker", "exec", containerName, "git", "config", "--global", "--add", "safe.directory", dir)
+	if err := safeCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to set safe.directory for %s: %v\n", dir, err)
+	}
+
+	// Check if git repo exists
+	checkCmd := exec.Command("docker", "exec", containerName, "test", "-d", dir+"/.git")
+	if err := checkCmd.Run(); err != nil {
+		return nil // Not a git repo, skip
+	}
+
+	// Create and checkout branch
+	cmd := exec.Command("docker", "exec", containerName, "sh", "-c",
+		fmt.Sprintf("cd %s && git checkout -b %s 2>/dev/null || git checkout %s", dir, branchName, branchName))
+	return cmd.Run()
+}
+
+// setupGitHubRemoteInDir converts SSH remotes to HTTPS in a specific directory.
+func setupGitHubRemoteInDir(containerName, dir string) error {
+	getOriginCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
+		fmt.Sprintf("cd %s && git config --get remote.origin.url", dir))
+	originOutput, err := getOriginCmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	originURL := strings.TrimSpace(string(originOutput))
+	if originURL == "" {
+		return nil
+	}
+
+	sshPattern := regexp.MustCompile(`^git@github\.com:(.+/.+?)(?:\.git)?$`)
+	matches := sshPattern.FindStringSubmatch(originURL)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	repoPath := matches[1]
+	if !strings.HasSuffix(repoPath, ".git") {
+		repoPath = repoPath + ".git"
+	}
+
+	// Determine HTTPS host
+	host := "github.com"
+	if config.GitHub.Hostname != "" {
+		host = config.GitHub.Hostname
+	}
+	httpsURL := fmt.Sprintf("https://%s/%s", host, repoPath)
+
+	setCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
+		fmt.Sprintf("cd %s && git remote set-url origin %s", dir, httpsURL))
+	return setCmd.Run()
 }
 
 func configureGitUser(containerName string) error {
@@ -1507,11 +1844,20 @@ func startTmuxSession(containerName, branchName, planningPrompt string, exactPro
 Please analyze this task and create a detailed implementation plan. Do not start coding yet - just plan the implementation.`, planningPrompt)
 	}
 
-	// Start tmux session with Claude running directly
-	// Running Claude as the tmux command (not via send-keys) preserves the environment correctly
-	// Explicitly set HOME and user to ensure credentials are found
+	// Write the bootstrap prompt to a file in the container
+	writePrompt := exec.Command("docker", "exec", "-i", containerName, "sh", "-c",
+		"cat > /tmp/maestro-bootstrap.txt")
+	writePrompt.Stdin = strings.NewReader(taskPrompt)
+	if err := writePrompt.Run(); err != nil {
+		return fmt.Errorf("failed to write bootstrap prompt: %w", err)
+	}
+
+	// Start tmux session with Claude, piping the bootstrap prompt via stdin.
+	// Piped input bypasses the bypass-permissions prompt entirely and delivers
+	// the initial prompt in one shot — no auto-input script needed.
 	tmuxCmd := exec.Command("docker", "exec", "-u", "node", containerName, "sh", "-c",
-		"cd /workspace && HOME=/home/node tmux new-session -d -s main 'claude --dangerously-skip-permissions'")
+		"cd /workspace && HOME=/home/node tmux new-session -d -s main "+
+			"'cat /tmp/maestro-bootstrap.txt | claude --dangerously-skip-permissions'")
 
 	// Capture output for debugging
 	var stdout, stderr bytes.Buffer
@@ -1537,11 +1883,9 @@ Please analyze this task and create a detailed implementation plan. Do not start
 		}
 		if i == 9 {
 			fmt.Printf("Timeout waiting for tmux session. Last check stderr: %s\n", checkErr.String())
-			// List all tmux sessions for debugging
 			listCmd := exec.Command("docker", "exec", "-u", "node", containerName, "tmux", "ls")
 			listOut, _ := listCmd.CombinedOutput()
 			fmt.Printf("All tmux sessions: %s\n", string(listOut))
-			// Check if Claude process is running
 			psCmd := exec.Command("docker", "exec", "-u", "node", containerName, "ps", "aux")
 			psOut, _ := psCmd.CombinedOutput()
 			fmt.Printf("Running processes:\n%s\n", string(psOut))
@@ -1550,52 +1894,14 @@ Please analyze this task and create a detailed implementation plan. Do not start
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Create a background script to send the initial prompt
-	// First accepts the bypass permissions prompt, then sends the task
-	autoInputScript := fmt.Sprintf(`#!/bin/sh
-# Wait for Claude to start and show the bypass permissions prompt
-sleep 3
-
-# Accept the bypass permissions prompt by pressing Down then Enter
-tmux send-keys -t main:0 Down 2>/dev/null
-sleep 0.3
-tmux send-keys -t main:0 Enter 2>/dev/null
-
-# Wait for Claude to fully initialize after accepting
-sleep 3
-
-# Send the task prompt
-cat > /tmp/prompt-input.txt << 'PROMPT_EOF'
-%s
-PROMPT_EOF
-
-# Send the prompt line by line to avoid issues
-while IFS= read -r line || [ -n "$line" ]; do
-    printf "%%s\n" "$line" | tmux load-buffer -
-    tmux paste-buffer -t main:0 -d 2>/dev/null
-done < /tmp/prompt-input.txt
-
-# Send Enter to submit
-sleep 0.5
-tmux send-keys -t main:0 C-m 2>/dev/null
-`, taskPrompt)
-
-	fmt.Println("Setting up automated Claude startup...")
-
-	// Write and execute the auto-input script in the background
-	writeAutoInput := exec.Command("docker", "exec", containerName, "sh", "-c",
-		fmt.Sprintf("cat > /tmp/auto-input.sh << 'EOF'\n%s\nEOF\nchmod +x /tmp/auto-input.sh", autoInputScript))
-	if err := writeAutoInput.Run(); err != nil {
-		return fmt.Errorf("failed to write auto-input script: %w", err)
+	// Start maestro-agent service in background (handles idle wake-up, heartbeat, clear timer)
+	agentService := exec.Command("docker", "exec", "-d", "-u", "node", containerName, "sh", "-c",
+		"HOME=/home/node maestro-agent service")
+	if err := agentService.Run(); err != nil {
+		fmt.Printf("Warning: Failed to start maestro-agent service: %v\n", err)
 	}
 
-	// Run the auto-input script in the background as node user
-	runAutoInput := exec.Command("docker", "exec", "-d", "-u", "node", containerName, "/tmp/auto-input.sh")
-	if err := runAutoInput.Run(); err != nil {
-		fmt.Printf("Warning: Failed to start auto-input script: %v\n", err)
-	}
-
-	fmt.Println("Automated input started for Claude...")
+	fmt.Println("Claude started with piped bootstrap prompt...")
 
 	// Window 1: Shell
 	newWinCmd := exec.Command("docker", "exec", "-u", "node", containerName,
@@ -1929,7 +2235,7 @@ func truncateString(s string, maxLen int) string {
 // to two locations inside the container:
 //   - /home/node/.maestro/MAESTRO.md  — canonical reference location
 //   - /home/node/.claude/CLAUDE.md    — auto-discovered by Claude Code at startup
-func writeMaestroMD(containerName, branchName, parentContainer string) error {
+func writeMaestroMD(containerName, branchName, parentContainer string, project *ProjectConfig) error {
 	content := assets.MaestroMDTemplate
 	content = strings.ReplaceAll(content, "{{CONTAINER_NAME}}", containerName)
 	content = strings.ReplaceAll(content, "{{BRANCH_NAME}}", branchName)
@@ -1938,6 +2244,18 @@ func writeMaestroMD(containerName, branchName, parentContainer string) error {
 		content = strings.ReplaceAll(content, "{{PARENT_CONTAINER}}", "none (top-level)")
 	} else {
 		content = strings.ReplaceAll(content, "{{PARENT_CONTAINER}}", parentContainer)
+	}
+
+	// Render workspace layout
+	if project != nil && !project.IsSinglePath() {
+		var layout strings.Builder
+		layout.WriteString("- **Workspace layout**:\n")
+		for _, p := range project.ExpandedPaths() {
+			layout.WriteString(fmt.Sprintf("  - `/workspace/%s/`\n", filepath.Base(p)))
+		}
+		content = strings.ReplaceAll(content, "{{WORKSPACE_LAYOUT}}", layout.String())
+	} else {
+		content = strings.ReplaceAll(content, "{{WORKSPACE_LAYOUT}}", "- **Workspace**: `/workspace/` — your project files and git repo")
 	}
 
 	// Write to canonical location
@@ -1960,26 +2278,38 @@ func writeMaestroMD(containerName, branchName, parentContainer string) error {
 }
 
 // writeClaudeSettings writes Claude Code hooks configuration to the container.
-// The hooks create/remove a flag file to signal when Claude is idle (waiting for input).
+// All hooks are handled by maestro-agent, which manages agent state centrally.
 //
 // Hook ordering for PreToolUse matters: the general hook (no matcher) fires first
-// and removes the idle flag. The user-blocking tools hook fires second and re-creates
-// it, because Claude is actually waiting for user input during those tools
-// (AskUserQuestion, EnterPlanMode, ExitPlanMode). PostToolUse removes the flag
-// when the user responds.
-//
-// For AskUserQuestion specifically, the structured question data (tool_input) is
-// captured to current-question.json so external tools can display it without
-// parsing tmux output. The file is removed on both success and failure/cancel.
+// and sets StateActive. The user-blocking tools hook fires second with --idle,
+// setting StateIdle because Claude is waiting for user input during those tools
+// (AskUserQuestion, EnterPlanMode, ExitPlanMode). For AskUserQuestion, the ask
+// hook additionally blocks (up to 6 hours) waiting for either a response file
+// from the daemon/TUI or a user to connect. PostToolUse transitions back to
+// StateActive and cleans up question files.
 func writeClaudeSettings(containerName string) error {
 	settings := `{
+  "effortLevel": "high",
+  "promptSuggestionEnabled": false,
+  "spinnerTipsEnabled": false,
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "touch /home/node/.maestro/claude-idle"
+            "command": "maestro-agent hook stop",
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "maestro-agent hook session-start"
           }
         ]
       }
@@ -1989,7 +2319,7 @@ func writeClaudeSettings(containerName string) error {
         "hooks": [
           {
             "type": "command",
-            "command": "rm -f /home/node/.maestro/claude-idle"
+            "command": "maestro-agent hook prompt"
           }
         ]
       }
@@ -1999,7 +2329,7 @@ func writeClaudeSettings(containerName string) error {
         "hooks": [
           {
             "type": "command",
-            "command": "rm -f /home/node/.maestro/claude-idle"
+            "command": "maestro-agent hook pre-tool-use"
           }
         ]
       },
@@ -2008,7 +2338,7 @@ func writeClaudeSettings(containerName string) error {
         "hooks": [
           {
             "type": "command",
-            "command": "touch /home/node/.maestro/claude-idle"
+            "command": "maestro-agent hook pre-tool-use --idle"
           }
         ]
       },
@@ -2017,7 +2347,8 @@ func writeClaudeSettings(containerName string) error {
         "hooks": [
           {
             "type": "command",
-            "command": "jq '.tool_input' > /home/node/.maestro/current-question.json"
+            "command": "maestro-agent hook ask",
+            "timeout": 86400
           }
         ]
       }
@@ -2028,16 +2359,7 @@ func writeClaudeSettings(containerName string) error {
         "hooks": [
           {
             "type": "command",
-            "command": "rm -f /home/node/.maestro/claude-idle"
-          }
-        ]
-      },
-      {
-        "matcher": "AskUserQuestion",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "rm -f /home/node/.maestro/current-question.json"
+            "command": "maestro-agent hook post-tool-use"
           }
         ]
       }
@@ -2048,23 +2370,63 @@ func writeClaudeSettings(containerName string) error {
         "hooks": [
           {
             "type": "command",
-            "command": "rm -f /home/node/.maestro/current-question.json"
+            "command": "maestro-agent hook post-tool-use"
           }
         ]
       }
     ]
   }
 }`
+
+	// Ensure maestro state directories exist
+	mkdirCmd := exec.Command("docker", "exec", containerName, "mkdir", "-p",
+		"/home/node/.maestro/pending-messages",
+		"/home/node/.maestro/state",
+		"/home/node/.maestro/logs")
+	if err := mkdirCmd.Run(); err != nil {
+		fmt.Printf("Warning: Failed to create maestro directories: %v\n", err)
+	}
+
 	writeCmd := exec.Command("docker", "exec", "-i", containerName, "sh", "-c",
 		"cat > /home/node/.claude/settings.json")
 	writeCmd.Stdin = strings.NewReader(settings)
 	return writeCmd.Run()
 }
 
-// copyProjectFromContainer copies the workspace from a source container to a destination container
+// copyProjectFromContainer copies the workspace from a source container to a destination container.
+// Retries up to 3 times to handle transient failures (e.g., files changing mid-tar due to
+// background processes like maestro-agent watchers running git fetch).
 func copyProjectFromContainer(srcContainer, dstContainer string) error {
-	// Use tar pipe to copy full workspace including .git
-	tarCmd := exec.Command("docker", "exec", srcContainer, "tar", "-cf", "-", "-C", "/workspace", ".")
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			fmt.Printf("Retrying workspace copy (attempt %d/3)...\n", attempt)
+			// Clean destination before retry
+			cleanCmd := exec.Command("docker", "exec", dstContainer, "sh", "-c", "rm -rf /workspace/* /workspace/.* 2>/dev/null; true")
+			cleanCmd.Run()
+			time.Sleep(2 * time.Second)
+		}
+
+		lastErr = copyProjectFromContainerOnce(srcContainer, dstContainer)
+		if lastErr == nil {
+			break
+		}
+		fmt.Printf("Warning: workspace copy attempt %d failed: %v\n", attempt, lastErr)
+	}
+	return lastErr
+}
+
+func copyProjectFromContainerOnce(srcContainer, dstContainer string) error {
+	// Use tar pipe to copy full workspace including .git.
+	// --ignore-failed-read and --warning flags handle files changing mid-tar
+	// (e.g., git fetch modifying .git/ or maestro-agent writing state files).
+	tarCmd := exec.Command("docker", "exec", srcContainer,
+		"tar", "-cf", "-",
+		"--ignore-failed-read",
+		"--warning=no-file-changed",
+		"--warning=no-file-removed",
+		"--warning=no-file-shrank",
+		"-C", "/workspace", ".")
 	dockerCmd := exec.Command("docker", "exec", "-i", dstContainer, "tar", "-xf", "-", "-C", "/workspace")
 
 	pipe, err := tarCmd.StdoutPipe()
@@ -2084,7 +2446,13 @@ func copyProjectFromContainer(srcContainer, dstContainer string) error {
 	dockerErr := dockerCmd.Wait()
 
 	if tarErr != nil {
-		return fmt.Errorf("tar from source failed: %w", tarErr)
+		// GNU tar exits 1 for "files changed during archival" (e.g., git fetch modifying .git/).
+		// Exit code 1 is non-fatal — the archive is still usable. Only fail on exit code 2+.
+		if exitErr, ok := tarErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// Tolerate exit code 1 — files changed but archive was written
+		} else {
+			return fmt.Errorf("tar from source failed: %w", tarErr)
+		}
 	}
 	if dockerErr != nil {
 		return fmt.Errorf("tar to destination failed: %w", dockerErr)
@@ -2115,13 +2483,19 @@ func CreateContainerFromDaemon(task, parentContainer, branch string) (string, er
 		return "", fmt.Errorf("failed to generate container name: %w", err)
 	}
 
+	// Build labels, propagating workspace label from parent if present
+	labels := map[string]string{"maestro.parent": parentContainer}
+	if ws := container.GetLabel(parentContainer, "maestro.workspace"); ws != "" {
+		labels["maestro.workspace"] = ws
+	}
+
 	// Run the shared container setup pipeline
 	if err := setupContainer(ContainerSetupOptions{
 		ContainerName:   containerName,
 		BranchName:      branchName,
 		Prompt:          task,
 		ExactPrompt:     true,
-		Labels:          map[string]string{"maestro.parent": parentContainer},
+		Labels:          labels,
 		ParentContainer: parentContainer,
 		SourceBranch:    branch,
 	}); err != nil {

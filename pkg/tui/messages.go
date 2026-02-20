@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/uprockcom/maestro/pkg/container"
+	"github.com/uprockcom/maestro/pkg/notify"
 )
 
 // tickMsg is sent on each animation tick (750ms for daemon pulsing)
@@ -104,6 +105,61 @@ type saveSettingsMsg struct {
 type saveFirewallMsg struct {
 	domainsText    string
 	applyToRunning bool
+}
+
+// pendingQuestionsMsg is sent when pending questions are fetched from the daemon
+type pendingQuestionsMsg struct {
+	questions []notify.PendingQuestion
+	err       error
+}
+
+// submitQuestionMsg is sent when the user selects an answer in the question modal.
+// The actual HTTP call is dispatched as an async tea.Cmd from the Update handler.
+type submitQuestionMsg struct {
+	eventID    string
+	selections []string
+	text       string
+}
+
+// nextQuestionMsg is sent when a multi-question flow has more questions remaining.
+type nextQuestionMsg struct {
+	answer string // the answer just selected
+}
+
+// otherQuestionMsg is sent when the user clicks "Other..." to enter freeform text.
+type otherQuestionMsg struct {
+	eventID   string
+	shortName string
+	question  string // original question text to redisplay
+}
+
+// dismissQuestionMsg is sent when the user dismisses a notification without answering.
+type dismissQuestionMsg struct {
+	eventID string
+}
+
+// dismissQuestionResultMsg is the result of the async dismiss call
+type dismissQuestionResultMsg struct {
+	eventID string
+	err     error
+}
+
+// answerQuestionMsg is the result of the async answer submission
+type answerQuestionMsg struct {
+	eventID string
+	err     error
+}
+
+// showUpdateResourcesMsg triggers the update resources form for a container
+type showUpdateResourcesMsg struct {
+	ContainerName string
+}
+
+// updateResourcesMsg signals that resource update should be performed
+type updateResourcesMsg struct {
+	containerName string
+	memory        string
+	cpus          string
 }
 
 // Docker operation result messages

@@ -345,10 +345,22 @@ func (h *HomeModel) formatStatus(c container.Info) string {
 		if c.IsDormant {
 			return "◌ Dormant"
 		}
-		if c.NeedsAttention {
+		switch c.AgentState {
+		case "question":
+			return "? Question"
+		case "waiting":
+			return "◷ Waiting"
+		case "idle":
 			return "⚠ Idle"
+		case "clearing":
+			return "↻ Clearing"
+		case "starting":
+			return "⋯ Starting"
+		case "active":
+			return "● Working"
+		default:
+			return "● Running"
 		}
-		return "● Running"
 	case "exited":
 		return "○ Stopped"
 	default:

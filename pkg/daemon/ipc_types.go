@@ -14,18 +14,24 @@
 
 package daemon
 
-import "time"
+import (
+	"time"
+
+	"github.com/uprockcom/maestro/pkg/notify"
+)
 
 // IPCAction represents the type of IPC request
 type IPCAction string
 
 const (
-	IPCActionNew          IPCAction = "new"
-	IPCActionNotify       IPCAction = "notify"
-	IPCActionExit         IPCAction = "exit"
-	IPCActionReadMessages IPCAction = "read_messages"
-	IPCActionSendMessage  IPCAction = "send_message"
-	IPCActionWaitIdle     IPCAction = "wait_idle"
+	IPCActionNew            IPCAction = "new"
+	IPCActionNotify         IPCAction = "notify"
+	IPCActionExit           IPCAction = "exit"
+	IPCActionReadMessages   IPCAction = "read_messages"
+	IPCActionSendMessage    IPCAction = "send_message"
+	IPCActionWaitIdle       IPCAction = "wait_idle"
+	IPCActionAnswerQuestion IPCAction = "answer_question"
+	IPCActionRequest        IPCAction = "request"
 )
 
 // IPCRequestStatus represents the status of a persisted IPC request
@@ -51,12 +57,15 @@ type IPCRequest struct {
 	Action          IPCAction `json:"action"`
 	Task            string    `json:"task,omitempty"`              // For "new" action
 	Title           string    `json:"title,omitempty"`             // For "notify" action
-	Message         string    `json:"message,omitempty"`           // For "notify" and "send_message" actions
+	Message         string    `json:"message,omitempty"`           // For "notify", "send_message", and "answer_question" actions
 	Parent          string    `json:"parent"`                      // Container hostname (verified)
 	Branch          string    `json:"branch,omitempty"`            // Optional branch for "new" action
 	TargetRequestID string    `json:"target_request_id,omitempty"` // For child-targeting actions
 	Count           int       `json:"count,omitempty"`             // read_messages: how many (default 10, max 50)
 	Timeout         int       `json:"timeout,omitempty"`           // wait_idle: seconds (default 300)
+	Selections      []string  `json:"selections,omitempty"`        // answer_question: selected option labels
+	RequestType     string    `json:"request_type,omitempty"`      // request: domain, memory, cpus, ip
+	RequestValue    string    `json:"request_value,omitempty"`     // request: the value being requested
 }
 
 // IPCResponse is the wire format for IPC responses to containers
@@ -82,9 +91,13 @@ type IPCRequestFile struct {
 	ChildExitedAt   *time.Time       `json:"child_exited_at,omitempty"`
 	Error           *string          `json:"error,omitempty"`
 	TargetRequestID string           `json:"target_request_id,omitempty"`
-	Messages        []IPCMessage     `json:"messages,omitempty"`
-	Count           int              `json:"count,omitempty"`
-	Timeout         int              `json:"timeout,omitempty"`
+	Messages        []IPCMessage        `json:"messages,omitempty"`
+	PendingQuestion *notify.QuestionData `json:"pending_question,omitempty"`
+	Count           int                  `json:"count,omitempty"`
+	Timeout         int                  `json:"timeout,omitempty"`
+	Selections      []string             `json:"selections,omitempty"`
+	RequestType     string               `json:"request_type,omitempty"`
+	RequestValue    string               `json:"request_value,omitempty"`
 }
 
 // IPCStatusResponse is returned by the /status endpoint

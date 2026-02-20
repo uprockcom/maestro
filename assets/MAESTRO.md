@@ -152,7 +152,22 @@ Read the last N messages from a child container's Claude session. The `--last` f
 maestro-request claude send <request-id> <message>
 ```
 
-Send a message to a child container's Claude session. The message is typed into the Claude pane and Enter is pressed. Use this to answer questions the child has asked or provide additional guidance.
+Send a message to a child container's Claude session. The message is injected into the Claude pane via tmux. Use this for follow-up instructions or guidance when the child is **not** blocked on a question.
+
+**Important:** If the child has a pending `AskUserQuestion` prompt, `send` will automatically detect it and route your message as a freeform text answer. However, for structured question responses (selecting specific options), use `claude answer` instead.
+
+### Answer a child's pending question
+
+```bash
+maestro-request claude answer <request-id> --select "Option A"
+maestro-request claude answer <request-id> --select "Option A" --select "Option B"
+maestro-request claude answer <request-id> --text "Custom freeform answer"
+maestro-request claude answer <request-id> --select "Other" --text "Details here"
+```
+
+Answer a pending `AskUserQuestion` prompt in a child container. When `claude read` shows a `pending_question` in its output, the child's Claude is blocked waiting for an answer — **you must use `claude answer` (or `claude send`) to unblock it**. Regular `claude send` will also work but can only provide freeform text; `claude answer` lets you select specific options by label.
+
+For multi-select questions, repeat `--select` for each option. Use `--text` for the "Other" freeform field or as a standalone answer.
 
 ### Canonical workflow: spawn, monitor, interact
 
@@ -167,10 +182,13 @@ maestro-request wait request "$ID" fulfilled --timeout 120
 # 3. Wait for the child to ask a question (become idle)
 maestro-request wait idle "$ID" --timeout 300
 
-# 4. Read what the child said
+# 4. Read what the child said — check for pending_question
 maestro-request claude read "$ID" --last 5
 
-# 5. Send a response
+# 5a. If the child has a pending question, answer it with specific options:
+maestro-request claude answer "$ID" --select "Option A"
+
+# 5b. Or send freeform guidance if no question is pending:
 maestro-request claude send "$ID" "Use approach B — it's simpler and covers all edge cases."
 
 # 6. Wait for the child to finish its work
@@ -186,7 +204,7 @@ Status lifecycle:
 ## Environment details
 
 - **User**: `node` (non-root, sudo available for system operations)
-- **Workspace**: `/workspace/` — your project files and git repo
+{{WORKSPACE_LAYOUT}}
 - **Shell**: zsh with git integration
 - **Network**: Firewalled — only whitelisted domains are accessible
 - **Tools**: git, gh (GitHub CLI), node, python3, go, jq, curl, and standard dev tools

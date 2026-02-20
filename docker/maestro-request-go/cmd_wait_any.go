@@ -28,7 +28,7 @@ import (
 type waitSpec struct {
 	Index int
 	Raw   string
-	Type  string   // "request", "idle", "script", "daemon"
+	Type  string   // "request", "idle", "script", "daemon", "message"
 	Args  []string
 }
 
@@ -74,8 +74,12 @@ func parseWaitSpec(index int, raw string) (*waitSpec, error) {
 		if len(spec.Args) != 0 {
 			return nil, fmt.Errorf("spec %d: 'daemon' takes no arguments", index)
 		}
+	case "message":
+		if len(spec.Args) != 0 {
+			return nil, fmt.Errorf("spec %d: 'message' takes no arguments", index)
+		}
 	default:
-		return nil, fmt.Errorf("spec %d: unknown type %q (use request, idle, script, or daemon)", index, spec.Type)
+		return nil, fmt.Errorf("spec %d: unknown type %q (use request, idle, script, daemon, or message)", index, spec.Type)
 	}
 
 	return spec, nil
@@ -155,6 +159,16 @@ func runWaitSpec(ctx context.Context, spec *waitSpec, timeout int, ch chan<- wai
 				result.Result = resp
 			}
 		}
+
+	case "message":
+		msgResult, err := pollMessages(ctx)
+		if err != nil {
+			result.Success = false
+			result.Error = err.Error()
+		} else {
+			result.Success = true
+			result.Result = msgResult
+		}
 	}
 
 	select {
@@ -176,13 +190,15 @@ Each argument is a quoted spec string:
   "idle <request-id>"      — wait for child's Claude to become idle
   "script <cmd> [args...]" — run command, wait for exit
   "daemon"                 — wait for daemon to become reachable
+  "message"                — wait for a message in pending-messages queue
 
 Returns JSON with the first matching spec. Exit code 0 if the match
 succeeded, 1 if it failed, 2 on global timeout.
 
 Examples:
   maestro-request wait any "request $ID child_exited" "script ./monitor.sh" --timeout 600
-  maestro-request wait any "idle $ID" "request $ID child_exited"`,
+  maestro-request wait any "idle $ID" "request $ID child_exited"
+  maestro-request wait any "script ./watch.sh" "message" --timeout 3600`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			specs, err := parseAllSpecs(args)
@@ -258,6 +274,7 @@ Each argument is a quoted spec string:
   "idle <request-id>"      — wait for child's Claude to become idle
   "script <cmd> [args...]" — run command, wait for exit
   "daemon"                 — wait for daemon to become reachable
+  "message"                — wait for a message in pending-messages queue
 
 Returns JSON array of all results. If any spec fails, remaining specs
 are canceled and the command exits with code 1. Exit code 2 on global timeout.

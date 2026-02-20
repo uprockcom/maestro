@@ -9,6 +9,7 @@ bin/
 *.test
 *.out
 docker/maestro-request-go/maestro-request
+docker/maestro-agent/maestro-agent
 
 # Go dependencies
 vendor/

@@ -4,3 +4,4 @@
 !docker/daemon-ipc/main.go
 !docker/container-startup.sh
 !docker/maestro-request-go/
+!docker/maestro-agent/

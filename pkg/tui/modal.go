@@ -465,7 +465,15 @@ func (m *Modal) Update(msg tea.Msg) (*Modal, tea.Cmd) {
 					}
 					return nil, nil
 				}
-				// Not on action button, fall through to textarea/textinput
+				// On a single-line textinput, Enter submits the form
+				if onTextinput && len(m.Actions) > 0 && m.Actions[0].OnSelect != nil {
+					cmd := m.Actions[0].OnSelect()
+					if cmd != nil {
+						return nil, func() tea.Msg { return cmd }
+					}
+					return nil, nil
+				}
+				// Not on action button or textinput, fall through to textarea
 			case " ":
 				// Space: toggle checkbox ONLY if focused on checkbox
 				if onCheckbox {
@@ -756,6 +764,16 @@ func (m *Modal) View(screenWidth, screenHeight int) string {
 		// Render form fields
 		var formParts []string
 		modalBg := lipgloss.Color("235")
+
+		// Render content text (question) above form fields
+		if m.Content != "" {
+			contentStyle := lipgloss.NewStyle().
+				Foreground(style.GhostWhite).
+				Background(modalBg).
+				Width(modalWidth - 4).
+				Align(lipgloss.Left)
+			formParts = append(formParts, contentStyle.Render(m.Content), "")
+		}
 
 		// Render each field with its label
 		fieldIdx := 0

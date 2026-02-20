@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: build install install-completion docker signing-image clean test help release release-snapshot license-check
+.PHONY: build install install-completion docker signing-image clean test check help release release-snapshot license-check build-relay docker-relay
 
 # Default target
 help:
 	@echo "Maestro Build Targets:"
+	@echo "  make check              - Compile all binaries and run all tests (no Docker needed)"
 	@echo "  make build              - Build the maestro binary"
 	@echo "  make docker             - Build the Docker image locally"
 	@echo "  make signing-image      - Build the code signing Docker image"
@@ -25,6 +26,8 @@ help:
 	@echo "  make test               - Run tests"
 	@echo "  make clean              - Remove built binaries"
 	@echo "  make all                - Build everything (binary + docker)"
+	@echo "  make build-relay        - Build the signal-relay binary"
+	@echo "  make docker-relay       - Build the signal-relay Docker image"
 	@echo "  make license-check      - Check/add Apache 2.0 headers to source files"
 	@echo ""
 	@echo "Release Targets:"
@@ -109,9 +112,30 @@ install-completion:
 test:
 	go test ./...
 
+# Compile all binaries and run all tests (works inside containers — no Docker needed)
+check:
+	@echo "==> Compiling maestro (main module)..."
+	go build ./...
+	@echo "==> Compiling maestro-request (docker/maestro-request-go)..."
+	cd docker/maestro-request-go && go build -o /dev/null .
+	@echo "==> Compiling signal-relay (cmd/signal-relay)..."
+	cd cmd/signal-relay && go build -o /dev/null .
+	@echo "==> Running tests (main module)..."
+	go test ./...
+	@echo ""
+	@echo "All binaries compile and tests pass."
+
 # Clean build artifacts
 clean:
 	rm -rf bin
+
+# Build the signal-relay binary (separate Go module)
+build-relay:
+	cd cmd/signal-relay && go build -o ../../bin/signal-relay .
+
+# Build the signal-relay Docker image
+docker-relay:
+	docker build -t maestro-signal-relay:latest -f deploy/signal-relay/Dockerfile .
 
 # Build everything
 all: build docker

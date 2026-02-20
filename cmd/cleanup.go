@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/uprockcom/maestro/pkg/container"
 )
 
 var (
@@ -66,6 +67,10 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 
 		name := parts[0]
 		state := parts[1]
+
+		if container.IsInfraContainer(name) {
+			continue
+		}
 
 		if state == "running" {
 			if cleanupAll {
