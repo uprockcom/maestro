@@ -28,11 +28,21 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/uprockcom/maestro/assets"
+	"github.com/uprockcom/maestro/pkg/api"
 	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/daemon"
 	"github.com/uprockcom/maestro/pkg/notify"
 	"github.com/uprockcom/maestro/pkg/notify/signal"
 )
+
+// newDaemonClient creates an api.Client from DaemonIPCInfo.
+func newDaemonClient(info *api.DaemonIPCInfo) *api.Client {
+	return &api.Client{
+		BaseURL:    fmt.Sprintf("http://127.0.0.1:%d", info.Port),
+		Token:      info.Token,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+	}
+}
 
 // daemonIPCFilePath returns the path to daemon-ipc.json using the configured auth path.
 func daemonIPCFilePath() string {
@@ -89,13 +99,13 @@ func init() {
 }
 
 // readDaemonIPCInfo reads daemon-ipc.json and returns the parsed info, or nil if not found.
-func readDaemonIPCInfo() *daemon.DaemonIPCInfo {
+func readDaemonIPCInfo() *api.DaemonIPCInfo {
 	data, err := os.ReadFile(daemonIPCFilePath())
 	if err != nil {
 		return nil
 	}
 
-	var info daemon.DaemonIPCInfo
+	var info api.DaemonIPCInfo
 	if err := json.Unmarshal(data, &info); err != nil {
 		return nil
 	}
@@ -108,28 +118,25 @@ func readDaemonIPCInfo() *daemon.DaemonIPCInfo {
 }
 
 // isDaemonRunning checks if the daemon is running by reading daemon-ipc.json
-// and making an HTTP GET /status call. Returns running status and info.
-func isDaemonRunning() (bool, *daemon.DaemonIPCInfo) {
+// and calling the typed status endpoint. Returns running status and info.
+func isDaemonRunning() (bool, *api.DaemonIPCInfo) {
 	info := readDaemonIPCInfo()
 	if info == nil {
 		return false, nil
 	}
 
-	// Try HTTP health check
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/status", info.Port))
+	client := newDaemonClient(info)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := api.Call(ctx, client, api.GetStatus, nil)
 	if err != nil {
 		// Connection refused or timeout — daemon is not running, clean up stale file
 		os.Remove(daemonIPCFilePath())
 		return false, nil
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		return true, info
-	}
-
-	return false, nil
+	return true, info
 }
 
 func runDaemonStart(cmd *cobra.Command, args []string) error {
@@ -209,28 +216,24 @@ func runDaemonStop(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Stopping daemon (PID %d)...\n", info.PID)
 
-	// Send POST /shutdown with auth token
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/shutdown", info.Port), nil)
-	if err != nil {
-		return fmt.Errorf("failed to create shutdown request: %w", err)
-	}
-	req.Header.Set("X-Maestro-Token", info.Token)
+	// Send typed shutdown request
+	client := newDaemonClient(info)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	resp, err := client.Do(req)
+	_, err := api.Call(ctx, client, api.Shutdown, nil)
 	if err != nil {
 		// If we can't connect, daemon may have already stopped
-		fmt.Println("✅ Daemon stopped")
+		fmt.Println("Daemon stopped")
 		os.Remove(daemonIPCFilePath())
 		return nil
 	}
-	resp.Body.Close()
 
 	// Poll until daemon is no longer responding (up to 5 seconds)
 	for i := 0; i < 50; i++ {
 		time.Sleep(100 * time.Millisecond)
 		if running, _ := isDaemonRunning(); !running {
-			fmt.Println("✅ Daemon stopped")
+			fmt.Println("Daemon stopped")
 			return nil
 		}
 	}
@@ -246,7 +249,7 @@ func runDaemonStop(cmd *cobra.Command, args []string) error {
 			}
 		}
 		os.Remove(daemonIPCFilePath())
-		fmt.Println("✅ Daemon stopped (forced)")
+		fmt.Println("Daemon stopped (forced)")
 		return nil
 	}
 
@@ -257,21 +260,18 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 	running, info := isDaemonRunning()
 
 	if running {
-		// Get detailed status from HTTP endpoint
-		client := &http.Client{Timeout: 2 * time.Second}
-		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/status", info.Port))
+		// Get detailed status via typed API
+		client := newDaemonClient(info)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		status, err := api.Call(ctx, client, api.GetStatus, nil)
 		if err == nil {
-			defer resp.Body.Close()
-			var status daemon.IPCStatusResponse
-			if err := json.NewDecoder(resp.Body).Decode(&status); err == nil {
-				fmt.Printf("Status: Running (PID %d, port %d)\n", status.PID, info.Port)
-				fmt.Printf("Uptime: %s\n", status.Uptime)
-				fmt.Printf("Containers: %d\n", len(status.Containers))
-				for _, c := range status.Containers {
-					fmt.Printf("  - %s\n", c)
-				}
-			} else {
-				fmt.Printf("Status: Running (PID %d, port %d)\n", info.PID, info.Port)
+			fmt.Printf("Status: Running (PID %d, port %d)\n", status.PID, info.Port)
+			fmt.Printf("Uptime: %s\n", status.Uptime)
+			fmt.Printf("Containers: %d\n", len(status.Containers))
+			for _, c := range status.Containers {
+				fmt.Printf("  - %s\n", c)
 			}
 		} else {
 			fmt.Printf("Status: Running (PID %d, port %d)\n", info.PID, info.Port)
@@ -357,7 +357,7 @@ func runDaemonBackground(cmd *cobra.Command, args []string) error {
 		QuietHoursStart:    config.Daemon.Notifications.QuietHours.Start,
 		QuietHoursEnd:      config.Daemon.Notifications.QuietHours.End,
 		ContainerPrefix:    config.Containers.Prefix,
-		CreateContainer:    CreateContainerFromDaemon,
+		CreateContainer:    createContainerFromDaemonOpts,
 	}
 
 	// Create and start daemon with embedded icon
@@ -381,18 +381,31 @@ func runDaemonBackground(cmd *cobra.Command, args []string) error {
 	}
 
 	if config.Daemon.Notifications.Providers.Signal.Enabled {
-		port := config.Daemon.Notifications.Providers.Signal.ContainerPort
-		if port == 0 {
-			port = 8080
-		}
 		signalProvider := signal.New(signal.Config{
 			Number:    config.Daemon.Notifications.Providers.Signal.Number,
 			Recipient: config.Daemon.Notifications.Providers.Signal.Recipient,
-			Port:      port,
 			URL:       config.Daemon.Notifications.Providers.Signal.URL,
 			APIKey:    config.Daemon.Notifications.Providers.Signal.APIKey,
-		}, d, d.LogInfo)
+		}, d, d.LogInfo, true)
 		providers = append(providers, signalProvider)
+
+		// Create per-contact-profile providers
+		for name, profile := range config.Contacts {
+			if profile.Signal == nil || profile.Signal.Recipient == config.Daemon.Notifications.Providers.Signal.Recipient {
+				continue
+			}
+			if profile.Signal.Recipient == "" || profile.Signal.APIKey == "" {
+				d.LogInfo("skipping contact profile %q: missing signal recipient or api_key", name)
+				continue
+			}
+			p := signal.New(signal.Config{
+				Number:    config.Daemon.Notifications.Providers.Signal.Number,
+				Recipient: profile.Signal.Recipient,
+				URL:       config.Daemon.Notifications.Providers.Signal.URL,
+				APIKey:    profile.Signal.APIKey,
+			}, d, d.LogInfo, false)
+			providers = append(providers, p)
+		}
 	}
 
 	// Response callback: handle approval responses or write answer to container's

@@ -31,15 +31,16 @@ const (
 
 // Event represents a notification event from a container.
 type Event struct {
-	ID            string        `json:"id"`
-	ContainerName string        `json:"container_name"`
-	ShortName     string        `json:"short_name"`
-	Branch        string        `json:"branch,omitempty"`
-	Title         string        `json:"title"`
-	Message       string        `json:"message"`
-	Type          EventType     `json:"type"`
-	Timestamp     time.Time     `json:"timestamp"`
-	Question      *QuestionData `json:"question,omitempty"`
+	ID            string                       `json:"id"`
+	ContainerName string                       `json:"container_name"`
+	ShortName     string                       `json:"short_name"`
+	Branch        string                       `json:"branch,omitempty"`
+	Title         string                       `json:"title"`
+	Message       string                       `json:"message"`
+	Type          EventType                    `json:"type"`
+	Timestamp     time.Time                    `json:"timestamp"`
+	Question      *QuestionData                `json:"question,omitempty"`
+	Contacts      map[string]map[string]string `json:"contacts,omitempty"`
 }
 
 // QuestionData mirrors the tool_input JSON from a container's current-question.json.

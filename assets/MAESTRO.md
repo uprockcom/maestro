@@ -201,6 +201,8 @@ Status lifecycle:
 - **`child_exited`** → child container has stopped (work complete)
 - **`failed`** → creation error (check the `.error` field in the JSON output)
 
+{{WEB_TOOLS_SECTION}}
+
 ## Environment details
 
 - **User**: `node` (non-root, sudo available for system operations)

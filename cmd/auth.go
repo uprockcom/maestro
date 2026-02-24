@@ -195,7 +195,7 @@ func runAuth(cmd *cobra.Command, cmdArgs []string) error {
 	fmt.Println("✓ Cleared existing authentication data")
 
 	// Ensure Docker image exists
-	if err := ensureDockerImage(); err != nil {
+	if err := ensureDockerImage(getDockerImage()); err != nil {
 		return fmt.Errorf("failed to ensure Docker image: %w", err)
 	}
 

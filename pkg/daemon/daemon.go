@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/uprockcom/maestro/pkg/api"
 	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/notify"
 )
@@ -45,7 +46,16 @@ type Config struct {
 	QuietHoursStart    string
 	QuietHoursEnd      string
 	ContainerPrefix    string
-	CreateContainer    func(task, parentContainer, branch string) (string, error) // Callback for IPC child creation
+	CreateContainer    func(opts CreateContainerOpts) (string, error) // Callback for IPC child creation
+}
+
+// CreateContainerOpts holds parameters for creating a child container via the daemon callback.
+type CreateContainerOpts struct {
+	Task            string
+	ParentContainer string
+	Branch          string
+	Model           string // Claude model alias: opus, sonnet, haiku (default from config if empty)
+	WebEnabled      bool   // Use web-enabled image
 }
 
 // pendingApproval tracks a container-initiated resource request awaiting user approval
@@ -79,6 +89,7 @@ type Daemon struct {
 	pendingApprovals    map[string]*pendingApproval
 	pendingApprovalsMu  sync.Mutex
 	lastTokenSync       time.Time
+	containerCache      *ContainerCache // lazy cache for API v1 endpoints
 }
 
 // ContainerState tracks container monitoring state
@@ -119,6 +130,11 @@ func New(config Config, configDir string, iconData []byte) (*Daemon, error) {
 	}
 	token := hex.EncodeToString(tokenBytes)
 
+	prefix := config.ContainerPrefix
+	if prefix == "" {
+		prefix = "maestro-"
+	}
+
 	d := &Daemon{
 		config:           config,
 		logFile:          logFile,
@@ -130,6 +146,7 @@ func New(config Config, configDir string, iconData []byte) (*Daemon, error) {
 		nicknames:        NewNicknameStore(filepath.Join(configDir, "nicknames.yml")),
 		containerOps:     &dockerContainerOps{},
 		pendingApprovals: make(map[string]*pendingApproval),
+		containerCache:   NewContainerCache(prefix),
 	}
 
 	// Check for terminal-notifier on macOS
@@ -194,14 +211,6 @@ func (d *Daemon) sendNotification(event notify.Event) {
 	d.notify(event.Title, event.ShortName, event.Message)
 }
 
-// DaemonIPCInfo is the JSON structure written to daemon-ipc.json
-type DaemonIPCInfo struct {
-	Port       int    `json:"port"`
-	BridgePort int    `json:"bridge_port,omitempty"`
-	Token      string `json:"token"`
-	PID        int    `json:"pid"`
-}
-
 // Start begins the daemon monitoring loop
 func (d *Daemon) Start() error {
 	log.SetOutput(d.logFile)
@@ -254,7 +263,7 @@ func (d *Daemon) Start() error {
 	// Double-check: if daemon-ipc.json exists and daemon is responsive, bail out
 	ipcFilePath := filepath.Join(d.configDir, "daemon-ipc.json")
 	if data, err := os.ReadFile(ipcFilePath); err == nil {
-		var existing DaemonIPCInfo
+		var existing api.DaemonIPCInfo
 		if json.Unmarshal(data, &existing) == nil && existing.Port > 0 {
 			client := &http.Client{Timeout: 2 * time.Second}
 			if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/status", existing.Port)); err == nil {
@@ -279,7 +288,7 @@ func (d *Daemon) Start() error {
 	d.ipcServer.Start()
 
 	// Write daemon-ipc.json so CLI and containers can find us
-	ipcInfo := DaemonIPCInfo{
+	ipcInfo := api.DaemonIPCInfo{
 		Port:       d.ipcServer.LoopbackPort(),
 		BridgePort: d.ipcServer.BridgePort(),
 		Token:      d.ipcToken,
@@ -308,13 +317,15 @@ func (d *Daemon) Start() error {
 	ticker := time.NewTicker(d.config.CheckInterval)
 	defer ticker.Stop()
 
-	// Run initial check immediately
+	// Run initial check immediately and warm the container cache in background
 	d.check()
+	go d.containerCache.ForceRefresh() //nolint:errcheck
 
 	for {
 		select {
 		case <-ticker.C:
 			d.check()
+			go d.containerCache.ForceRefresh() //nolint:errcheck
 		case sig := <-sigChan:
 			d.logInfo("Received signal %v, shutting down", sig)
 			d.cleanup()
@@ -365,6 +376,7 @@ func (d *Daemon) check() {
 					Message:       "Claude process has exited",
 					Type:          notify.EventDormant,
 					Timestamp:     time.Now(),
+					Contacts:      d.getContainerContacts(container),
 				}
 				d.sendNotification(event)
 			}
@@ -436,6 +448,7 @@ func (d *Daemon) checkQuestionStatus(containerName string, state *ContainerState
 				Type:          notify.EventQuestion,
 				Timestamp:     time.Now(),
 				Question:      qd,
+				Contacts:      d.getContainerContacts(containerName),
 			}
 			d.sendNotification(event)
 			d.logInfo("Question detected in %s, notifying immediately", shortName)
@@ -619,6 +632,7 @@ func (d *Daemon) checkTokenExpiry(containerName string, state *ContainerState) {
 			Message:       message,
 			Type:          notify.EventTokenExpiring,
 			Timestamp:     time.Now(),
+			Contacts:      d.getContainerContacts(containerName),
 		}
 		d.sendNotification(event)
 		state.mu.Lock()
@@ -670,6 +684,7 @@ func (d *Daemon) checkAttentionStatus(containerName string, state *ContainerStat
 				Message:       fmt.Sprintf("Has needed attention for %s", formatDuration(attentionDuration)),
 				Type:          notify.EventAttentionNeeded,
 				Timestamp:     time.Now(),
+				Contacts:      d.getContainerContacts(containerName),
 			}
 
 			d.sendNotification(event)
@@ -742,6 +757,7 @@ func (d *Daemon) checkTaskStatus(containerName string, state *ContainerState) {
 				Message:       fmt.Sprintf("Finished all tasks (%s)", summary.Progress),
 				Type:          notify.EventTasksCompleted,
 				Timestamp:     time.Now(),
+				Contacts:      d.getContainerContacts(containerName),
 			}
 			d.sendNotification(event)
 			state.mu.Lock()
@@ -1076,11 +1092,11 @@ func (d *Daemon) ExecuteApproval(approval *pendingApproval, resp notify.Response
 }
 
 // createChildContainer delegates to the configured CreateContainer callback
-func (d *Daemon) createChildContainer(task, parent, branch string) (string, error) {
+func (d *Daemon) createChildContainer(opts CreateContainerOpts) (string, error) {
 	if d.config.CreateContainer == nil {
 		return "", fmt.Errorf("container creation not configured")
 	}
-	return d.config.CreateContainer(task, parent, branch)
+	return d.config.CreateContainer(opts)
 }
 
 // getUptime returns formatted daemon uptime
@@ -1120,6 +1136,21 @@ func (d *Daemon) getShortName(containerName string) string {
 		return containerName[len(prefix):]
 	}
 	return containerName
+}
+
+// getContainerContacts reads the maestro.contacts Docker label and parses it
+// into a nested map suitable for notify.Event.Contacts.
+func (d *Daemon) getContainerContacts(containerName string) map[string]map[string]string {
+	raw := d.containerOps.GetLabel(containerName, "maestro.contacts")
+	if raw == "" {
+		return nil
+	}
+	var contacts map[string]map[string]string
+	if err := json.Unmarshal([]byte(raw), &contacts); err != nil {
+		d.logInfo("getContainerContacts: failed to parse label for %s: %v", containerName, err)
+		return nil
+	}
+	return contacts
 }
 
 func timeNow() *time.Time {

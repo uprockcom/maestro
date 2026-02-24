@@ -28,13 +28,15 @@ import (
 // infraContainers are maestro infrastructure containers that should be excluded
 // from user-facing listings, stop, and cleanup operations.
 var infraContainers = map[string]bool{
-	"maestro-signal-cli": true,
+	"maestro-signal-cli":   true,
+	"maestro-signal-relay": true,
 }
 
 // IsInfraContainer returns true if the container is a maestro infrastructure
-// container (e.g. signal-cli) that should not appear in user-facing listings.
+// container (e.g. signal-cli, expose sidecars) that should not appear in
+// user-facing listings.
 func IsInfraContainer(name string) bool {
-	return infraContainers[name]
+	return infraContainers[name] || strings.HasPrefix(name, "maestro-expose-")
 }
 
 // ReadCredentials loads and parses credentials from a file path
@@ -101,6 +103,19 @@ func GetLabel(containerName, label string) string {
 		return ""
 	}
 	return val
+}
+
+// readContactsLabel reads and parses the maestro.contacts JSON label from a container.
+func readContactsLabel(containerName string) map[string]map[string]string {
+	raw := GetLabel(containerName, "maestro.contacts")
+	if raw == "" {
+		return nil
+	}
+	var contacts map[string]map[string]string
+	if err := json.Unmarshal([]byte(raw), &contacts); err != nil {
+		return nil
+	}
+	return contacts
 }
 
 // getWorkspaceDir returns the primary git workspace directory for a container.
@@ -194,7 +209,7 @@ func GetAuthStatus(containerName string) string {
 // GetRunningContainers returns a list of all running containers with the given prefix
 func GetRunningContainers(prefix string) ([]Info, error) {
 	dockerCmd := exec.Command("docker", "ps", "--format",
-		"{{.Names}}\t{{.Status}}\t{{.State}}\t{{.CreatedAt}}")
+		"{{.Names}}\t{{.Status}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label \"maestro.web\"}}")
 	output, err := dockerCmd.Output()
 	if err != nil {
 		return nil, err
@@ -206,6 +221,7 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 		status    string
 		state     string
 		createdAt time.Time
+		hasWeb    bool
 	}
 	var basics []basicInfo
 
@@ -233,11 +249,17 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 			createdAt = time.Time{}
 		}
 
+		hasWeb := false
+		if len(parts) > 4 && parts[4] == "true" {
+			hasWeb = true
+		}
+
 		basics = append(basics, basicInfo{
 			name:      name,
 			status:    parts[1],
 			state:     parts[2],
 			createdAt: createdAt,
+			hasWeb:    hasWeb,
 		})
 	}
 
@@ -256,6 +278,7 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 				Status:        basic.state,
 				StatusDetails: basic.status,
 				CreatedAt:     basic.createdAt,
+				HasWeb:        basic.hasWeb,
 			}
 
 			// Fetch details in parallel
@@ -292,6 +315,16 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 				mu.Unlock()
 			}()
 
+			// Contacts label
+			detailWg.Add(1)
+			go func() {
+				defer detailWg.Done()
+				contacts := readContactsLabel(basic.name)
+				mu.Lock()
+				info.Contacts = contacts
+				mu.Unlock()
+			}()
+
 			detailWg.Wait()
 			containers[idx] = info
 		}(i, b)
@@ -304,7 +337,7 @@ func GetRunningContainers(prefix string) ([]Info, error) {
 // GetAllContainers returns a list of all containers (including stopped) with the given prefix
 func GetAllContainers(prefix string) ([]Info, error) {
 	dockerCmd := exec.Command("docker", "ps", "-a", "--format",
-		"{{.Names}}\t{{.Status}}\t{{.State}}\t{{.CreatedAt}}")
+		"{{.Names}}\t{{.Status}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label \"maestro.web\"}}")
 	output, err := dockerCmd.Output()
 	if err != nil {
 		return nil, err
@@ -316,6 +349,7 @@ func GetAllContainers(prefix string) ([]Info, error) {
 		status    string
 		state     string
 		createdAt time.Time
+		hasWeb    bool
 	}
 	var basics []basicInfo
 
@@ -343,11 +377,17 @@ func GetAllContainers(prefix string) ([]Info, error) {
 			createdAt = time.Time{}
 		}
 
+		hasWeb := false
+		if len(parts) > 4 && parts[4] == "true" {
+			hasWeb = true
+		}
+
 		basics = append(basics, basicInfo{
 			name:      name,
 			status:    parts[1],
 			state:     parts[2],
 			createdAt: createdAt,
+			hasWeb:    hasWeb,
 		})
 	}
 
@@ -366,6 +406,7 @@ func GetAllContainers(prefix string) ([]Info, error) {
 				Status:        basic.state,
 				StatusDetails: basic.status,
 				CreatedAt:     basic.createdAt,
+				HasWeb:        basic.hasWeb,
 				LastActivity:  "-",
 				GitStatus:     "-",
 			}
@@ -443,6 +484,16 @@ func GetAllContainers(prefix string) ([]Info, error) {
 					mu.Lock()
 					info.CurrentTask = taskSummary.CurrentTask
 					info.TaskProgress = taskSummary.Progress
+					mu.Unlock()
+				}()
+
+				// Contacts label
+				detailWg.Add(1)
+				go func() {
+					defer detailWg.Done()
+					contacts := readContactsLabel(basic.name)
+					mu.Lock()
+					info.Contacts = contacts
 					mu.Unlock()
 				}()
 

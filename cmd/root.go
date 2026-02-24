@@ -100,6 +100,12 @@ type Config struct {
 		Model   string `mapstructure:"model"`
 	} `mapstructure:"bedrock"`
 
+	Web struct {
+		Enabled bool   `mapstructure:"enabled"`
+		Image   string `mapstructure:"image"`
+		ShmSize string `mapstructure:"shm_size"`
+	} `mapstructure:"web"`
+
 	Daemon struct {
 		CheckInterval string `mapstructure:"check_interval"`
 		ShowNag       bool   `mapstructure:"show_nag"`
@@ -132,13 +138,12 @@ type Config struct {
 					NotifyOn []string `mapstructure:"notify_on"`
 				} `mapstructure:"slack"`
 				Signal struct {
-					Enabled       bool     `mapstructure:"enabled"`
-					Number        string   `mapstructure:"number"`
-					Recipient     string   `mapstructure:"recipient"`
-					ContainerPort int      `mapstructure:"container_port"`
-					URL           string   `mapstructure:"url"`
-					APIKey        string   `mapstructure:"api_key"`
-					NotifyOn      []string `mapstructure:"notify_on"`
+					Enabled  bool     `mapstructure:"enabled"`
+					Number   string   `mapstructure:"number"`
+					Recipient string  `mapstructure:"recipient"`
+					URL      string   `mapstructure:"url"`
+					APIKey   string   `mapstructure:"api_key"`
+					NotifyOn []string `mapstructure:"notify_on"`
 				} `mapstructure:"signal"`
 			} `mapstructure:"providers"`
 		} `mapstructure:"notifications"`
@@ -146,6 +151,18 @@ type Config struct {
 
 	Apps     map[string]string          `mapstructure:"apps"`     // name -> source path
 	Projects map[string]ProjectConfig   `mapstructure:"projects"` // name -> project config
+	Contacts map[string]ContactProfile  `mapstructure:"contacts"` // name -> contact profile
+}
+
+// ContactProfile defines notification routing overrides for a named person.
+type ContactProfile struct {
+	Signal *SignalContactOverride `mapstructure:"signal,omitempty" json:"signal,omitempty"`
+}
+
+// SignalContactOverride configures per-contact Signal routing.
+type SignalContactOverride struct {
+	Recipient string `mapstructure:"recipient" json:"recipient"`
+	APIKey    string `mapstructure:"api_key,omitempty" json:"api_key,omitempty"`
 }
 
 var rootCmd = &cobra.Command{
@@ -188,7 +205,7 @@ parallel, each in their own isolated environment with proper branch management.`
 				// Loop continues, TUI will restart with cached state
 			case tui.ActionCreate:
 				// Create a new container
-				err := performCreate(result.TaskDescription, result.BranchName, result.NoConnect, result.Exact)
+				err := performCreate(result.TaskDescription, result.BranchName, result.NoConnect, result.Exact, result.Model, result.Web)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error creating container: %v\n", err)
 					fmt.Println("Press Enter to continue...")
@@ -283,12 +300,12 @@ func performConnect(containerName string) error {
 }
 
 // performCreate creates a new container from TUI form data
-func performCreate(taskDescription, branchName string, noConnect, exact bool) error {
+func performCreate(taskDescription, branchName string, noConnect, exact bool, model string, web bool) error {
 	if taskDescription == "" {
 		return fmt.Errorf("task description is required")
 	}
 
-	return CreateContainerFromTUI(taskDescription, branchName, noConnect, exact)
+	return CreateContainerFromTUI(taskDescription, branchName, noConnect, exact, model, web)
 }
 
 func initConfig() {
@@ -331,6 +348,7 @@ func initConfig() {
 	viper.SetDefault("containers.resources.memory", "4g")
 	viper.SetDefault("containers.resources.cpus", "2")
 	viper.SetDefault("containers.default_return_to_tui", false)
+	viper.SetDefault("containers.default_model", "opus")
 	viper.SetDefault("tmux.default_session", "main")
 	viper.SetDefault("tmux.prefix", "C-b")
 	viper.SetDefault("firewall.allowed_domains", []string{
@@ -362,7 +380,10 @@ func initConfig() {
 	viper.SetDefault("aws.region", "")
 	viper.SetDefault("bedrock.enabled", false)
 	viper.SetDefault("bedrock.model", "")
-	viper.SetDefault("daemon.check_interval", "30m")
+	viper.SetDefault("web.enabled", false)
+	viper.SetDefault("web.image", "")
+	viper.SetDefault("web.shm_size", "256m")
+	viper.SetDefault("daemon.check_interval", "30s")
 	viper.SetDefault("daemon.show_nag", true)
 	viper.SetDefault("daemon.token_refresh.enabled", true)
 	viper.SetDefault("daemon.token_refresh.threshold", "6h")

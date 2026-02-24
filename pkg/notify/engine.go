@@ -17,6 +17,7 @@ package notify
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 )
@@ -63,12 +64,28 @@ func NewEngine(providers []Provider, callback func(Response) error, logger func(
 // shouldSendTo returns whether the given event type should be dispatched to the
 // named provider. If the provider has no per-provider override, it returns true
 // (inheriting the global filter applied upstream).
+// For prefixed names like "signal:4567", falls back to the base name "signal".
 func (e *Engine) shouldSendTo(providerName, eventType string) bool {
 	set, ok := e.allowedTypes[providerName]
 	if !ok {
+		// Try prefix match (e.g., "signal:4567" → "signal")
+		if idx := strings.Index(providerName, ":"); idx > 0 {
+			if set, ok = e.allowedTypes[providerName[:idx]]; ok {
+				return set[eventType]
+			}
+		}
 		return true // no override → inherit global
 	}
 	return set[eventType]
+}
+
+// matchesScope returns true if a provider should handle the given event.
+// Non-scoped providers always match. Scoped providers are checked via MatchesEvent.
+func matchesScope(p Provider, event Event) bool {
+	if sp, ok := p.(ScopedProvider); ok {
+		return sp.MatchesEvent(event)
+	}
+	return true
 }
 
 // Notify sends a one-way notification to ALL available providers concurrently.
@@ -91,6 +108,9 @@ func (e *Engine) Notify(event Event) {
 			continue
 		}
 		if !e.shouldSendTo(p.Name(), string(event.Type)) {
+			continue
+		}
+		if !matchesScope(p, event) {
 			continue
 		}
 		wg.Add(1)
@@ -132,6 +152,9 @@ func (e *Engine) AskQuestion(event Event) {
 			continue
 		}
 		if !e.shouldSendTo(p.Name(), string(event.Type)) {
+			continue
+		}
+		if !matchesScope(p, event) {
 			continue
 		}
 

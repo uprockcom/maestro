@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -97,16 +98,37 @@ func runSignalSetup(cmd *cobra.Command, args []string) error {
 	fmt.Println("You need an SMS-capable phone number for the bot (separate from your personal number).")
 	fmt.Println()
 
-	// Step 1: Pull image
+	// Step 1: Pull signal-cli image and check relay image
 	fmt.Println("Step 1: Pulling Signal CLI Docker image...")
 	if err := signal.PullImage(logger); err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
+	}
+	// Check that relay image exists; try pulling from registry first, then build locally
+	checkRelay := exec.Command("docker", "image", "inspect", "maestro-signal-relay:latest")
+	if err := checkRelay.Run(); err != nil {
+		fmt.Println("Pulling signal-relay Docker image...")
+		pullCmd := exec.Command("docker", "pull", "ghcr.io/uprockcom/maestro-signal-relay:latest")
+		pullCmd.Stdout = os.Stdout
+		pullCmd.Stderr = os.Stderr
+		if pullErr := pullCmd.Run(); pullErr == nil {
+			// Tag as local name
+			tagCmd := exec.Command("docker", "tag", "ghcr.io/uprockcom/maestro-signal-relay:latest", "maestro-signal-relay:latest")
+			tagCmd.Run()
+		} else {
+			fmt.Println("Pull failed, building signal-relay Docker image locally...")
+			buildCmd := exec.Command("make", "docker-relay")
+			buildCmd.Stdout = os.Stdout
+			buildCmd.Stderr = os.Stderr
+			if err := buildCmd.Run(); err != nil {
+				return fmt.Errorf("failed to build relay image (run 'make docker-relay' manually): %w", err)
+			}
+		}
 	}
 	fmt.Println("Done.")
 	fmt.Println()
 
 	// Step 2: Port selection
-	fmt.Print("Step 2: Container port [8080]: ")
+	fmt.Print("Step 2: Relay port [8080]: ")
 	portStr, _ := reader.ReadString('\n')
 	portStr = strings.TrimSpace(portStr)
 	port := 8080
@@ -118,25 +140,25 @@ func runSignalSetup(cmd *cobra.Command, args []string) error {
 		port = p
 	}
 
-	// Step 3: Start container
+	// Step 3: Bot phone number (needed before starting containers)
 	fmt.Println()
-	fmt.Printf("Step 3: Starting Signal CLI container on port %d...\n", port)
-	if err := signal.EnsureRunning(port, logger); err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
-	}
-	fmt.Println("Container is running and healthy.")
-	fmt.Println()
-
-	// Step 4: Bot phone number
-	fmt.Print("Step 4: Bot phone number (with country code, e.g. +12025551234): ")
+	fmt.Print("Step 3: Bot phone number (with country code, e.g. +12025551234): ")
 	botNumber, _ := reader.ReadString('\n')
 	botNumber = strings.TrimSpace(botNumber)
 	if botNumber == "" {
 		return fmt.Errorf("bot phone number is required")
 	}
 
-	// Step 5: Captcha
+	// Step 4: Start both containers
 	fmt.Println()
+	fmt.Printf("Step 4: Starting Signal containers on port %d...\n", port)
+	if err := signal.EnsureRunning(port, botNumber, logger); err != nil {
+		return fmt.Errorf("failed to start containers: %w", err)
+	}
+	fmt.Println("Containers are running and healthy.")
+	fmt.Println()
+
+	// Step 5: Captcha
 	fmt.Println("Step 5: Signal requires a captcha for registration.")
 	fmt.Println("  1. Open this URL in your browser:")
 	fmt.Println("     https://signalcaptchas.org/registration/generate.html")
@@ -148,10 +170,9 @@ func runSignalSetup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	// Extract token from signalcaptcha://signal-recaptcha-v2.6LfBXs0bAAAAAAjkDyyI1Lk5gBAUWzh... format
 	captchaToken := strings.TrimPrefix(captchaLink, "signalcaptcha://")
 
-	// Step 6: Register
+	// Step 6: Register (talk to signal-cli via relay)
 	fmt.Println()
 	fmt.Printf("Step 6: Registering %s (an SMS will be sent)...\n", botNumber)
 	api := signal.NewAPIClient(fmt.Sprintf("http://127.0.0.1:%d", port), botNumber)
@@ -183,16 +204,27 @@ func runSignalSetup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("recipient phone number is required")
 	}
 
-	// Step 9: Test message
+	// Step 9: Generate API key and write keys.json to relay config volume
 	fmt.Println()
-	fmt.Println("Step 9: Sending a test message...")
-	if _, err := api.SendMessage(recipient, "[maestro] Signal setup complete! You will receive notifications here."); err != nil {
+	fmt.Println("Step 9: Generating API key and configuring relay...")
+	apiKey, err := generateAndWriteKeysJSON("default", recipient)
+	if err != nil {
+		return fmt.Errorf("failed to configure relay: %w", err)
+	}
+	fmt.Println("Relay configured.")
+	fmt.Println()
+
+	// Step 10: Test message via relay
+	fmt.Println("Step 10: Sending a test message via relay...")
+	relayURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	relayAPI := signal.NewAPIClientWithKey(relayURL, botNumber, apiKey)
+	if _, err := relayAPI.SendMessage(recipient, "[maestro] Signal setup complete! You will receive notifications here."); err != nil {
 		return fmt.Errorf("failed to send test message: %w", err)
 	}
 	fmt.Println("Test message sent!")
 	fmt.Println()
 
-	// Step 9: Confirm
+	// Step 11: Confirm
 	fmt.Print("Did you receive the test message? [Y/n]: ")
 	confirm, _ := reader.ReadString('\n')
 	confirm = strings.TrimSpace(strings.ToLower(confirm))
@@ -201,14 +233,14 @@ func runSignalSetup(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Step 11: Save config
+	// Step 12: Save config
 	viper.Set("daemon.notifications.providers.signal.enabled", true)
 	viper.Set("daemon.notifications.providers.signal.number", botNumber)
 	viper.Set("daemon.notifications.providers.signal.recipient", recipient)
-	viper.Set("daemon.notifications.providers.signal.container_port", port)
+	viper.Set("daemon.notifications.providers.signal.url", relayURL)
+	viper.Set("daemon.notifications.providers.signal.api_key", apiKey)
 
 	if err := viper.WriteConfig(); err != nil {
-		// Try WriteConfigAs if no config file exists yet
 		configFile := viper.ConfigFileUsed()
 		if configFile == "" {
 			return fmt.Errorf("failed to save config: %w", err)
@@ -255,7 +287,7 @@ func runSignalBackup(cmd *cobra.Command, args []string) error {
 	fmt.Println("Current Signal config (also saved in config.yml):")
 	fmt.Printf("  number:    %s\n", config.Daemon.Notifications.Providers.Signal.Number)
 	fmt.Printf("  recipient: %s\n", config.Daemon.Notifications.Providers.Signal.Recipient)
-	fmt.Printf("  port:      %d\n", config.Daemon.Notifications.Providers.Signal.ContainerPort)
+	fmt.Printf("  url:       %s\n", config.Daemon.Notifications.Providers.Signal.URL)
 
 	// List all backups
 	fmt.Println()
@@ -355,17 +387,20 @@ func runSignalRestore(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("restore failed: %w\n%s", err, string(out))
 	}
 
-	// Restart container
-	port := config.Daemon.Notifications.Providers.Signal.ContainerPort
-	if port == 0 {
-		port = 8080
-	}
-	fmt.Println("Starting Signal container...")
-	logger := func(format string, args ...interface{}) {
+	// Restart containers
+	fmt.Println("Starting Signal containers...")
+	restoreLogger := func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
 	}
-	if err := signal.EnsureRunning(port, logger); err != nil {
-		return fmt.Errorf("failed to restart container: %w", err)
+	botNumber := config.Daemon.Notifications.Providers.Signal.Number
+	restorePort := 8080
+	if u, err := url.Parse(config.Daemon.Notifications.Providers.Signal.URL); err == nil && u.Port() != "" {
+		if p, err := strconv.Atoi(u.Port()); err == nil {
+			restorePort = p
+		}
+	}
+	if err := signal.EnsureRunning(restorePort, botNumber, restoreLogger); err != nil {
+		return fmt.Errorf("failed to restart containers: %w", err)
 	}
 
 	fmt.Println()
@@ -523,7 +558,9 @@ func runSignalAddUser(cmd *cobra.Command, args []string) error {
 
 	var kf signalKeysFile
 	if data, err := os.ReadFile(keysPath); err == nil {
-		json.Unmarshal(data, &kf)
+		if err := json.Unmarshal(data, &kf); err != nil {
+			return fmt.Errorf("failed to parse existing keys.json: %w", err)
+		}
 	}
 	kf.Users = append(kf.Users, newUser)
 
@@ -542,6 +579,120 @@ func runSignalAddUser(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Relay URL: (your relay URL)\n")
 	fmt.Printf("  API key:   %s\n", plaintext)
 	return nil
+}
+
+var signalAddContactCmd = &cobra.Command{
+	Use:   "add-contact",
+	Short: "Add a contact profile for per-container routing",
+	Long: `Add a contact profile so containers can be assigned to a specific person.
+Messages from that person's phone will be routed only to their containers.`,
+	RunE: runSignalAddContact,
+}
+
+func init() {
+	signalCmd.AddCommand(signalAddContactCmd)
+}
+
+func runSignalAddContact(cmd *cobra.Command, args []string) error {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println("Add Signal Contact Profile")
+	fmt.Println("==========================")
+	fmt.Println()
+
+	// Step 1: Profile name
+	fmt.Print("Profile name (e.g. wife, alice): ")
+	name, _ := reader.ReadString('\n')
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("profile name is required")
+	}
+
+	// Step 2: Recipient phone number
+	fmt.Print("Phone number (e.g. +15551234567): ")
+	recipient, _ := reader.ReadString('\n')
+	recipient = strings.TrimSpace(recipient)
+	if recipient == "" {
+		return fmt.Errorf("phone number is required")
+	}
+
+	// Step 3: Generate API key and add to relay's keys.json
+	fmt.Println()
+	fmt.Println("Generating API key...")
+	apiKey, err := generateAndWriteKeysJSON(name, recipient)
+	if err != nil {
+		return fmt.Errorf("failed to add to relay: %w", err)
+	}
+
+	// Step 4: Save to config
+	viper.Set(fmt.Sprintf("contacts.%s.signal.recipient", name), recipient)
+	viper.Set(fmt.Sprintf("contacts.%s.signal.api_key", name), apiKey)
+
+	if err := viper.WriteConfig(); err != nil {
+		configFile := viper.ConfigFileUsed()
+		if configFile == "" {
+			return fmt.Errorf("failed to save config: %w", err)
+		}
+		if err := viper.WriteConfigAs(configFile); err != nil {
+			return fmt.Errorf("failed to write config: %w", err)
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("Contact profile %q saved.\n", name)
+	fmt.Println("Use with: maestro new --contact-profile " + name + " \"task description\"")
+	fmt.Println("Restart the daemon to activate: maestro daemon stop && maestro daemon start")
+	return nil
+}
+
+// generateAndWriteKeysJSON generates an API key, writes the entry to keys.json
+// on the relay config volume, and returns the plaintext key.
+func generateAndWriteKeysJSON(name, recipient string) (string, error) {
+	// Generate API key
+	keyBytes := make([]byte, 32)
+	if _, err := cryptoRandRead(keyBytes); err != nil {
+		return "", fmt.Errorf("failed to generate random key: %w", err)
+	}
+	plaintext := hex.EncodeToString(keyBytes)
+	h := sha256.Sum256([]byte(plaintext))
+	keyHash := hex.EncodeToString(h[:])
+
+	newUser := signalAddUserEntry{
+		Name:      name,
+		KeyHash:   keyHash,
+		Recipient: recipient,
+	}
+
+	// Read existing keys.json from the relay config volume
+	volName := signal.RelayConfigVolume()
+	var kf signalKeysFile
+
+	readCmd := exec.Command("docker", "run", "--rm",
+		"-v", volName+":/config:ro",
+		"alpine", "cat", "/config/keys.json")
+	if data, err := readCmd.Output(); err == nil {
+		if err := json.Unmarshal(data, &kf); err != nil {
+			return "", fmt.Errorf("failed to parse existing keys.json from relay volume: %w", err)
+		}
+	}
+
+	kf.Users = append(kf.Users, newUser)
+
+	data, err := json.MarshalIndent(kf, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal keys file: %w", err)
+	}
+
+	// Write keys.json back to the volume
+	writeCmd := exec.Command("docker", "run", "--rm",
+		"-v", volName+":/config",
+		"-i", "alpine", "sh", "-c", "cat > /config/keys.json")
+	writeCmd.Stdin = strings.NewReader(string(data))
+	if out, err := writeCmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to write keys.json: %w\n%s", err, string(out))
+	}
+
+	return plaintext, nil
 }
 
 // cryptoRandRead is a variable for testing; defaults to crypto/rand.Read.

@@ -66,6 +66,7 @@ type containersLoadedMsg struct {
 	containers       []container.Info
 	err              error
 	dockerResponsive bool
+	daemonConnected  bool // true when data came from daemon cache
 }
 
 // daemonStatusMsg is sent when daemon status is checked
@@ -90,12 +91,15 @@ type createContainerMsg struct {
 	branchName      string
 	noConnect       bool
 	exact           bool
+	model           string
+	web             bool
 }
 
 // saveSettingsMsg is sent when user saves settings
 type saveSettingsMsg struct {
 	memory              string
 	cpus                string
+	defaultModel        string
 	showNag             bool
 	autoRefreshTokens   bool
 	enableNotifications bool
@@ -179,6 +183,8 @@ type TUIResult struct {
 	BranchName      string // For ActionCreate
 	NoConnect       bool   // For ActionCreate
 	Exact           bool   // For ActionCreate
+	Model           string // For ActionCreate (opus, sonnet, haiku)
+	Web             bool   // For ActionCreate
 }
 
 // ActionType defines what action the TUI wants the caller to perform

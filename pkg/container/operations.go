@@ -16,6 +16,7 @@ package container
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,63 @@ import (
 
 	"github.com/uprockcom/maestro/pkg/paths"
 )
+
+// ValidateDomain checks that a string is a valid DNS domain name per RFC 1123.
+// Returns an error describing the validation failure, or nil if valid.
+func ValidateDomain(domain string) error {
+	if domain == "" {
+		return fmt.Errorf("domain is empty")
+	}
+	if len(domain) > 253 {
+		return fmt.Errorf("domain exceeds 253 characters")
+	}
+	if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+		return fmt.Errorf("domain must not start or end with a dot")
+	}
+	if strings.Contains(domain, "..") {
+		return fmt.Errorf("domain must not contain consecutive dots")
+	}
+	labels := strings.Split(domain, ".")
+	for i, label := range labels {
+		if len(label) == 0 {
+			return fmt.Errorf("domain contains empty label")
+		}
+		// Wildcard "*" is only valid as the entire first label and must be followed
+		// by at least one more label (e.g. *.example.com). Bare "*" is rejected.
+		if label == "*" {
+			if i != 0 {
+				return fmt.Errorf("wildcard * is only allowed as the first label")
+			}
+			if len(labels) < 2 {
+				return fmt.Errorf("wildcard * must be followed by a domain label, e.g. *.example.com")
+			}
+			continue
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("domain label %q exceeds 63 characters", label)
+		}
+		for _, c := range label {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+				return fmt.Errorf("domain contains invalid character %q", c)
+			}
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("domain label %q must not start or end with a hyphen", label)
+		}
+	}
+	return nil
+}
+
+// ValidateIP checks that a string is a valid IPv4 or IPv6 address.
+func ValidateIP(ip string) error {
+	if ip == "" {
+		return fmt.Errorf("IP address is empty")
+	}
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("invalid IP address: %s", ip)
+	}
+	return nil
+}
 
 // OperationType defines Docker operations that can be performed on containers
 type OperationType string
@@ -341,10 +399,14 @@ func UpdateContainerResources(containerName, memory, cpus string) error {
 	return nil
 }
 
-// AddIPToContainer adds an IP address to a container's firewall whitelist
+// AddIPToContainer adds an IP address to a container's firewall whitelist.
+// The IP is validated and passed as a shell positional parameter to prevent injection.
 func AddIPToContainer(containerName, ip string) error {
-	cmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
-		fmt.Sprintf("ipset add allowed-domains %s 2>/dev/null || true", ip))
+	if err := ValidateIP(ip); err != nil {
+		return fmt.Errorf("invalid IP for firewall: %w", err)
+	}
+	cmd := exec.Command("docker", "exec", "-u", "root", containerName,
+		"sh", "-c", `ipset add allowed-domains "$1" 2>/dev/null || true`, "_", ip)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to add IP to container firewall: %w", err)
 	}
@@ -367,34 +429,40 @@ func AddDomainToAllContainers(domain, containerPrefix string) error {
 	return nil
 }
 
-// AddDomainToContainer adds a domain to a specific container's firewall
+// AddDomainToContainer adds a domain to a specific container's firewall.
+// The domain is validated and passed as shell positional parameters to prevent injection.
 func AddDomainToContainer(containerName, domain string) error {
+	if err := ValidateDomain(domain); err != nil {
+		return fmt.Errorf("invalid domain for firewall: %w", err)
+	}
+
 	dnsmasqConf := "/tmp/dnsmasq-firewall.conf"
 
-	// Check if domain already in config
-	checkConfCmd := exec.Command("docker", "exec", containerName, "grep", "-q", fmt.Sprintf("ipset=/%s/", domain), dnsmasqConf)
+	// Check if domain already in config (grep arg is safe — not passed through shell)
+	checkConfCmd := exec.Command("docker", "exec", containerName, "grep", "-qF",
+		fmt.Sprintf("ipset=/%s/", domain), dnsmasqConf)
 	if checkConfCmd.Run() == nil {
 		return nil // Already configured
 	}
 
-	// Append domain to dnsmasq config
-	appendCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
-		fmt.Sprintf("echo 'ipset=/%s/allowed-domains' >> %s && echo 'server=/%s/8.8.8.8' >> %s",
-			domain, dnsmasqConf, domain, dnsmasqConf))
+	// Append domain to dnsmasq config using positional parameters (no interpolation)
+	appendCmd := exec.Command("docker", "exec", "-u", "root", containerName,
+		"sh", "-c", `printf '%s\n' "ipset=/$1/allowed-domains" "server=/$1/8.8.8.8" >> "$2"`,
+		"_", domain, dnsmasqConf)
 	if err := appendCmd.Run(); err != nil {
 		return fmt.Errorf("failed to update dnsmasq config: %w", err)
 	}
 
-	// Restart dnsmasq
+	// Restart dnsmasq (no user input in this command)
 	restartCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
 		"pkill -9 dnsmasq 2>/dev/null || true; sleep 0.2; dnsmasq --conf-file=/tmp/dnsmasq-firewall.conf")
 	if err := restartCmd.Run(); err != nil {
 		return fmt.Errorf("failed to restart dnsmasq: %w", err)
 	}
 
-	// Perform initial DNS resolution
-	resolveCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
-		fmt.Sprintf("dig +short %s | head -5", domain))
+	// Perform initial DNS resolution using positional parameter
+	resolveCmd := exec.Command("docker", "exec", containerName,
+		"sh", "-c", `dig +short "$1" | head -5`, "_", domain)
 	_, _ = resolveCmd.Output() // Ignore errors from resolution
 
 	return nil

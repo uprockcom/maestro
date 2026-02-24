@@ -33,12 +33,13 @@ type pendingSignalQ struct {
 }
 
 // SignalProvider sends notifications via Signal and supports interactive
-// question/response by polling for incoming messages.
+// question/response by polling for incoming messages. Always communicates
+// through the relay (local or remote).
 type SignalProvider struct {
 	api        *APIClient
 	recipient  string
-	port       int
-	remote     bool   // true when using a remote relay (URL is set)
+	name       string // unique provider name: "signal" for default, "signal:<last4>" for overrides
+	isDefault  bool   // true for the primary user's provider
 	cursor     uint64 // cursor for relay's non-destructive polling
 	pending    map[string]*pendingSignalQ
 	commands   notify.CommandHandler // provider-agnostic command handler
@@ -48,33 +49,54 @@ type SignalProvider struct {
 	mu         sync.Mutex
 }
 
-// New creates a new SignalProvider.
-func New(cfg Config, commands notify.CommandHandler, logger func(string, ...interface{})) *SignalProvider {
+// New creates a new SignalProvider. Always uses the relay API.
+// isDefault indicates whether this is the primary user's provider.
+// cfg.URL and cfg.APIKey must be set; if empty, the provider will log an error
+// and remain unavailable.
+func New(cfg Config, commands notify.CommandHandler, logger func(string, ...interface{}), isDefault bool) *SignalProvider {
+	if cfg.URL == "" {
+		logger("signal: cannot create provider — URL is not configured (run 'maestro signal setup' or 'maestro signal connect')")
+	}
+
 	sp := &SignalProvider{
+		api:       NewAPIClientWithKey(cfg.URL, cfg.Number, cfg.APIKey),
 		recipient: cfg.Recipient,
+		isDefault: isDefault,
 		pending:   make(map[string]*pendingSignalQ),
 		commands:  commands,
 		logger:    logger,
 	}
 
-	if cfg.URL != "" {
-		// Remote relay mode — use relay URL with API key auth
-		sp.api = NewAPIClientWithKey(cfg.URL, cfg.Number, cfg.APIKey)
-		sp.remote = true
+	// Build unique name
+	if isDefault {
+		sp.name = "signal"
+	} else if len(cfg.Recipient) >= 4 {
+		sp.name = "signal:" + cfg.Recipient[len(cfg.Recipient)-4:]
 	} else {
-		// Local mode — talk to local signal-cli container
-		port := cfg.Port
-		if port == 0 {
-			port = 8080
-		}
-		sp.api = NewAPIClient(fmt.Sprintf("http://127.0.0.1:%d", port), cfg.Number)
-		sp.port = port
+		sp.name = "signal:" + cfg.Recipient
 	}
 
 	return sp
 }
 
-func (s *SignalProvider) Name() string { return "signal" }
+func (s *SignalProvider) Name() string { return s.name }
+
+// IsDefault returns true if this is the primary/default provider.
+func (s *SignalProvider) IsDefault() bool { return s.isDefault }
+
+// MatchesEvent returns true if this provider should handle the given event.
+// Default providers handle events with no contact overrides.
+// Non-default providers only handle events whose contacts match their recipient.
+func (s *SignalProvider) MatchesEvent(event notify.Event) bool {
+	if event.Contacts == nil {
+		return s.isDefault
+	}
+	sc, ok := event.Contacts["signal"]
+	if !ok {
+		return s.isDefault
+	}
+	return sc["recipient"] == s.recipient
+}
 
 // Send delivers a plain (non-interactive) notification via Signal.
 func (s *SignalProvider) Send(_ context.Context, event notify.Event) error {
@@ -105,12 +127,12 @@ func (s *SignalProvider) SendInteractive(_ context.Context, event notify.Event) 
 	return ch, false, nil
 }
 
-// Available reports whether the Signal container is connected and healthy.
+// Available reports whether the Signal relay is connected and healthy.
 func (s *SignalProvider) Available() bool {
 	return s.connected.Load()
 }
 
-// Close cancels the poll loop. It does NOT stop the Docker container
+// Close cancels the poll loop. It does NOT stop the Docker containers
 // (preserves Signal registration across daemon restarts).
 func (s *SignalProvider) Close() error {
 	if s.pollCancel != nil {
@@ -129,23 +151,12 @@ func (s *SignalProvider) Close() error {
 	return nil
 }
 
-// Run starts the Signal backend and enters the polling loop. In local mode,
-// this starts the Docker container. In remote mode, it health-checks the relay.
-// Blocks until ctx is cancelled.
+// Run health-checks the relay and enters the polling loop. Blocks until ctx is cancelled.
 func (s *SignalProvider) Run(ctx context.Context) error {
-	if s.remote {
-		// Remote mode — health-check the relay instead of starting a container
-		if _, err := s.api.About(); err != nil {
-			return fmt.Errorf("signal relay health check failed: %w", err)
-		}
-		s.logger("signal: connected to remote relay, starting poll loop")
-	} else {
-		// Local mode — start signal-cli container
-		if err := EnsureRunning(s.port, s.logger); err != nil {
-			return fmt.Errorf("signal container failed to start: %w", err)
-		}
-		s.logger("signal: provider connected, starting poll loop")
+	if _, err := s.api.About(); err != nil {
+		return fmt.Errorf("signal relay health check failed: %w", err)
 	}
+	s.logger("signal [%s]: connected to relay, starting poll loop", s.name)
 
 	s.connected.Store(true)
 
@@ -169,10 +180,10 @@ func (s *SignalProvider) OnQuestionResolved(eventID string, resp notify.Response
 	s.mu.Unlock()
 
 	// Send follow-up only if the question was answered by a different provider
-	if ok && resp.Provider != "signal" {
+	if ok && resp.Provider != s.name {
 		text := FormatResolved(resp.Provider)
 		if _, err := s.api.SendMessage(s.recipient, text); err != nil {
-			s.logger("signal: failed to send resolved follow-up: %v", err)
+			s.logger("signal [%s]: failed to send resolved follow-up: %v", s.name, err)
 		}
 	}
 }

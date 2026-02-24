@@ -15,171 +15,114 @@
 package tui
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
-	"net/http"
-	"os"
-	"path/filepath"
-	"time"
 
+	"github.com/uprockcom/maestro/pkg/api"
 	"github.com/uprockcom/maestro/pkg/notify"
 )
 
-// DaemonClient talks to the running daemon's IPC server.
+// DaemonClient wraps api.Client for TUI-specific daemon operations.
 type DaemonClient struct {
-	port      int
-	token     string
-	client    *http.Client
-	configDir string // stored so we can re-read daemon-ipc.json on reconnect
+	client    *api.Client
+	configDir string
 }
 
-// daemonIPCInfo mirrors daemon.DaemonIPCInfo without importing the daemon package.
-type daemonIPCInfo struct {
-	Port  int    `json:"port"`
-	Token string `json:"token"`
-}
-
-// NewDaemonClient reads daemon-ipc.json from the given config directory and
-// returns a client that can communicate with the daemon. Returns nil, nil if
-// the daemon is not running (file not found).
+// NewDaemonClient reads daemon-ipc.json and returns a client.
+// Returns nil, nil if daemon is not running.
 func NewDaemonClient(configDir string) (*DaemonClient, error) {
-	ipcPath := filepath.Join(configDir, "daemon-ipc.json")
-	data, err := os.ReadFile(ipcPath)
+	client, err := api.NewClientFromConfig(configDir)
 	if err != nil {
-		return nil, nil // daemon not running
+		return nil, err
 	}
-
-	var info daemonIPCInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, fmt.Errorf("invalid daemon-ipc.json: %w", err)
-	}
-	if info.Port == 0 {
+	if client == nil {
 		return nil, nil
 	}
-
-	return &DaemonClient{
-		port:      info.Port,
-		token:     info.Token,
-		configDir: configDir,
-		client: &http.Client{
-			Timeout: 3 * time.Second,
-		},
-	}, nil
+	return &DaemonClient{client: client, configDir: configDir}, nil
 }
 
-// Reconnect re-reads daemon-ipc.json and updates the port and token.
-// This handles daemon restarts where the port/token change.
+// Reconnect re-reads daemon-ipc.json (handles daemon restart).
 func (c *DaemonClient) Reconnect() error {
-	ipcPath := filepath.Join(c.configDir, "daemon-ipc.json")
-	data, err := os.ReadFile(ipcPath)
+	client, err := api.NewClientFromConfig(c.configDir)
 	if err != nil {
-		return fmt.Errorf("daemon-ipc.json not found: %w", err)
+		return err
 	}
-
-	var info daemonIPCInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return fmt.Errorf("invalid daemon-ipc.json: %w", err)
+	if client == nil {
+		return fmt.Errorf("daemon not running")
 	}
-	if info.Port == 0 {
-		return fmt.Errorf("daemon-ipc.json has no port")
-	}
-
-	c.port = info.Port
-	c.token = info.Token
+	c.client = client
 	return nil
 }
 
 // GetPendingNotifications fetches pending questions from the daemon.
 func (c *DaemonClient) GetPendingNotifications() ([]notify.PendingQuestion, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/notifications/pending", c.port)
-	req, err := http.NewRequest("GET", url, nil)
+	ctx := context.Background()
+	resp, err := api.Call(ctx, c.client, api.GetPendingNotifications, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Maestro-Token", c.token)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("daemon returned %d", resp.StatusCode)
-	}
-
-	var questions []notify.PendingQuestion
-	if err := json.NewDecoder(resp.Body).Decode(&questions); err != nil {
-		return nil, err
-	}
-	return questions, nil
-}
-
-// DismissNotification removes a pending notification without answering it.
-func (c *DaemonClient) DismissNotification(eventID string) error {
-	body := struct {
-		EventID string `json:"event_id"`
-	}{EventID: eventID}
-
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-
-	url := fmt.Sprintf("http://127.0.0.1:%d/notifications/dismiss", c.port)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("X-Maestro-Token", c.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("daemon returned %d", resp.StatusCode)
-	}
-	return nil
+	return toNotifyQuestions(resp.Questions), nil
 }
 
 // AnswerNotification submits an answer to a pending question.
 func (c *DaemonClient) AnswerNotification(eventID string, selections []string, text string) error {
-	body := struct {
-		EventID    string   `json:"event_id"`
-		Selections []string `json:"selections,omitempty"`
-		Text       string   `json:"text,omitempty"`
-	}{
+	ctx := context.Background()
+	_, err := api.Call(ctx, c.client, api.AnswerNotification, &api.AnswerNotificationRequest{
 		EventID:    eventID,
 		Selections: selections,
 		Text:       text,
-	}
+	})
+	return err
+}
 
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
+// DismissNotification removes a pending notification.
+func (c *DaemonClient) DismissNotification(eventID string) error {
+	ctx := context.Background()
+	_, err := api.Call(ctx, c.client, api.DismissNotification, &api.DismissNotificationRequest{
+		EventID: eventID,
+	})
+	return err
+}
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/notifications/answer", c.port)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("X-Maestro-Token", c.token)
-	req.Header.Set("Content-Type", "application/json")
+// toNotifyQuestions converts api.PendingQuestion to notify.PendingQuestion.
+func toNotifyQuestions(apiQs []api.PendingQuestion) []notify.PendingQuestion {
+	result := make([]notify.PendingQuestion, len(apiQs))
+	for i, aq := range apiQs {
+		var question *notify.QuestionData
+		if aq.Event.Question != nil {
+			items := make([]notify.QuestionItem, len(aq.Event.Question.Questions))
+			for j, q := range aq.Event.Question.Questions {
+				opts := make([]notify.QuestionOption, len(q.Options))
+				for k, o := range q.Options {
+					opts[k] = notify.QuestionOption{
+						Label:       o.Label,
+						Description: o.Description,
+					}
+				}
+				items[j] = notify.QuestionItem{
+					Question:    q.Question,
+					Header:      q.Header,
+					Options:     opts,
+					MultiSelect: q.MultiSelect,
+				}
+			}
+			question = &notify.QuestionData{Questions: items}
+		}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
+		result[i] = notify.PendingQuestion{
+			Event: notify.Event{
+				ID:            aq.Event.ID,
+				ContainerName: aq.Event.ContainerName,
+				ShortName:     aq.Event.ShortName,
+				Branch:        aq.Event.Branch,
+				Title:         aq.Event.Title,
+				Message:       aq.Event.Message,
+				Type:          notify.EventType(aq.Event.Type),
+				Timestamp:     aq.Event.Timestamp,
+				Question:      question,
+			},
+			SentAt: aq.SentAt,
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("daemon returned %d", resp.StatusCode)
-	}
-	return nil
+	return result
 }

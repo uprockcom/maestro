@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -30,18 +31,24 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/uprockcom/maestro/assets"
 	"github.com/uprockcom/maestro/pkg/container"
+	"github.com/uprockcom/maestro/pkg/daemon"
 	"github.com/uprockcom/maestro/pkg/version"
 )
 
 var (
-	specFile      string
-	noConnect     bool
-	exactPrompt  bool
-	flagProject   string
-	flagNoProject bool
-	flagNick      string
+	specFile        string
+	noConnect       bool
+	exactPrompt    bool
+	flagProject     string
+	flagNoProject   bool
+	flagNick        string
+	flagModel       string
+	flagContacts    string // raw JSON contacts override
+	flagContactProf string // named contact profile from config
+	webMode         bool
 )
 
 var newCmd = &cobra.Command{
@@ -67,6 +74,10 @@ func init() {
 	newCmd.Flags().StringVarP(&flagProject, "project", "p", "", "Use a named project from config")
 	newCmd.Flags().BoolVar(&flagNoProject, "no-project", false, "Force ad-hoc mode even inside a project directory")
 	newCmd.Flags().StringVar(&flagNick, "nick", "", "Assign a nickname to the new container")
+	newCmd.Flags().StringVarP(&flagModel, "model", "m", "", "Claude model to use: opus, sonnet, haiku (default from config)")
+	newCmd.Flags().StringVar(&flagContacts, "contacts", "", "Raw JSON contacts override (e.g. '{\"signal\":{\"recipient\":\"+1555\"}}')")
+	newCmd.Flags().StringVar(&flagContactProf, "contact-profile", "", "Named contact profile from config")
+	newCmd.Flags().BoolVarP(&webMode, "web", "w", false, "Enable browser support (Playwright + headless Chromium)")
 }
 
 func runNew(cmd *cobra.Command, args []string) error {
@@ -92,6 +103,9 @@ func runNew(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Creating container for: %s\n", truncateString(taskDescription, 80))
+
+	// Resolve model selection (flag > config > default "opus")
+	model := resolveModel(flagModel)
 
 	// Resolve project
 	project, projectName, err := resolveProject(flagProject, flagNoProject)
@@ -135,6 +149,17 @@ func runNew(cmd *cobra.Command, args []string) error {
 		labels["maestro.workspace"] = "/workspace/" + filepath.Base(project.PrimaryPath())
 	}
 
+	// Resolve contacts
+	contactsJSON, err := resolveContacts(flagContacts, flagContactProf)
+	if err != nil {
+		return fmt.Errorf("contacts: %w", err)
+	}
+	if contactsJSON != "" {
+		labels["maestro.contacts"] = contactsJSON
+	}
+
+	useWeb := webMode || config.Web.Enabled
+
 	// Run the shared container setup pipeline
 	if err := setupContainer(ContainerSetupOptions{
 		ContainerName: containerName,
@@ -144,6 +169,8 @@ func runNew(cmd *cobra.Command, args []string) error {
 		Labels:        labels,
 		Project:       project,
 		ProjectName:   projectName,
+		Model:         model,
+		WebEnabled:    useWeb,
 	}); err != nil {
 		return err
 	}
@@ -195,18 +222,66 @@ type ContainerSetupOptions struct {
 	SourceBranch    string            // If set (with ParentContainer): checkout this branch after copy
 	Project         *ProjectConfig    // If set: use project paths instead of cwd
 	ProjectName     string            // For Docker label and container name prefix
+	Model           string            // Claude model alias: opus, sonnet, haiku (default: opus)
+	WebEnabled      bool              // Use web-enabled image with Playwright/Chromium
+}
+
+// validModels is the set of accepted Claude model aliases.
+var validModels = map[string]bool{
+	"opus":   true,
+	"sonnet": true,
+	"haiku":  true,
+}
+
+// isValidModel checks whether a model alias is in the allowed set.
+func isValidModel(model string) bool {
+	return validModels[strings.ToLower(model)]
+}
+
+// resolveModel returns the model to use, resolving from flag, config, or default.
+// The returned value is always a valid, lowercase model alias.
+func resolveModel(flagValue string) string {
+	if flagValue != "" {
+		m := strings.ToLower(flagValue)
+		if isValidModel(m) {
+			return m
+		}
+		fmt.Printf("Warning: unknown model %q, falling back to config default\n", flagValue)
+	}
+	m := strings.ToLower(viper.GetString("containers.default_model"))
+	if isValidModel(m) {
+		return m
+	}
+	if m != "" {
+		fmt.Printf("Warning: unknown model %q in config, falling back to default\n", m)
+	}
+	return "opus"
 }
 
 // setupContainer runs the shared container setup pipeline.
 // All four container creation paths (CLI, TUI, daemon, batch) funnel through here.
 func setupContainer(opts ContainerSetupOptions) error {
+	// Normalize and validate model — this is the safety net for all entry paths
+	if opts.Model == "" {
+		opts.Model = "opus"
+	}
+	opts.Model = strings.ToLower(opts.Model)
+	if !isValidModel(opts.Model) {
+		return fmt.Errorf("invalid model %q: must be opus, sonnet, or haiku", opts.Model)
+	}
+
+	imageName := getDockerImage()
+	if opts.WebEnabled {
+		imageName = getDockerWebImage()
+	}
+
 	// 1. Ensure Docker image is available
-	if err := ensureDockerImage(); err != nil {
+	if err := ensureDockerImage(imageName); err != nil {
 		return fmt.Errorf("failed to ensure Docker image: %w", err)
 	}
 
 	// 2. Start container (with optional labels)
-	if err := startContainerWithLabels(opts.ContainerName, opts.Labels); err != nil {
+	if err := startContainerWithLabels(opts.ContainerName, opts.Labels, opts.WebEnabled); err != nil {
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
@@ -293,17 +368,17 @@ func setupContainer(opts ContainerSetupOptions) error {
 	}
 
 	// 8. Write MAESTRO.md agent documentation
-	if err := writeMaestroMD(opts.ContainerName, opts.BranchName, opts.ParentContainer, opts.Project); err != nil {
+	if err := writeMaestroMD(opts.ContainerName, opts.BranchName, opts.ParentContainer, opts.Project, opts.WebEnabled); err != nil {
 		fmt.Printf("Warning: Failed to write MAESTRO.md: %v\n", err)
 	}
 
 	// 9. Write Claude Code hooks for idle detection
-	if err := writeClaudeSettings(opts.ContainerName); err != nil {
+	if err := writeClaudeSettings(opts.ContainerName, opts.Model, opts.WebEnabled); err != nil {
 		fmt.Printf("Warning: Failed to write Claude settings: %v\n", err)
 	}
 
 	// 10. Start tmux session with Claude
-	if err := startTmuxSession(opts.ContainerName, opts.BranchName, opts.Prompt, opts.ExactPrompt); err != nil {
+	if err := startTmuxSession(opts.ContainerName, opts.BranchName, opts.Prompt, opts.ExactPrompt, opts.Model); err != nil {
 		return fmt.Errorf("failed to start tmux session: %w", err)
 	}
 
@@ -663,9 +738,16 @@ func getDockerImage() string {
 	return config.Containers.Image
 }
 
-func ensureDockerImage() error {
-	// Use the image determined by priority logic
-	imageName := getDockerImage()
+// getDockerWebImage returns the web-enabled container image to use.
+func getDockerWebImage() string {
+	versionImage := version.GetContainerWebImage()
+	if config.Web.Image == "" {
+		return versionImage
+	}
+	return config.Web.Image
+}
+
+func ensureDockerImage(imageName string) error {
 	cmd := exec.Command("docker", "images", "-q", imageName)
 	output, err := cmd.Output()
 	if err != nil {
@@ -700,7 +782,13 @@ func ensureDockerImage() error {
 			return fmt.Errorf("docker image not found and cannot build (no docker/ directory found)\nTry: docker pull %s", imageName)
 		}
 
-		buildCmd := exec.Command("docker", "build", "-t", imageName, dockerDir)
+		projectDir := filepath.Dir(dockerDir)
+		dockerFile := filepath.Join(dockerDir, "Dockerfile")
+		if strings.Contains(imageName, "maestro-web") {
+			dockerFile = filepath.Join(dockerDir, "Dockerfile.web")
+		}
+
+		buildCmd := exec.Command("docker", "build", "-t", imageName, "-f", dockerFile, projectDir)
 		buildCmd.Stdout = os.Stdout
 		buildCmd.Stderr = os.Stderr
 		return buildCmd.Run()
@@ -710,10 +798,10 @@ func ensureDockerImage() error {
 }
 
 func startContainer(containerName string) error {
-	return startContainerWithLabels(containerName, nil)
+	return startContainerWithLabels(containerName, nil, false)
 }
 
-func startContainerWithLabels(containerName string, labels map[string]string) error {
+func startContainerWithLabels(containerName string, labels map[string]string, webEnabled bool) error {
 	// Ensure Claude auth directory exists
 	authPath := expandPath(config.Claude.AuthPath)
 	if err := os.MkdirAll(authPath, 0755); err != nil {
@@ -791,6 +879,15 @@ func startContainerWithLabels(containerName string, labels map[string]string) er
 		"--cap-add", "NET_ADMIN", // For iptables
 		"--memory", config.Containers.Resources.Memory,
 		"--cpus", config.Containers.Resources.CPUs,
+	}
+
+	if webEnabled {
+		args = append(args, "--label", "maestro.web=true", "--init")
+		shmSize := config.Web.ShmSize
+		if shmSize == "" {
+			shmSize = "256m"
+		}
+		args = append(args, "--shm-size", shmSize)
 	}
 
 	// Add labels
@@ -893,7 +990,11 @@ func startContainerWithLabels(containerName string, labels map[string]string) er
 	}
 
 	// Use version-synchronized image (or config override if set)
-	args = append(args, getDockerImage())
+	imageName := getDockerImage()
+	if webEnabled {
+		imageName = getDockerWebImage()
+	}
+	args = append(args, imageName)
 
 	cmd := exec.Command("docker", args...)
 	if err := cmd.Run(); err != nil {
@@ -1819,7 +1920,7 @@ func setupGitHubRemote(containerName string) error {
 	return nil
 }
 
-func startTmuxSession(containerName, branchName, planningPrompt string, exactPrompt bool) error {
+func startTmuxSession(containerName, branchName, planningPrompt string, exactPrompt bool, model string) error {
 	// Create tmux configuration with status line showing container info and true color support
 	tmuxConfig := generateTmuxConfig(containerName, branchName)
 
@@ -1852,12 +1953,17 @@ Please analyze this task and create a detailed implementation plan. Do not start
 		return fmt.Errorf("failed to write bootstrap prompt: %w", err)
 	}
 
+	// Build Claude command — always pass --model explicitly so we don't
+	// depend on Claude CLI's default, which could change between versions.
+	// model is already validated by setupContainer, so this is safe to interpolate.
+	claudeCmd := fmt.Sprintf("claude --dangerously-skip-permissions --model %s", model)
+
 	// Start tmux session with Claude, piping the bootstrap prompt via stdin.
 	// Piped input bypasses the bypass-permissions prompt entirely and delivers
 	// the initial prompt in one shot — no auto-input script needed.
 	tmuxCmd := exec.Command("docker", "exec", "-u", "node", containerName, "sh", "-c",
 		"cd /workspace && HOME=/home/node tmux new-session -d -s main "+
-			"'cat /tmp/maestro-bootstrap.txt | claude --dangerously-skip-permissions'")
+			fmt.Sprintf("'cat /tmp/maestro-bootstrap.txt | %s'", claudeCmd))
 
 	// Capture output for debugging
 	var stdout, stderr bytes.Buffer
@@ -2235,7 +2341,7 @@ func truncateString(s string, maxLen int) string {
 // to two locations inside the container:
 //   - /home/node/.maestro/MAESTRO.md  — canonical reference location
 //   - /home/node/.claude/CLAUDE.md    — auto-discovered by Claude Code at startup
-func writeMaestroMD(containerName, branchName, parentContainer string, project *ProjectConfig) error {
+func writeMaestroMD(containerName, branchName, parentContainer string, project *ProjectConfig, webEnabled bool) error {
 	content := assets.MaestroMDTemplate
 	content = strings.ReplaceAll(content, "{{CONTAINER_NAME}}", containerName)
 	content = strings.ReplaceAll(content, "{{BRANCH_NAME}}", branchName)
@@ -2244,6 +2350,17 @@ func writeMaestroMD(containerName, branchName, parentContainer string, project *
 		content = strings.ReplaceAll(content, "{{PARENT_CONTAINER}}", "none (top-level)")
 	} else {
 		content = strings.ReplaceAll(content, "{{PARENT_CONTAINER}}", parentContainer)
+	}
+
+	if webEnabled {
+		webToolsSection := `## Browser / Web Support
+This container has Playwright browser automation available. You can use the ` + "`playwright`" + ` MCP server to test web apps.
+- Connect to dev servers normally via localhost (e.g. ` + "`http://localhost:3000`" + `).
+- Use ` + "`playwright_navigate`" + `, ` + "`playwright_screenshot`" + `, ` + "`playwright_click`" + ` etc.`
+		content = strings.ReplaceAll(content, "{{WEB_TOOLS_SECTION}}", webToolsSection)
+	} else {
+		content = strings.ReplaceAll(content, "{{WEB_TOOLS_SECTION}}\n\n", "")
+		content = strings.ReplaceAll(content, "{{WEB_TOOLS_SECTION}}", "")
 	}
 
 	// Render workspace layout
@@ -2287,9 +2404,28 @@ func writeMaestroMD(containerName, branchName, parentContainer string, project *
 // hook additionally blocks (up to 6 hours) waiting for either a response file
 // from the daemon/TUI or a user to connect. PostToolUse transitions back to
 // StateActive and cleans up question files.
-func writeClaudeSettings(containerName string) error {
-	settings := `{
-  "effortLevel": "high",
+func writeClaudeSettings(containerName, model string, webEnabled bool) error {
+	// Only set effortLevel for opus (thinking model); sonnet/haiku don't use it
+	effortLine := ""
+	if model == "" || model == "opus" {
+		effortLine = `
+  "effortLevel": "high",`
+	}
+
+	mcpServers := ""
+	if webEnabled {
+		mcpServers = `,
+  "mcpServers": {
+    "playwright": {
+      "command": "playwright-mcp",
+      "args": ["--headless"]
+    }
+  }`
+	}
+
+	// effortLine is either empty or includes a trailing comma + newline-indented
+	// field, so concatenation produces valid JSON in both cases.
+	settings := `{` + effortLine + `
   "promptSuggestionEnabled": false,
   "spinnerTipsEnabled": false,
   "hooks": {
@@ -2375,7 +2511,7 @@ func writeClaudeSettings(containerName string) error {
         ]
       }
     ]
-  }
+  }` + mcpServers + `
 }`
 
 	// Ensure maestro state directories exist
@@ -2467,9 +2603,54 @@ func copyProjectFromContainerOnce(srcContainer, dstContainer string) error {
 	return nil
 }
 
+// resolveContacts converts --contacts or --contact-profile flags to a JSON string
+// suitable for the maestro.contacts Docker label.
+func resolveContacts(rawJSON, profileName string) (string, error) {
+	if rawJSON != "" && profileName != "" {
+		return "", fmt.Errorf("--contacts and --contact-profile are mutually exclusive")
+	}
+
+	if rawJSON != "" {
+		// Validate JSON
+		var parsed map[string]map[string]string
+		if err := json.Unmarshal([]byte(rawJSON), &parsed); err != nil {
+			return "", fmt.Errorf("invalid --contacts JSON: %w", err)
+		}
+		// Re-marshal for consistent formatting
+		data, _ := json.Marshal(parsed)
+		return string(data), nil
+	}
+
+	if profileName != "" {
+		if config.Contacts == nil {
+			return "", fmt.Errorf("no contacts defined in config")
+		}
+		profile, ok := config.Contacts[profileName]
+		if !ok {
+			return "", fmt.Errorf("contact profile %q not found in config", profileName)
+		}
+		contacts := make(map[string]map[string]string)
+		if profile.Signal != nil && profile.Signal.Recipient != "" {
+			contacts["signal"] = map[string]string{"recipient": profile.Signal.Recipient}
+		}
+		if len(contacts) == 0 {
+			return "", fmt.Errorf("contact profile %q has no supported contact methods configured", profileName)
+		}
+		data, _ := json.Marshal(contacts)
+		return string(data), nil
+	}
+
+	return "", nil
+}
+
+// createContainerFromDaemonOpts is the callback adapter matching daemon.CreateContainerOpts.
+func createContainerFromDaemonOpts(opts daemon.CreateContainerOpts) (string, error) {
+	return CreateContainerFromDaemon(opts.Task, opts.ParentContainer, opts.Branch, opts.Model, opts.WebEnabled)
+}
+
 // CreateContainerFromDaemon creates a new child container from a daemon IPC request.
 // This is called by the daemon when a container requests a sibling via maestro-request.
-func CreateContainerFromDaemon(task, parentContainer, branch string) (string, error) {
+func CreateContainerFromDaemon(task, parentContainer, branch, model string, webEnabled bool) (string, error) {
 	// Use exact mode: the parent agent crafted a specific prompt, pass it through unmodified.
 	// We still need a branch name for container naming, so generate one separately.
 	branchName, err := generateBranchNameOnly(task)
@@ -2483,10 +2664,21 @@ func CreateContainerFromDaemon(task, parentContainer, branch string) (string, er
 		return "", fmt.Errorf("failed to generate container name: %w", err)
 	}
 
-	// Build labels, propagating workspace label from parent if present
+	// Resolve model: normalize, validate, fall back to config default
+	model = resolveModel(model)
+
+	// if not explicitly requested, inherit web support from parent
+	if !webEnabled && parentContainer != "" {
+		webEnabled = (container.GetLabel(parentContainer, "maestro.web") == "true")
+	}
+
+	// Build labels, propagating workspace and contacts labels from parent
 	labels := map[string]string{"maestro.parent": parentContainer}
 	if ws := container.GetLabel(parentContainer, "maestro.workspace"); ws != "" {
 		labels["maestro.workspace"] = ws
+	}
+	if contacts := container.GetLabel(parentContainer, "maestro.contacts"); contacts != "" {
+		labels["maestro.contacts"] = contacts
 	}
 
 	// Run the shared container setup pipeline
@@ -2498,6 +2690,8 @@ func CreateContainerFromDaemon(task, parentContainer, branch string) (string, er
 		Labels:          labels,
 		ParentContainer: parentContainer,
 		SourceBranch:    branch,
+		Model:           model,
+		WebEnabled:      webEnabled,
 	}); err != nil {
 		return "", err
 	}
@@ -2506,7 +2700,7 @@ func CreateContainerFromDaemon(task, parentContainer, branch string) (string, er
 }
 
 // CreateContainerFromTUI creates a new container with the given parameters (called from TUI)
-func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConnect, exact bool) error {
+func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConnect, exact bool, model string, web bool) error {
 	if taskDescription == "" {
 		return fmt.Errorf("task description is required")
 	}
@@ -2550,12 +2744,19 @@ func CreateContainerFromTUI(taskDescription, branchNameOverride string, skipConn
 	fmt.Printf("Container name: %s\n", containerName)
 	fmt.Printf("Branch name: %s\n", branchName)
 
+	// Resolve model: normalize, validate, fall back to config default
+	model = resolveModel(model)
+
+	useWeb := web || config.Web.Enabled
+
 	// Run the shared container setup pipeline
 	if err := setupContainer(ContainerSetupOptions{
 		ContainerName: containerName,
 		BranchName:    branchName,
 		Prompt:        planningPrompt,
 		ExactPrompt:   exact,
+		Model:         model,
+		WebEnabled:    useWeb,
 	}); err != nil {
 		return err
 	}

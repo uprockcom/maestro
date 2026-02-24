@@ -92,7 +92,8 @@ func ParseSignalCommand(text string) *SignalCommand {
 }
 
 // executeCommand runs a parsed command against the CommandHandler and sends
-// the result back via Signal.
+// the result back via Signal. Results are filtered to containers visible to
+// this provider's recipient.
 func (s *SignalProvider) executeCommand(cmd *SignalCommand) {
 	ctx := context.Background()
 	var reply string
@@ -103,7 +104,8 @@ func (s *SignalProvider) executeCommand(cmd *SignalCommand) {
 		if err != nil {
 			reply = FormatCommandError(err)
 		} else {
-			reply = FormatContainerList(containers)
+			visible := s.filterByContacts(containers)
+			reply = FormatContainerList(visible)
 		}
 
 	case CmdSend:

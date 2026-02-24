@@ -47,8 +47,11 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	// If no argument provided, show interactive selection
 	if len(args) == 0 {
-		// Get containers with configured prefix
-		containers, err := container.GetRunningContainers(config.Containers.Prefix)
+		svc := newContainerService()
+		defer svc.Close()
+
+		// Get running containers via ContainerService
+		containers, err := svc.ListRunning(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("failed to get running containers: %w", err)
 		}
@@ -121,7 +124,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Syncing credentials for %s...\n", containerName)
 	if err := container.EnsureFreshToken(containerName, config.Containers.Prefix); err != nil {
 		// Warn but don't fail - user might want to connect anyway
-		fmt.Printf("⚠️  Token sync warning: %v\n", err)
+		fmt.Printf("Warning: Token sync: %v\n", err)
 		fmt.Println("   You may need to run 'maestro auth' if authentication fails.")
 	}
 

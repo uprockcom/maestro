@@ -417,7 +417,7 @@ func TestBroadcast_PartialFailure(t *testing.T) {
 func TestCreateContainer(t *testing.T) {
 	ops := &mockContainerOps{}
 	d := newTestDaemon(ops, nil)
-	d.config.CreateContainer = func(task, parent, branch string) (string, error) {
+	d.config.CreateContainer = func(opts CreateContainerOpts) (string, error) {
 		return "maestro-new-container-1", nil
 	}
 

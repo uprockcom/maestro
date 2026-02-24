@@ -18,7 +18,6 @@ package signal
 type Config struct {
 	Number    string // bot's registered Signal phone number
 	Recipient string // user's phone number (receives notifications)
-	Port      int    // localhost port for signal-cli container (default 8080)
-	URL       string // remote relay URL — if set, skip local Docker
-	APIKey    string // API key for remote relay auth
+	URL       string // relay URL (local or remote — always set)
+	APIKey    string // API key for relay auth (always set)
 }

@@ -40,6 +40,8 @@ type RequestFile struct {
 	Message         string           `json:"message,omitempty"`
 	Parent          string           `json:"parent"`
 	Branch          string           `json:"branch,omitempty"`
+	Model           string           `json:"model,omitempty"`
+	Web             bool             `json:"web,omitempty"`
 	Status          string           `json:"status"`
 	RequestedAt     string           `json:"requested_at"`
 	ChildContainer  *string          `json:"child_container"`

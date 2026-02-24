@@ -88,7 +88,7 @@ github:
 
 daemon:
   # Daemon check interval
-  check_interval: 30m
+  check_interval: 30s
   # Show nag message if daemon not running
   show_nag: true
 

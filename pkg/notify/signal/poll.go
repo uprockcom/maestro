@@ -16,15 +16,16 @@ package signal
 
 import (
 	"context"
+	"fmt"
 	"time"
+
+	"github.com/uprockcom/maestro/pkg/notify"
 )
 
 const pollInterval = 3 * time.Second
 
 // pollLoop runs a ticker that polls for incoming Signal messages.
-// In local mode (destructive reads), only polls when there are pending questions.
-// In remote/relay mode (non-destructive cursor-based reads), always polls so
-// messages are consumed and cursor advances.
+// Always polls — relay uses non-destructive cursor-based reads.
 func (s *SignalProvider) pollLoop(ctx context.Context) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -34,17 +35,6 @@ func (s *SignalProvider) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !s.remote && s.commands == nil {
-				// Local mode without commands: only poll when there are pending questions
-				// (destructive reads would discard unmatched messages)
-				s.mu.Lock()
-				hasPending := len(s.pending) > 0
-				s.mu.Unlock()
-				if !hasPending {
-					continue
-				}
-			}
-
 			s.pollOnce()
 		}
 	}
@@ -53,16 +43,17 @@ func (s *SignalProvider) pollLoop(ctx context.Context) {
 // pollOnce fetches messages and matches replies to pending questions.
 // Matching priority:
 //  1. Reply-to (quote): match the quoted message timestamp to a pending question
-//  2. Commands: if the message parses as a command (@name, list, new, etc.), execute it
+//  2. Commands: if the message parses as a command (@name, @all, list, new, etc.), execute it
 //  3. Fallback: match to the most recent pending question
+//  4. Auto-route: if exactly one visible container exists, route the message there
 func (s *SignalProvider) pollOnce() {
 	result, err := s.api.Receive(s.cursor)
 	if err != nil {
-		s.logger("signal: receive error: %v", err)
+		s.logger("signal [%s]: receive error: %v", s.name, err)
 		return
 	}
 
-	// Update cursor for next poll (relay mode)
+	// Update cursor for next poll
 	if result.MaxID > s.cursor {
 		s.cursor = result.MaxID
 	}
@@ -91,7 +82,7 @@ func (s *SignalProvider) pollOnce() {
 				}
 			}
 			if matchedID != "" {
-				s.logger("signal: matched reply-to quote (ts=%d) to question %s", quoteTS, matchedID)
+				s.logger("signal [%s]: matched reply-to quote (ts=%d) to question %s", s.name, quoteTS, matchedID)
 			}
 		}
 
@@ -101,7 +92,7 @@ func (s *SignalProvider) pollOnce() {
 		if matchedID == "" && s.commands != nil {
 			if cmd := ParseSignalCommand(text); cmd != nil {
 				s.mu.Unlock()
-				s.logger("signal: parsed command: %s", text)
+				s.logger("signal [%s]: parsed command: %s", s.name, text)
 				go s.executeCommand(cmd)
 				continue
 			}
@@ -117,8 +108,15 @@ func (s *SignalProvider) pollOnce() {
 				}
 			}
 			if matchedID != "" {
-				s.logger("signal: no quote, falling back to most recent question %s", matchedID)
+				s.logger("signal [%s]: no quote, falling back to most recent question %s", s.name, matchedID)
 			}
+		}
+
+		// Priority 4: auto-route to sole visible container
+		if matchedID == "" && s.commands != nil {
+			s.mu.Unlock()
+			s.autoRoute(text)
+			continue
 		}
 
 		if matchedID == "" {
@@ -130,7 +128,7 @@ func (s *SignalProvider) pollOnce() {
 		resp := ParseResponse(text, pq.Event.Question)
 		resp.EventID = matchedID
 		resp.ContainerName = pq.Event.ContainerName
-		resp.Provider = "signal"
+		resp.Provider = s.name
 
 		// Remove from pending and send response
 		delete(s.pending, matchedID)
@@ -143,4 +141,50 @@ func (s *SignalProvider) pollOnce() {
 		default:
 		}
 	}
+}
+
+// autoRoute sends an unmatched message to the sole visible container, if exactly one exists.
+func (s *SignalProvider) autoRoute(text string) {
+	ctx := context.Background()
+	containers, err := s.commands.ListContainers(ctx, "")
+	if err != nil {
+		return
+	}
+
+	visible := s.filterByContacts(containers)
+	if len(visible) == 1 {
+		go func() {
+			if err := s.commands.SendToContainer(ctx, visible[0].Name, text); err != nil {
+				s.logger("signal [%s]: auto-route failed: %v", s.name, err)
+				return
+			}
+			if _, err := s.api.SendMessage(s.recipient, fmt.Sprintf("Sent to %s", visible[0].ShortName)); err != nil {
+				s.logger("signal [%s]: auto-route ack failed: %v", s.name, err)
+			}
+		}()
+	}
+}
+
+// filterByContacts filters containers to those visible to this provider's recipient.
+func (s *SignalProvider) filterByContacts(containers []notify.ContainerSummary) []notify.ContainerSummary {
+	var result []notify.ContainerSummary
+	for _, c := range containers {
+		if c.Contacts == nil || len(c.Contacts) == 0 {
+			// No contact override — visible only to default provider
+			if s.isDefault {
+				result = append(result, c)
+			}
+		} else if sc, ok := c.Contacts["signal"]; ok {
+			// Signal contact override — visible only to matching provider
+			if sc["recipient"] == s.recipient {
+				result = append(result, c)
+			}
+		} else {
+			// Non-signal contact override — visible to default provider
+			if s.isDefault {
+				result = append(result, c)
+			}
+		}
+	}
+	return result
 }

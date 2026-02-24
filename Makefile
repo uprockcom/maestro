@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: build install install-completion docker signing-image clean test check help release release-snapshot license-check build-relay docker-relay
+.PHONY: build install install-completion docker docker-web signing-image clean test check help release release-snapshot license-check build-relay docker-relay
 
 # Default target
 help:
@@ -53,6 +53,10 @@ build:
 # Build the Docker image
 docker:
 	docker build -t maestro:latest -f docker/Dockerfile .
+
+# Build the Web-enabled Docker image
+docker-web: docker
+	docker build -t maestro-web:latest --build-arg BASE_IMAGE=maestro:latest -f docker/Dockerfile.web .
 
 # Build the code signing Docker image
 # Tagged with version and latest
@@ -138,7 +142,7 @@ docker-relay:
 	docker build -t maestro-signal-relay:latest -f deploy/signal-relay/Dockerfile .
 
 # Build everything
-all: build docker
+all: build docker docker-web
 
 # Release targets
 release-preflight:

@@ -26,6 +26,7 @@ type ContainerSummary struct {
 	Status      string // "working", "idle", "dormant", "question"
 	Task        string
 	HasQuestion bool
+	Contacts    map[string]map[string]string // provider → key → value (from maestro.contacts label)
 }
 
 // ResolveResult holds the result of resolving a container name or nickname.

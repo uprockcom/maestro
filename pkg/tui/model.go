@@ -15,6 +15,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,6 +37,7 @@ import (
 	"go.dalton.dog/bubbleup"
 
 	"github.com/uprockcom/maestro/pkg/container"
+	"github.com/uprockcom/maestro/pkg/containerservice"
 	"github.com/uprockcom/maestro/pkg/notify"
 	"github.com/uprockcom/maestro/pkg/system"
 	"github.com/uprockcom/maestro/pkg/tui/style"
@@ -66,6 +68,9 @@ type Model struct {
 	animationFrame      int                 // Animation frame counter for pulsing effects
 	operationInProgress bool                // Whether an operation is currently running
 	operationSpinner    spinner.Model       // Spinner for operations in statusbar
+
+	// Container service (daemon-backed or direct Docker)
+	containerService     containerservice.ContainerService
 
 	// Notification/question state
 	daemonClient         *DaemonClient
@@ -267,8 +272,15 @@ func NewWithCache(containerPrefix string, cached *CachedState) *Model {
 	}
 	daemonClient, _ := NewDaemonClient(authDir)
 
+	// Create ContainerService (daemon-backed if available, Docker fallback)
+	svc, err := containerservice.New(authDir, containerPrefix)
+	if err != nil {
+		svc = containerservice.NewDocker(containerPrefix)
+	}
+
 	m := &Model{
 		containerPrefix:     containerPrefix,
+		containerService:    svc,
 		help:                help.New(),
 		spinner:             s,
 		loading:             cached == nil || len(cached.Containers) == 0, // Loading if no cache
@@ -276,7 +288,7 @@ func NewWithCache(containerPrefix string, cached *CachedState) *Model {
 		statusbar:           sb,
 		containerCount:      0,
 		operationStatus:     "Ready",
-		daemonRunning:       true, // TODO: Check actual daemon status
+		daemonRunning:       svc.IsDaemonConnected(),
 		dockerResponsive:    true, // Assume true until first check completes
 		workingDir:          relPath,
 		animationFrame:      0,
@@ -457,32 +469,35 @@ func (m Model) GetState() *CachedState {
 	}
 }
 
-// loadContainers fetches container data
+// loadContainers fetches container data via ContainerService (daemon cache or Docker fallback)
 func (m Model) loadContainers() tea.Cmd {
 	return func() tea.Msg {
-		// Check if Docker is responsive first
-		dockerResponsive := container.IsDockerResponsive()
-		if !dockerResponsive {
-			return containersLoadedMsg{
-				containers:       []container.Info{},
-				err:              nil,
-				dockerResponsive: false,
-			}
-		}
-
-		containers, err := container.GetAllContainers(m.containerPrefix)
+		ctx := context.Background()
+		containers, err := m.containerService.ListAll(ctx)
 		if err != nil {
-			// Return empty list on error, but Docker was responsive
+			// If daemon-backed, the error might just be Docker not running
+			if !m.containerService.IsDaemonConnected() {
+				// Direct Docker: check if Docker is responsive
+				dockerResponsive := container.IsDockerResponsive()
+				return containersLoadedMsg{
+					containers:       []container.Info{},
+					err:              nil,
+					dockerResponsive: dockerResponsive,
+					daemonConnected:  false,
+				}
+			}
 			return containersLoadedMsg{
 				containers:       []container.Info{},
 				err:              nil,
 				dockerResponsive: true,
+				daemonConnected:  true,
 			}
 		}
 		return containersLoadedMsg{
 			containers:       containers,
 			err:              nil,
 			dockerResponsive: true,
+			daemonConnected:  m.containerService.IsDaemonConnected(),
 		}
 	}
 }
@@ -1083,6 +1098,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			BranchName:      msg.branchName,
 			NoConnect:       msg.noConnect,
 			Exact:           msg.exact,
+			Model:           msg.model,
+			Web:             msg.web,
 		}
 		return m, tea.Quit
 
@@ -1096,6 +1113,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.cpus != "" {
 			viper.Set("containers.resources.cpus", msg.cpus)
+		}
+		if msg.defaultModel != "" {
+			normalizedModel := strings.ToLower(msg.defaultModel)
+			validModels := map[string]bool{"opus": true, "sonnet": true, "haiku": true}
+			if validModels[normalizedModel] {
+				viper.Set("containers.default_model", normalizedModel)
+			}
+			// Invalid values are silently ignored; the field keeps its previous value
 		}
 
 		// Update daemon settings
@@ -1809,6 +1834,21 @@ func createContainerCreateModal() *Modal {
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
 	// Note: textinput doesn't have BlurredStyle, we'll handle prompt color in the blur/focus methods
 
+	// Create text input for model selection
+	modelInput := textinput.New()
+	defaultModel := viper.GetString("containers.default_model")
+	if defaultModel == "" {
+		defaultModel = "opus"
+	}
+	modelInput.Placeholder = "opus, sonnet, or haiku"
+	modelInput.SetValue(defaultModel)
+	modelInput.Width = 90
+	modelInput.CharLimit = 10
+	modelInput.PromptStyle = lipgloss.NewStyle().Foreground(style.DimGray)
+	modelInput.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	modelInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	modelInput.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
+
 	// Get default value for "Return to TUI" from config
 	defaultReturnToTUI := viper.GetBool("containers.default_return_to_tui")
 
@@ -1818,14 +1858,16 @@ func createContainerCreateModal() *Modal {
 		Width:        100,
 		Height:       30,
 		textarea:     &ta,
-		textinputs:   []textinput.Model{ti},
-		checkboxes:   []bool{defaultReturnToTUI, false}, // [0]=no-connect, [1]=exact
+		textinputs:   []textinput.Model{ti, modelInput},
+		checkboxes:   []bool{defaultReturnToTUI, false, false}, // [0]=no-connect, [1]=exact, [2]=web
 		focusedField: 0,                                 // Start with textarea focused
 		fieldLabels: []string{
 			"Task Description:",
 			"Branch Name:",
+			"Model:",
 			"Return to TUI after creation (--no-connect)",
 			"Exact prompt (don't preprocess with AI)",
+			"Enable browser support (--web)",
 		},
 		Actions: []ModalAction{
 			{Label: "Create", Key: "ctrl+s", IsPrimary: true},
@@ -1846,13 +1888,22 @@ func createContainerCreateModal() *Modal {
 			branchName = modal.textinputs[0].Value()
 		}
 
+		model := ""
+		if len(modal.textinputs) > 1 {
+			model = strings.ToLower(strings.TrimSpace(modal.textinputs[1].Value()))
+		}
+
 		noConnect := false
 		exact := false
+		web := false
 		if len(modal.checkboxes) > 0 {
 			noConnect = modal.checkboxes[0]
 		}
 		if len(modal.checkboxes) > 1 {
 			exact = modal.checkboxes[1]
+		}
+		if len(modal.checkboxes) > 2 {
+			web = modal.checkboxes[2]
 		}
 
 		return createContainerMsg{
@@ -1860,6 +1911,8 @@ func createContainerCreateModal() *Modal {
 			branchName:      branchName,
 			noConnect:       noConnect,
 			exact:           exact,
+			model:           model,
+			web:             web,
 		}
 	}
 
@@ -1871,6 +1924,10 @@ func createSettingsModal() *Modal {
 	// Load current settings from viper
 	memory := viper.GetString("containers.resources.memory")
 	cpus := viper.GetString("containers.resources.cpus")
+	defaultModel := viper.GetString("containers.default_model")
+	if defaultModel == "" {
+		defaultModel = "opus"
+	}
 	showNag := viper.GetBool("daemon.show_nag")
 	autoRefreshTokens := viper.GetBool("daemon.token_refresh.enabled")
 	enableNotifications := viper.GetBool("daemon.notifications.enabled")
@@ -1898,17 +1955,29 @@ func createSettingsModal() *Modal {
 	cpusInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	cpusInput.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
 
+	// Create text input for default model
+	modelInput := textinput.New()
+	modelInput.Placeholder = "opus, sonnet, or haiku"
+	modelInput.SetValue(defaultModel)
+	modelInput.Width = 90
+	modelInput.CharLimit = 10
+	modelInput.PromptStyle = lipgloss.NewStyle().Foreground(style.DimGray)
+	modelInput.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	modelInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	modelInput.Cursor.Style = lipgloss.NewStyle().Foreground(style.OceanSurge)
+
 	modal := &Modal{
 		Type:         ModalForm,
 		Title:        "Settings",
 		Width:        100,
-		Height:       25,
-		textinputs:   []textinput.Model{memoryInput, cpusInput},
+		Height:       27,
+		textinputs:   []textinput.Model{memoryInput, cpusInput, modelInput},
 		checkboxes:   []bool{showNag, autoRefreshTokens, enableNotifications},
 		focusedField: 0,
 		fieldLabels: []string{
 			"Memory Limit (for new containers):",
 			"CPU Limit (for new containers):",
+			"Default Model (opus, sonnet, haiku):",
 			"Show daemon startup reminder",
 			"Auto-refresh authentication tokens",
 			"Enable desktop notifications",
@@ -1923,6 +1992,7 @@ func createSettingsModal() *Modal {
 	modal.Actions[0].OnSelect = func() tea.Msg {
 		memory := ""
 		cpus := ""
+		defaultModel := ""
 		showNag := false
 		autoRefresh := false
 		enableNotif := false
@@ -1932,6 +2002,9 @@ func createSettingsModal() *Modal {
 		}
 		if len(modal.textinputs) > 1 {
 			cpus = modal.textinputs[1].Value()
+		}
+		if len(modal.textinputs) > 2 {
+			defaultModel = strings.ToLower(strings.TrimSpace(modal.textinputs[2].Value()))
 		}
 		if len(modal.checkboxes) > 0 {
 			showNag = modal.checkboxes[0]
@@ -1946,6 +2019,7 @@ func createSettingsModal() *Modal {
 		return saveSettingsMsg{
 			memory:              memory,
 			cpus:                cpus,
+			defaultModel:        defaultModel,
 			showNag:             showNag,
 			autoRefreshTokens:   autoRefresh,
 			enableNotifications: enableNotif,
@@ -2161,18 +2235,21 @@ type ConfirmActionMsg struct {
 	ContainerName string
 }
 
-// performDockerOperation executes a Docker operation asynchronously
+// performDockerOperation executes a Docker operation asynchronously.
+// Stop and delete route through ContainerService so the daemon's cache
+// is invalidated and state hash validation works.
 func (m Model) performDockerOperation(action container.OperationType, containerName string) tea.Cmd {
 	return func() tea.Msg {
 		var err error
+		ctx := context.Background()
 
 		switch action {
 		case container.OperationStop:
-			err = container.StopContainer(containerName)
+			err = m.containerService.StopContainer(ctx, containerName, "")
 		case container.OperationRestart:
 			err = container.RestartContainer(containerName)
 		case container.OperationDelete:
-			err = container.DeleteContainer(containerName)
+			_, err = m.containerService.CleanupContainers(ctx, []string{containerName}, "")
 		case container.OperationRefreshTokens:
 			err = container.RefreshTokens(containerName)
 		default:

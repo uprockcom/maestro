@@ -24,6 +24,8 @@ import (
 
 func newCmd() *cobra.Command {
 	var branch string
+	var model string
+	var web bool
 
 	cmd := &cobra.Command{
 		Use:   "new <task description>",
@@ -49,6 +51,12 @@ func newCmd() *cobra.Command {
 			if branch != "" {
 				req["branch"] = branch
 			}
+			if model != "" {
+				req["model"] = model
+			}
+			if web {
+				req["web"] = "true"
+			}
 			reqJSON, _ := json.Marshal(req)
 
 			// Persist request file
@@ -58,6 +66,8 @@ func newCmd() *cobra.Command {
 				Task:        task,
 				Parent:      parent,
 				Branch:      branch,
+				Model:       model,
+				Web:         web,
 				Status:      "pending",
 				RequestedAt: nowUTC(),
 			}
@@ -100,5 +110,7 @@ func newCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&branch, "branch", "", "Start child from a specific branch")
+	cmd.Flags().StringVar(&model, "model", "", "Claude model to use: opus, sonnet, haiku")
+	cmd.Flags().BoolVarP(&web, "web", "w", false, "Enable browser support (Playwright + headless Chromium)")
 	return cmd
 }

@@ -18,7 +18,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -44,45 +43,29 @@ func init() {
 }
 
 func runCleanup(cmd *cobra.Command, args []string) error {
-	// Get containers to remove
-	filter := config.Containers.Prefix
-	dockerCmd := exec.Command("docker", "ps", "-a", "--filter", fmt.Sprintf("name=%s", filter), "--format", "{{.Names}}\t{{.State}}")
-	output, err := dockerCmd.Output()
+	svc := newContainerService()
+	defer svc.Close()
+
+	// Get all containers via ContainerService (daemon cache or Docker fallback)
+	containers, err := svc.ListAll(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	var toRemove []string
-	var running []string
 
-	for _, line := range strings.Split(string(output), "\n") {
-		if line == "" {
+	for _, c := range containers {
+		if container.IsInfraContainer(c.Name) {
 			continue
 		}
 
-		parts := strings.Split(line, "\t")
-		if len(parts) < 2 {
-			continue
-		}
-
-		name := parts[0]
-		state := parts[1]
-
-		if container.IsInfraContainer(name) {
-			continue
-		}
-
-		if state == "running" {
+		if c.Status == "running" {
 			if cleanupAll {
-				running = append(running, name)
+				toRemove = append(toRemove, c.Name)
 			}
 		} else {
-			toRemove = append(toRemove, name)
+			toRemove = append(toRemove, c.Name)
 		}
-	}
-
-	if cleanupAll {
-		toRemove = append(toRemove, running...)
 	}
 
 	if len(toRemove) == 0 {
@@ -109,50 +92,27 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Stop running containers if needed
-	for _, name := range running {
-		fmt.Printf("Stopping %s...\n", name)
-		stopCmd := exec.Command("docker", "stop", name)
-		if err := stopCmd.Run(); err != nil {
-			fmt.Printf("Warning: failed to stop %s: %v\n", name, err)
+	// Remove containers via ContainerService (handles stop, remove, and volumes)
+	// Uses state hash from the list call for optimistic concurrency
+	fmt.Printf("Removing %d container(s)...\n", len(toRemove))
+	result, err := svc.CleanupContainers(cmd.Context(), toRemove, svc.StateHash())
+	if err != nil {
+		if isStateHashMismatch(err) {
+			return fmt.Errorf("container state changed since listing — please re-run 'maestro cleanup'")
 		}
+		return fmt.Errorf("cleanup failed: %w", err)
 	}
 
-	// Remove containers and volumes
-	totalVolumes := 0
-	for _, name := range toRemove {
-		fmt.Printf("Removing %s...\n", name)
-
-		// Remove container
-		rmCmd := exec.Command("docker", "rm", "-f", "-v", name)
-		if err := rmCmd.Run(); err != nil {
-			fmt.Printf("Warning: failed to remove %s: %v\n", name, err)
-			continue
-		}
-
-		// Remove associated named volumes
-		volumes := []string{
-			fmt.Sprintf("%s-npm", name),
-			fmt.Sprintf("%s-uv", name),
-			fmt.Sprintf("%s-history", name),
-			fmt.Sprintf("%s-claude-debug", name), // Also remove debug volume if it exists
-		}
-
-		for _, vol := range volumes {
-			volCmd := exec.Command("docker", "volume", "rm", vol)
-			output, err := volCmd.CombinedOutput()
-			if err != nil {
-				// Only warn if it's not a "volume not found" error
-				if !strings.Contains(string(output), "no such volume") {
-					fmt.Printf("  Warning: failed to remove volume %s: %v\n", vol, err)
-				}
-			} else {
-				totalVolumes++
-				fmt.Printf("  Removed volume %s\n", vol)
-			}
-		}
+	// Report errors
+	for _, e := range result.Errors {
+		fmt.Printf("  Warning: %s\n", e)
 	}
 
-	fmt.Printf("\n✅ Cleaned up %d container(s) and %d volume(s)\n", len(toRemove), totalVolumes)
+	// Remove any expose sidecars associated with the cleaned-up containers
+	if len(result.Removed) > 0 {
+		removeExposeSidecarsForContainers(result.Removed)
+	}
+
+	fmt.Printf("\nCleaned up %d container(s) and %d volume(s)\n", len(result.Removed), result.VolumesRemoved)
 	return nil
 }

@@ -59,3 +59,12 @@ type QuestionListener interface {
 	// (dismissed by user or answered externally).
 	OnQuestionCancelled(eventID string)
 }
+
+// ScopedProvider is an optional interface for providers that should only handle
+// events for specific contacts. The engine skips scoped providers whose
+// MatchesEvent returns false.
+type ScopedProvider interface {
+	Provider
+	MatchesEvent(event Event) bool
+	IsDefault() bool
+}

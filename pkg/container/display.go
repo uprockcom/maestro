@@ -138,6 +138,9 @@ func Display(containers []Info, opts DisplayOptions) []Info {
 			if c.Status == "running" && c.IsDormant {
 				displayStatus = "dormant"
 			}
+			if c.HasWeb {
+				displayStatus += "/web"
+			}
 
 			// Use default values for stopped containers
 			gitStatus := c.GitStatus

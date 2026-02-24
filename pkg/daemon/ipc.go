@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/uprockcom/maestro/pkg/api"
 	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/notify"
 )
@@ -90,6 +91,20 @@ func NewIPCServer(d *Daemon, token string) (*IPCServer, error) {
 	mux.HandleFunc("GET /notifications/pending", s.requireAuth(s.handleGetPendingNotifications))
 	mux.HandleFunc("POST /notifications/answer", s.requireAuth(s.handleAnswerNotification))
 	mux.HandleFunc("POST /notifications/dismiss", s.requireAuth(s.handleDismissNotification))
+
+	// Typed API v1 endpoints (coexist with legacy endpoints)
+	// Use HandleWithAuth so auth is checked BEFORE body decoding
+	authFn := s.tokenAuthFunc()
+	api.HandleWithAuth(mux, api.ListContainers, authFn, s.handleListContainersV1)
+	api.HandleWithAuth(mux, api.GetContainer, authFn, s.handleGetContainerV1)
+	api.HandleWithAuth(mux, api.RefreshCache, authFn, s.handleRefreshCacheV1)
+	api.HandleWithAuth(mux, api.StopContainer, authFn, s.handleStopContainerV1)
+	api.HandleWithAuth(mux, api.CleanupContainers, authFn, s.handleCleanupContainersV1)
+	api.Handle(mux, api.GetStatus, s.handleGetStatusV1) // no auth, same as /status
+	api.HandleWithAuth(mux, api.GetPendingNotifications, authFn, s.handleGetPendingNotificationsV1)
+	api.HandleWithAuth(mux, api.AnswerNotification, authFn, s.handleAnswerNotificationV1)
+	api.HandleWithAuth(mux, api.DismissNotification, authFn, s.handleDismissNotificationV1)
+	api.HandleWithAuth(mux, api.Shutdown, authFn, s.handleShutdownV1)
 
 	s.server = &http.Server{
 		Handler:      mux,
@@ -253,7 +268,13 @@ func (s *IPCServer) handleNewContainer(w http.ResponseWriter, req IPCRequest) {
 				s.inFlightMu.Unlock()
 			}
 		}()
-		childName, err := s.daemon.createChildContainer(req.Task, req.Parent, req.Branch)
+		childName, err := s.daemon.createChildContainer(CreateContainerOpts{
+			Task:            req.Task,
+			ParentContainer: req.Parent,
+			Branch:          req.Branch,
+			Model:           req.Model,
+			WebEnabled:      req.Web,
+		})
 		if err != nil {
 			s.daemon.logError("IPC: failed to create child container for %s: %v", req.Parent, err)
 			errMsg := err.Error()
@@ -292,6 +313,7 @@ func (s *IPCServer) handleNotify(w http.ResponseWriter, req IPCRequest) {
 				Message:       req.Message,
 				Type:          notify.EventContainerNotification,
 				Timestamp:     time.Now(),
+				Contacts:      s.daemon.getContainerContacts(req.Parent),
 			}
 			s.daemon.notifyEngine.Notify(event)
 		} else {
@@ -574,7 +596,13 @@ func (s *IPCServer) checkPendingRequests(containerName string, state *ContainerS
 					delete(s.inFlight, rf.ID)
 					s.inFlightMu.Unlock()
 				}()
-				childName, err := s.daemon.createChildContainer(rf.Task, rf.Parent, rf.Branch)
+				childName, err := s.daemon.createChildContainer(CreateContainerOpts{
+					Task:            rf.Task,
+					ParentContainer: rf.Parent,
+					Branch:          rf.Branch,
+					Model:           rf.Model,
+					WebEnabled:      rf.Web,
+				})
 				if err != nil {
 					s.daemon.logError("IPC: recovery failed for %s: %v", rf.ID, err)
 					errMsg := err.Error()
@@ -796,6 +824,7 @@ func (s *IPCServer) checkPendingRequests(containerName string, state *ContainerS
 							},
 						}},
 					},
+					Contacts: s.daemon.getContainerContacts(containerName),
 				}
 
 				s.daemon.RegisterApproval(eventID, &pendingApproval{
@@ -1251,6 +1280,26 @@ func (s *IPCServer) handleResourceRequest(w http.ResponseWriter, req IPCRequest)
 		return
 	}
 
+	// Validate request value format to prevent injection attacks
+	switch req.RequestType {
+	case "domain":
+		if err := container.ValidateDomain(req.RequestValue); err != nil {
+			writeJSON(w, http.StatusBadRequest, IPCResponse{
+				Status: "error",
+				Error:  fmt.Sprintf("invalid domain: %v", err),
+			})
+			return
+		}
+	case "ip":
+		if err := container.ValidateIP(req.RequestValue); err != nil {
+			writeJSON(w, http.StatusBadRequest, IPCResponse{
+				Status: "error",
+				Error:  fmt.Sprintf("invalid IP: %v", err),
+			})
+			return
+		}
+	}
+
 	s.daemon.logInfo("IPC: resource request from %s: %s=%s", req.Parent, req.RequestType, req.RequestValue)
 
 	// Return 202 Accepted immediately
@@ -1295,6 +1344,7 @@ func (s *IPCServer) handleResourceRequest(w http.ResponseWriter, req IPCRequest)
 					},
 				}},
 			},
+			Contacts: s.daemon.getContainerContacts(req.Parent),
 		}
 
 		s.daemon.RegisterApproval(eventID, &pendingApproval{

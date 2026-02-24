@@ -74,6 +74,15 @@ func GetContainerImage() string {
 	return fmt.Sprintf("ghcr.io/uprockcom/maestro:%s", version)
 }
 
+// GetContainerWebImage returns the appropriate web-enabled container image for this version.
+func GetContainerWebImage() string {
+	if IsDevelopment() {
+		return "ghcr.io/uprockcom/maestro-web:latest"
+	}
+	version := strings.TrimPrefix(Version, "v")
+	return fmt.Sprintf("ghcr.io/uprockcom/maestro-web:%s", version)
+}
+
 // IsDevelopment returns true if this is a development build.
 func IsDevelopment() bool {
 	return Version == "dev" || strings.Contains(Version, "next") || strings.Contains(Version, "snapshot")

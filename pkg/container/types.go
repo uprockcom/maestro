@@ -36,12 +36,14 @@ type Info struct {
 	Branch         string
 	AgentState     string    // maestro-agent state (starting, active, waiting, idle, question, clearing, connected)
 	IsDormant      bool      // Claude process not running
+	HasWeb         bool      // Container has web/browser support (Playwright)
 	AuthStatus     string    // Token expiration status
 	LastActivity   string    // Time since last activity
 	GitStatus      string    // Git status indicators
 	CreatedAt      time.Time // Container creation time
 	CurrentTask    string    // Current task being worked on (from Claude Code task management)
 	TaskProgress   string    // Task progress (e.g., "2/5")
+	Contacts       map[string]map[string]string // Contact overrides from maestro.contacts label
 }
 
 // DisplayOptions configures how containers are displayed

@@ -16,9 +16,9 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -42,30 +42,36 @@ func init() {
 func runStop(cmd *cobra.Command, args []string) error {
 	// If no arguments, prompt to stop dormant containers
 	if len(args) == 0 {
-		return stopDormantContainers()
+		return stopDormantContainers(cmd.Context())
 	}
 
-	// Stop specific container
+	// Stop specific container via ContainerService
+	svc := newContainerService()
+	defer svc.Close()
+
 	shortName := args[0]
 	containerName := resolveContainerName(shortName)
 
 	fmt.Printf("Stopping %s...\n", containerName)
 
-	stopCmd := exec.Command("docker", "stop", containerName)
-	if err := stopCmd.Run(); err != nil {
+	// Empty state hash = skip validation (direct CLI command, not from a stale list)
+	if err := svc.StopContainer(cmd.Context(), containerName, ""); err != nil {
 		return fmt.Errorf("failed to stop container: %w", err)
 	}
 
-	fmt.Printf("✅ Container %s stopped\n", containerName)
+	fmt.Printf("Container %s stopped\n", containerName)
 	fmt.Printf("To remove it completely, run: maestro cleanup\n")
 	fmt.Printf("To restart it, run: docker start %s && maestro connect %s\n", containerName, shortName)
 
 	return nil
 }
 
-func stopDormantContainers() error {
+func stopDormantContainers(ctx context.Context) error {
+	svc := newContainerService()
+	defer svc.Close()
+
 	// Get all running containers
-	containers, err := container.GetRunningContainers(config.Containers.Prefix)
+	containers, err := svc.ListRunning(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
@@ -104,24 +110,32 @@ func stopDormantContainers() error {
 		return nil
 	}
 
-	// Stop all dormant containers
+	// Stop all dormant containers via ContainerService
+	// Use state hash from the list call for optimistic concurrency
+	stateHash := svc.StateHash()
 	fmt.Println("\nStopping dormant containers...")
 	successCount := 0
 	for _, c := range dormantContainers {
 		fmt.Printf("  Stopping %s... ", c.ShortName)
-		stopCmd := exec.Command("docker", "stop", c.Name)
-		if err := stopCmd.Run(); err != nil {
+		if err := svc.StopContainer(ctx, c.Name, stateHash); err != nil {
+			if isStateHashMismatch(err) {
+				fmt.Printf("FAILED: container state changed — re-run 'maestro stop'\n")
+				break
+			}
 			fmt.Printf("FAILED: %v\n", err)
 			continue
 		}
-		fmt.Println("✓")
+		fmt.Println("done")
 		successCount++
+		// Clear state hash after first mutation — subsequent stops go through
+		// without validation since the state has already changed
+		stateHash = ""
 	}
 
 	if successCount == len(dormantContainers) {
-		fmt.Printf("\n✅ Successfully stopped %d container(s)\n", successCount)
+		fmt.Printf("\nSuccessfully stopped %d container(s)\n", successCount)
 	} else {
-		fmt.Printf("\n⚠️  Stopped %d/%d container(s)\n", successCount, len(dormantContainers))
+		fmt.Printf("\nStopped %d/%d container(s)\n", successCount, len(dormantContainers))
 	}
 
 	fmt.Println("\nTo remove stopped containers, run: maestro cleanup")

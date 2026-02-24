@@ -15,16 +15,37 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/uprockcom/maestro/pkg/api"
+	"github.com/uprockcom/maestro/pkg/containerservice"
 )
 
 // parseInt parses a string to int64
 func parseInt(s string) int64 {
 	i, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
 	return i
+}
+
+// newContainerService creates a ContainerService using the daemon if available,
+// with direct Docker fallback.
+func newContainerService() containerservice.ContainerService {
+	configDir := expandPath(config.Claude.AuthPath)
+	svc, err := containerservice.New(configDir, config.Containers.Prefix)
+	if err != nil {
+		return containerservice.NewDocker(config.Containers.Prefix)
+	}
+	return svc
+}
+
+// isStateHashMismatch checks if an error is a 409 state hash conflict.
+func isStateHashMismatch(err error) bool {
+	var apiErr *api.Error
+	return errors.As(err, &apiErr) && apiErr.Status == 409
 }
 
 // showDaemonNag shows a reminder to start the daemon if it's not running

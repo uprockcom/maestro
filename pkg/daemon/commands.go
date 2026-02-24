@@ -107,6 +107,7 @@ func (d *Daemon) ListContainers(ctx context.Context, project string) ([]notify.C
 			Status:      status,
 			Task:        c.CurrentTask,
 			HasQuestion: status == "question",
+			Contacts:    c.Contacts,
 		})
 	}
 
@@ -232,7 +233,7 @@ func (d *Daemon) CreateContainer(ctx context.Context, project string, task strin
 	if d.config.CreateContainer == nil {
 		return "", fmt.Errorf("container creation not available")
 	}
-	containerName, err := d.config.CreateContainer(task, "", "")
+	containerName, err := d.config.CreateContainer(CreateContainerOpts{Task: task})
 	if err != nil {
 		return "", err
 	}

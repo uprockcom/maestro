@@ -1,0 +1,21 @@
+ARG BASE_IMAGE=maestro:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Install Playwright system dependencies (~20 X11 client libs, fonts)
+RUN npx playwright install-deps chromium && \
+    apt-get install -y --no-install-recommends fonts-liberation && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+USER node
+
+# Install Playwright MCP and download headless Chromium shell
+RUN npm install -g @playwright/mcp && \
+    PLAYWRIGHT_CLI=$(npm root -g)/@playwright/mcp/node_modules/playwright-core/cli.js && \
+    node $PLAYWRIGHT_CLI install chromium && \
+    ln -s $(npm root -g)/@playwright/mcp/node_modules/.bin/playwright /usr/local/share/npm-global/bin/playwright
+
+# Set NODE_PATH so agents can simply require('playwright')
+ENV NODE_PATH=/usr/local/share/npm-global/lib/node_modules/@playwright/mcp/node_modules
+ENV MAESTRO_WEB=true

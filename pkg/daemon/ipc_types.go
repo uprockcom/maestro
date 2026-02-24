@@ -60,6 +60,8 @@ type IPCRequest struct {
 	Message         string    `json:"message,omitempty"`           // For "notify", "send_message", and "answer_question" actions
 	Parent          string    `json:"parent"`                      // Container hostname (verified)
 	Branch          string    `json:"branch,omitempty"`            // Optional branch for "new" action
+	Model           string    `json:"model,omitempty"`             // Optional model for "new" action (opus, sonnet, haiku)
+	Web             bool      `json:"web,omitempty"`               // Optional web support for "new" action
 	TargetRequestID string    `json:"target_request_id,omitempty"` // For child-targeting actions
 	Count           int       `json:"count,omitempty"`             // read_messages: how many (default 10, max 50)
 	Timeout         int       `json:"timeout,omitempty"`           // wait_idle: seconds (default 300)
@@ -84,6 +86,8 @@ type IPCRequestFile struct {
 	Message         string           `json:"message,omitempty"`
 	Parent          string           `json:"parent"`
 	Branch          string           `json:"branch,omitempty"`
+	Model           string           `json:"model,omitempty"`
+	Web             bool             `json:"web,omitempty"`
 	Status          IPCRequestStatus `json:"status"`
 	RequestedAt     time.Time        `json:"requested_at"`
 	ChildContainer  *string          `json:"child_container,omitempty"`

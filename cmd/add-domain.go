@@ -22,6 +22,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/paths"
 	"gopkg.in/yaml.v3"
 )
@@ -46,6 +47,11 @@ func runAddDomain(cmd *cobra.Command, args []string) error {
 	shortName := args[0]
 	domain := args[1]
 
+	// Validate domain before any operations
+	if err := container.ValidateDomain(domain); err != nil {
+		return fmt.Errorf("invalid domain: %w", err)
+	}
+
 	containerName := resolveContainerName(shortName)
 
 	// Check if container is running
@@ -66,17 +72,16 @@ func runAddDomain(cmd *cobra.Command, args []string) error {
 	fmt.Println("  Updating dnsmasq configuration...")
 	dnsmasqConf := "/tmp/dnsmasq-firewall.conf"
 
-	// Check if domain already in config
-	checkConfCmd := exec.Command("docker", "exec", containerName, "grep", "-q", fmt.Sprintf("ipset=/%s/", domain), dnsmasqConf)
+	// Check if domain already in config (grep arg is safe — not through shell)
+	checkConfCmd := exec.Command("docker", "exec", containerName, "grep", "-qF",
+		fmt.Sprintf("ipset=/%s/", domain), dnsmasqConf)
 	if checkConfCmd.Run() == nil {
 		fmt.Printf("  Domain %s already in dnsmasq config\n", domain)
 	} else {
-		// Append domain to dnsmasq config
-		// This tells dnsmasq to automatically add all resolved IPs for this domain to the ipset
-		// Run as root since the config file is owned by root
-		appendCmd := exec.Command("docker", "exec", "-u", "root", containerName, "sh", "-c",
-			fmt.Sprintf("echo 'ipset=/%s/allowed-domains' >> %s && echo 'server=/%s/8.8.8.8' >> %s",
-				domain, dnsmasqConf, domain, dnsmasqConf))
+		// Append domain to dnsmasq config using positional parameters (no interpolation)
+		appendCmd := exec.Command("docker", "exec", "-u", "root", containerName,
+			"sh", "-c", `printf '%s\n' "ipset=/$1/allowed-domains" "server=/$1/8.8.8.8" >> "$2"`,
+			"_", domain, dnsmasqConf)
 		if err := appendCmd.Run(); err != nil {
 			return fmt.Errorf("failed to update dnsmasq config: %w", err)
 		}
@@ -96,8 +101,8 @@ func runAddDomain(cmd *cobra.Command, args []string) error {
 
 	// Now do an initial resolution to populate the ipset
 	fmt.Println("  Performing initial DNS resolution...")
-	resolveCmd := exec.Command("docker", "exec", containerName, "sh", "-c",
-		fmt.Sprintf("dig +short %s | head -5", domain))
+	resolveCmd := exec.Command("docker", "exec", containerName,
+		"sh", "-c", `dig +short "$1" | head -5`, "_", domain)
 	output, err = resolveCmd.Output()
 	if err != nil {
 		fmt.Printf("  Warning: initial resolution failed: %v\n", err)
