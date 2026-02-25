@@ -10,6 +10,8 @@ bin/
 *.out
 docker/maestro-request-go/maestro-request
 docker/maestro-agent/maestro-agent
+cmd/signal-relay/maestro-signal-relay
+cmd/signal-relay/signal-relay
 
 # Go dependencies
 vendor/

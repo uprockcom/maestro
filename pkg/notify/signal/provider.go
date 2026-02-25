@@ -26,9 +26,9 @@ import (
 
 // pendingSignalQ tracks a question sent to Signal that is awaiting a reply.
 type pendingSignalQ struct {
-	Event    notify.Event
-	RespCh   chan notify.Response // buffered(1), engine reads from this
-	SentAt   time.Time
+	Event        notify.Event
+	RespCh       chan notify.Response // buffered(1), engine reads from this
+	SentAt       time.Time
 	MsgTimestamp int64 // Signal message timestamp for reply-to matching
 }
 

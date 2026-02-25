@@ -28,7 +28,7 @@ import (
 type waitSpec struct {
 	Index int
 	Raw   string
-	Type  string   // "request", "idle", "script", "daemon", "message"
+	Type  string // "request", "idle", "script", "daemon", "message"
 	Args  []string
 }
 

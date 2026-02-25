@@ -24,3 +24,6 @@ var NotificationIcon []byte
 
 //go:embed MAESTRO.md
 var MaestroMDTemplate string
+
+//go:embed hooks-guide.md
+var HooksGuide string

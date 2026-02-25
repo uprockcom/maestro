@@ -114,12 +114,12 @@ PASS_COUNT=0
 FAIL_COUNT=0
 
 pass() {
-  ((PASS_COUNT++))
+  PASS_COUNT=$((PASS_COUNT + 1))
   echo -e "  ${GREEN}PASS${NC} $1"
 }
 
 fail() {
-  ((FAIL_COUNT++))
+  FAIL_COUNT=$((FAIL_COUNT + 1))
   echo -e "  ${RED}FAIL${NC} $1"
   if [[ -n "${2:-}" ]]; then
     echo -e "       expected: $2"

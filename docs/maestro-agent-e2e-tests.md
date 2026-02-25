@@ -82,3 +82,19 @@ The agent state file lives at `/home/node/.maestro/state/agent-state` (NOT `.mae
 7. **Backward-compat idle flag:** Both `idle` and `question` states create the `claude-idle` flag; all other states remove it.
 
 8. **SIGPIPE with head:** Using `| head -1` with `set -o pipefail` causes exit 141 (SIGPIPE). Capture full output to a variable first, then extract lines.
+
+## Missing Test Coverage
+
+### Service (heartbeat, idle wake-up, clear timer)
+
+The `maestro-agent service` background process has no e2e test suite. A `test-service.sh` should cover:
+
+1. **Heartbeat delivery during idle state.** Write an `agent.yml` manifest with a short heartbeat interval (e.g. 5s) and a trivial heartbeat script. Set state to `idle`, start the service, and verify a `.txt` file appears in `pending-messages/` within the interval. This would have caught the inverted `SuppressWhileActive` condition (commit 9f54a51) where heartbeats never fired during idle with the default config.
+
+2. **Heartbeat suppression during active state.** Same setup, but set state to `active` with `suppress_while_active: true`. Verify NO heartbeat file appears within 2x the interval.
+
+3. **Idle wake-up.** Set state to `idle`, drop a message into `pending-messages/`, and verify the service sends "continue" to tmux and transitions to `active`. (Requires tmux running in the container.)
+
+4. **Clear timer.** Write manifest with `clear_after: 5`, set state to `idle`, and verify the state transitions to `clearing` → `starting` within ~7s.
+
+These tests need a running `maestro-agent service` process and a manifest, so the test script should write the manifest, start the service in the background, run assertions, and clean up. The service polls every 2s so timing assertions need ~3s tolerance.

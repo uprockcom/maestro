@@ -34,9 +34,9 @@ type Manifest struct {
 }
 
 type BootstrapConfig struct {
-	Strategy string         `yaml:"strategy"` // pipe | cli_arg | skill
-	Skill    string         `yaml:"skill"`    // skill name (e.g., "manager")
-	Context  ContextConfig  `yaml:"context"`
+	Strategy string        `yaml:"strategy"` // pipe | cli_arg | skill
+	Skill    string        `yaml:"skill"`    // skill name (e.g., "manager")
+	Context  ContextConfig `yaml:"context"`
 }
 
 type ContextConfig struct {
@@ -89,9 +89,9 @@ type OnMessageConfig struct {
 }
 
 type HeartbeatConfig struct {
-	Interval             int    `yaml:"interval"`               // seconds, 0 = disabled
-	Script               string `yaml:"script"`                 // generates heartbeat message
-	SuppressWhileActive  bool   `yaml:"suppress_while_active"`  // default true
+	Interval            int    `yaml:"interval"`              // seconds, 0 = disabled
+	Script              string `yaml:"script"`                // generates heartbeat message
+	SuppressWhileActive bool   `yaml:"suppress_while_active"` // default true
 }
 
 type OnSessionStartConfig struct {

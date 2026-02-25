@@ -87,11 +87,11 @@ func ValidateIP(ip string) error {
 type OperationType string
 
 const (
-	OperationStop          OperationType = "stop"
-	OperationRestart       OperationType = "restart"
-	OperationDelete        OperationType = "delete"
-	OperationRefreshTokens      OperationType = "refresh-tokens"
-	OperationUpdateResources    OperationType = "update-resources"
+	OperationStop            OperationType = "stop"
+	OperationRestart         OperationType = "restart"
+	OperationDelete          OperationType = "delete"
+	OperationRefreshTokens   OperationType = "refresh-tokens"
+	OperationUpdateResources OperationType = "update-resources"
 )
 
 // StopContainer stops a running container

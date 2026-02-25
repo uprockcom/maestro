@@ -107,9 +107,11 @@ type Config struct {
 	} `mapstructure:"web"`
 
 	Daemon struct {
-		CheckInterval string `mapstructure:"check_interval"`
-		ShowNag       bool   `mapstructure:"show_nag"`
-		TokenRefresh  struct {
+		CheckInterval       string `mapstructure:"check_interval"`
+		ShowNag             bool   `mapstructure:"show_nag"`
+		UpdateCheck         bool   `mapstructure:"update_check"`
+		UpdateCheckInterval string `mapstructure:"update_check_interval"`
+		TokenRefresh        struct {
 			Enabled   bool   `mapstructure:"enabled"`
 			Threshold string `mapstructure:"threshold"`
 		} `mapstructure:"token_refresh"`
@@ -138,20 +140,20 @@ type Config struct {
 					NotifyOn []string `mapstructure:"notify_on"`
 				} `mapstructure:"slack"`
 				Signal struct {
-					Enabled  bool     `mapstructure:"enabled"`
-					Number   string   `mapstructure:"number"`
-					Recipient string  `mapstructure:"recipient"`
-					URL      string   `mapstructure:"url"`
-					APIKey   string   `mapstructure:"api_key"`
-					NotifyOn []string `mapstructure:"notify_on"`
+					Enabled   bool     `mapstructure:"enabled"`
+					Number    string   `mapstructure:"number"`
+					Recipient string   `mapstructure:"recipient"`
+					URL       string   `mapstructure:"url"`
+					APIKey    string   `mapstructure:"api_key"`
+					NotifyOn  []string `mapstructure:"notify_on"`
 				} `mapstructure:"signal"`
 			} `mapstructure:"providers"`
 		} `mapstructure:"notifications"`
 	} `mapstructure:"daemon"`
 
-	Apps     map[string]string          `mapstructure:"apps"`     // name -> source path
-	Projects map[string]ProjectConfig   `mapstructure:"projects"` // name -> project config
-	Contacts map[string]ContactProfile  `mapstructure:"contacts"` // name -> contact profile
+	Apps     map[string]string         `mapstructure:"apps"`     // name -> source path
+	Projects map[string]ProjectConfig  `mapstructure:"projects"` // name -> project config
+	Contacts map[string]ContactProfile `mapstructure:"contacts"` // name -> contact profile
 }
 
 // ContactProfile defines notification routing overrides for a named person.
@@ -385,6 +387,8 @@ func initConfig() {
 	viper.SetDefault("web.shm_size", "256m")
 	viper.SetDefault("daemon.check_interval", "30s")
 	viper.SetDefault("daemon.show_nag", true)
+	viper.SetDefault("daemon.update_check", true)
+	viper.SetDefault("daemon.update_check_interval", "6h")
 	viper.SetDefault("daemon.token_refresh.enabled", true)
 	viper.SetDefault("daemon.token_refresh.threshold", "6h")
 	viper.SetDefault("daemon.notifications.enabled", true)

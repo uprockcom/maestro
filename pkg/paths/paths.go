@@ -132,4 +132,3 @@ func EnsureConfigDir() error {
 func EnsureAuthDir() error {
 	return os.MkdirAll(AuthDir(), 0755)
 }
-

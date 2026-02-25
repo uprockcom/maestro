@@ -15,6 +15,8 @@ This document catalogs every special file inside a Maestro container — what cr
 ├── .claude.json                     # Claude Code config (copied from host, note: in home, not .claude/)
 ├── .maestro/
 │   ├── MAESTRO.md                   # Agent-facing docs (canonical location)
+│   ├── docs/
+│   │   └── hooks-guide.md           # Claude Code hooks configuration guide for agents
 │   ├── claude-idle                  # Backward-compat flag: Claude is blocked (idle or question)
 │   ├── current-question.json        # Structured AskUserQuestion data (tool_input JSON)
 │   ├── question-response.txt        # Daemon-written answer to current question
@@ -27,6 +29,8 @@ This document catalogs every special file inside a Maestro container — what cr
 │   │   └── maestro-agent.log        # Structured JSON log (append-only)
 │   ├── pending-messages/
 │   │   └── {timestamp}.txt          # Queued messages (nanosecond timestamp filenames)
+│   ├── alarms/
+│   │   └── {uuid}.json              # Persisted alarm files (survive daemon restarts)
 │   ├── daemon/
 │   │   └── daemon-ipc.json          # Daemon connection info (read-only mount from host)
 │   └── requests/
@@ -131,6 +135,7 @@ These files are created by `cmd/new.go` functions after the container starts but
 |---|---|---|---|
 | `/home/node/.maestro/MAESTRO.md` | `writeMaestroMD()` | Markdown | Template variables replaced: `{{CONTAINER_NAME}}`, `{{BRANCH_NAME}}`, `{{MAESTRO_VERSION}}`, `{{PARENT_CONTAINER}}`. |
 | `/home/node/.claude/CLAUDE.md` | `writeMaestroMD()` | Markdown | Same content as MAESTRO.md. Placed here for Claude Code auto-discovery. |
+| `/home/node/.maestro/docs/hooks-guide.md` | `writeHooksGuide()` | Markdown | Claude Code hooks configuration guide. Referenced from MAESTRO.md. |
 
 ### Claude Code Hooks
 

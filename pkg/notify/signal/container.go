@@ -27,10 +27,10 @@ const (
 	signalCLIImage     = "bbernhard/signal-cli-rest-api:latest"
 	signalCLIVolume    = "maestro-signal-data"
 
-	relayContainer   = "maestro-signal-relay"
-	relayImage       = "maestro-signal-relay:latest"
-	relayConfigVol   = "maestro-signal-relay-config"
-	networkName      = "maestro-signal"
+	relayContainer = "maestro-signal-relay"
+	relayImage     = "maestro-signal-relay:latest"
+	relayConfigVol = "maestro-signal-relay-config"
+	networkName    = "maestro-signal"
 )
 
 // EnsureRunning ensures both signal-cli and signal-relay containers are running
@@ -50,7 +50,6 @@ func EnsureRunning(relayPort int, botNumber string, logger func(string, ...inter
 		"--network", networkName,
 		"-v", fmt.Sprintf("%s:/home/.local/share/signal-cli", signalCLIVolume),
 		"-e", "MODE=json",
-		"-e", "RECEIVE_WEBHOOK_URL=http://maestro-signal-relay:8080/internal/webhook",
 		"--restart", "unless-stopped",
 	}, logger); err != nil {
 		return fmt.Errorf("signal-cli container: %w", err)

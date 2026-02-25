@@ -32,6 +32,9 @@ const (
 	IPCActionWaitIdle       IPCAction = "wait_idle"
 	IPCActionAnswerQuestion IPCAction = "answer_question"
 	IPCActionRequest        IPCAction = "request"
+	IPCActionAlarmSet       IPCAction = "alarm_set"
+	IPCActionAlarmList      IPCAction = "alarm_list"
+	IPCActionAlarmCancel    IPCAction = "alarm_cancel"
 )
 
 // IPCRequestStatus represents the status of a persisted IPC request
@@ -68,6 +71,10 @@ type IPCRequest struct {
 	Selections      []string  `json:"selections,omitempty"`        // answer_question: selected option labels
 	RequestType     string    `json:"request_type,omitempty"`      // request: domain, memory, cpus, ip
 	RequestValue    string    `json:"request_value,omitempty"`     // request: the value being requested
+	AlarmTime       string    `json:"alarm_time,omitempty"`        // alarm_set: ISO 8601 fire time
+	AlarmName       string    `json:"alarm_name,omitempty"`        // alarm_set/alarm_cancel: alarm name
+	AlarmMessage    string    `json:"alarm_message,omitempty"`     // alarm_set: message to deliver
+	AlarmID         string    `json:"alarm_id,omitempty"`          // alarm_cancel: ID of alarm to cancel
 }
 
 // IPCResponse is the wire format for IPC responses to containers
@@ -79,29 +86,33 @@ type IPCResponse struct {
 
 // IPCRequestFile is the persistence format stored in the container filesystem
 type IPCRequestFile struct {
-	ID              string           `json:"id"`
-	Action          IPCAction        `json:"action"`
-	Task            string           `json:"task,omitempty"`
-	Title           string           `json:"title,omitempty"`
-	Message         string           `json:"message,omitempty"`
-	Parent          string           `json:"parent"`
-	Branch          string           `json:"branch,omitempty"`
-	Model           string           `json:"model,omitempty"`
-	Web             bool             `json:"web,omitempty"`
-	Status          IPCRequestStatus `json:"status"`
-	RequestedAt     time.Time        `json:"requested_at"`
-	ChildContainer  *string          `json:"child_container,omitempty"`
-	FulfilledAt     *time.Time       `json:"fulfilled_at,omitempty"`
-	ChildExitedAt   *time.Time       `json:"child_exited_at,omitempty"`
-	Error           *string          `json:"error,omitempty"`
-	TargetRequestID string           `json:"target_request_id,omitempty"`
-	Messages        []IPCMessage        `json:"messages,omitempty"`
+	ID              string               `json:"id"`
+	Action          IPCAction            `json:"action"`
+	Task            string               `json:"task,omitempty"`
+	Title           string               `json:"title,omitempty"`
+	Message         string               `json:"message,omitempty"`
+	Parent          string               `json:"parent"`
+	Branch          string               `json:"branch,omitempty"`
+	Model           string               `json:"model,omitempty"`
+	Web             bool                 `json:"web,omitempty"`
+	Status          IPCRequestStatus     `json:"status"`
+	RequestedAt     time.Time            `json:"requested_at"`
+	ChildContainer  *string              `json:"child_container,omitempty"`
+	FulfilledAt     *time.Time           `json:"fulfilled_at,omitempty"`
+	ChildExitedAt   *time.Time           `json:"child_exited_at,omitempty"`
+	Error           *string              `json:"error,omitempty"`
+	TargetRequestID string               `json:"target_request_id,omitempty"`
+	Messages        []IPCMessage         `json:"messages,omitempty"`
 	PendingQuestion *notify.QuestionData `json:"pending_question,omitempty"`
 	Count           int                  `json:"count,omitempty"`
 	Timeout         int                  `json:"timeout,omitempty"`
 	Selections      []string             `json:"selections,omitempty"`
 	RequestType     string               `json:"request_type,omitempty"`
 	RequestValue    string               `json:"request_value,omitempty"`
+	AlarmTime       string               `json:"alarm_time,omitempty"`
+	AlarmName       string               `json:"alarm_name,omitempty"`
+	AlarmMessage    string               `json:"alarm_message,omitempty"`
+	AlarmID         string               `json:"alarm_id,omitempty"`
 }
 
 // IPCStatusResponse is returned by the /status endpoint

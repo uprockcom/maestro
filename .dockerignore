@@ -5,3 +5,4 @@
 !docker/container-startup.sh
 !docker/maestro-request-go/
 !docker/maestro-agent/
+!cmd/signal-relay/

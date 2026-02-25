@@ -41,7 +41,7 @@ import (
 var (
 	specFile        string
 	noConnect       bool
-	exactPrompt    bool
+	exactPrompt     bool
 	flagProject     string
 	flagNoProject   bool
 	flagNick        string
@@ -370,6 +370,11 @@ func setupContainer(opts ContainerSetupOptions) error {
 	// 8. Write MAESTRO.md agent documentation
 	if err := writeMaestroMD(opts.ContainerName, opts.BranchName, opts.ParentContainer, opts.Project, opts.WebEnabled); err != nil {
 		fmt.Printf("Warning: Failed to write MAESTRO.md: %v\n", err)
+	}
+
+	// 8b. Write hooks guide documentation
+	if err := writeHooksGuide(opts.ContainerName); err != nil {
+		fmt.Printf("Warning: Failed to write hooks guide: %v\n", err)
 	}
 
 	// 9. Write Claude Code hooks for idle detection
@@ -1103,6 +1108,27 @@ PROMPT_EOF`)
 			chownConfigCmd := exec.Command("docker", "exec", "-u", "root", containerName, "chown", "node:node", "/home/node/.claude.json")
 			if err := chownConfigCmd.Run(); err != nil {
 				fmt.Printf("Warning: Failed to fix .claude.json ownership: %v\n", err)
+			}
+
+			// Inject fields to suppress interactive prompts that block unattended startup.
+			// The auth .claude.json may not have these if Claude Code was updated after auth ran.
+			patchScript := `node -e "
+const fs = require('fs');
+const p = '/home/node/.claude.json';
+try {
+  const d = JSON.parse(fs.readFileSync(p, 'utf8'));
+  d.effortCalloutDismissed = true;
+  d.hasCompletedOnboarding = true;
+  if (!d.projects) d.projects = {};
+  if (!d.projects['/workspace']) d.projects['/workspace'] = {};
+  d.projects['/workspace'].hasTrustDialogAccepted = true;
+  d.projects['/workspace'].hasCompletedProjectOnboarding = true;
+  fs.writeFileSync(p, JSON.stringify(d, null, 2));
+} catch(e) { process.exit(0); }
+"`
+			patchCmd := exec.Command("docker", "exec", "-u", "node", containerName, "bash", "-c", patchScript)
+			if err := patchCmd.Run(); err != nil {
+				fmt.Printf("Warning: Failed to patch .claude.json: %v\n", err)
 			}
 		}
 	}
@@ -2394,6 +2420,26 @@ This container has Playwright browser automation available. You can use the ` + 
 	return nil
 }
 
+// writeHooksGuide writes the hooks configuration guide into the container at
+// /home/node/.maestro/docs/hooks-guide.md so agents can reference it locally.
+func writeHooksGuide(containerName string) error {
+	// Ensure docs directory exists
+	mkdirCmd := exec.Command("docker", "exec", containerName, "mkdir", "-p",
+		"/home/node/.maestro/docs")
+	if err := mkdirCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create docs directory: %w", err)
+	}
+
+	writeCmd := exec.Command("docker", "exec", "-i", containerName, "sh", "-c",
+		"cat > /home/node/.maestro/docs/hooks-guide.md")
+	writeCmd.Stdin = strings.NewReader(assets.HooksGuide)
+	if err := writeCmd.Run(); err != nil {
+		return fmt.Errorf("failed to write hooks guide: %w", err)
+	}
+
+	return nil
+}
+
 // writeClaudeSettings writes Claude Code hooks configuration to the container.
 // All hooks are handled by maestro-agent, which manages agent state centrally.
 //
@@ -2426,6 +2472,7 @@ func writeClaudeSettings(containerName, model string, webEnabled bool) error {
 	// effortLine is either empty or includes a trailing comma + newline-indented
 	// field, so concatenation produces valid JSON in both cases.
 	settings := `{` + effortLine + `
+  "skipDangerousModePermissionPrompt": true,
   "promptSuggestionEnabled": false,
   "spinnerTipsEnabled": false,
   "hooks": {
@@ -2518,7 +2565,8 @@ func writeClaudeSettings(containerName, model string, webEnabled bool) error {
 	mkdirCmd := exec.Command("docker", "exec", containerName, "mkdir", "-p",
 		"/home/node/.maestro/pending-messages",
 		"/home/node/.maestro/state",
-		"/home/node/.maestro/logs")
+		"/home/node/.maestro/logs",
+		"/home/node/.maestro/alarms")
 	if err := mkdirCmd.Run(); err != nil {
 		fmt.Printf("Warning: Failed to create maestro directories: %v\n", err)
 	}

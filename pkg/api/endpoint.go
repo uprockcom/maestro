@@ -27,14 +27,14 @@ func NewEndpoint[Req, Resp any](pattern string) Endpoint[Req, Resp] {
 
 // Route registry — single source of truth for route + types.
 var (
-	ListContainers      = NewEndpoint[ListContainersRequest, ListContainersResponse]("GET /api/v1/containers")
-	GetContainer        = NewEndpoint[struct{}, ContainerInfo]("GET /api/v1/containers/{name}")
-	RefreshCache        = NewEndpoint[struct{}, RefreshCacheResponse]("POST /api/v1/containers/refresh")
-	StopContainer       = NewEndpoint[StopContainerRequest, StopContainerResponse]("POST /api/v1/containers/stop")
-	CleanupContainers   = NewEndpoint[CleanupContainersRequest, CleanupContainersResponse]("POST /api/v1/containers/cleanup")
-	GetStatus           = NewEndpoint[struct{}, StatusResponse]("GET /api/v1/status")
+	ListContainers          = NewEndpoint[ListContainersRequest, ListContainersResponse]("GET /api/v1/containers")
+	GetContainer            = NewEndpoint[struct{}, ContainerInfo]("GET /api/v1/containers/{name}")
+	RefreshCache            = NewEndpoint[struct{}, RefreshCacheResponse]("POST /api/v1/containers/refresh")
+	StopContainer           = NewEndpoint[StopContainerRequest, StopContainerResponse]("POST /api/v1/containers/stop")
+	CleanupContainers       = NewEndpoint[CleanupContainersRequest, CleanupContainersResponse]("POST /api/v1/containers/cleanup")
+	GetStatus               = NewEndpoint[struct{}, StatusResponse]("GET /api/v1/status")
 	GetPendingNotifications = NewEndpoint[struct{}, ListPendingNotificationsResponse]("GET /api/v1/notifications/pending")
-	AnswerNotification  = NewEndpoint[AnswerNotificationRequest, AnswerNotificationResponse]("POST /api/v1/notifications/answer")
-	DismissNotification = NewEndpoint[DismissNotificationRequest, DismissNotificationResponse]("POST /api/v1/notifications/dismiss")
-	Shutdown            = NewEndpoint[struct{}, ShutdownResponse]("POST /api/v1/shutdown")
+	AnswerNotification      = NewEndpoint[AnswerNotificationRequest, AnswerNotificationResponse]("POST /api/v1/notifications/answer")
+	DismissNotification     = NewEndpoint[DismissNotificationRequest, DismissNotificationResponse]("POST /api/v1/notifications/dismiss")
+	Shutdown                = NewEndpoint[struct{}, ShutdownResponse]("POST /api/v1/shutdown")
 )

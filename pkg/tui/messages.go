@@ -27,6 +27,9 @@ type tickMsg time.Time
 // refreshTickMsg is sent on each refresh interval (30s)
 type refreshTickMsg time.Time
 
+// daemonReconnectTickMsg is sent every 15s when daemon is disconnected to attempt reconnection
+type daemonReconnectTickMsg time.Time
+
 // wizardAnimationTickMsg is sent during the opening animation (80ms per column)
 type wizardAnimationTickMsg time.Time
 

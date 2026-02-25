@@ -49,9 +49,9 @@ type IPCServer struct {
 	token          string
 	loopbackPort   int
 	bridgePort     int
-	inFlightMu     sync.Mutex          // protects inFlight
+	inFlightMu     sync.Mutex           // protects inFlight
 	inFlight       map[string]bool      // request IDs currently being processed (dedup recovery)
-	childParentsMu sync.Mutex          // protects childParents
+	childParentsMu sync.Mutex           // protects childParents
 	childParents   map[string]childInfo // child container name → parent info
 }
 
@@ -225,6 +225,12 @@ func (s *IPCServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		s.handleAnswerQuestion(w, req)
 	case IPCActionRequest:
 		s.handleResourceRequest(w, req)
+	case IPCActionAlarmSet:
+		s.handleAlarmSet(w, req)
+	case IPCActionAlarmList:
+		s.handleAlarmList(w, req)
+	case IPCActionAlarmCancel:
+		s.handleAlarmCancel(w, req)
 	default:
 		writeJSON(w, http.StatusBadRequest, IPCResponse{
 			Status: "error",
@@ -835,6 +841,46 @@ func (s *IPCServer) checkPendingRequests(containerName string, state *ContainerS
 				})
 				s.daemon.sendNotification(event)
 			}(reqFile)
+
+		case IPCActionAlarmSet:
+			// Recover alarm — re-register with daemon and mark fulfilled.
+			// Skip if already loaded from the container's alarm files (dedup).
+			if s.daemon.alarms.Has(reqFile.ID) {
+				s.updateRequestFile(containerName, reqFile.ID, IPCRequestStatusFulfilled, "", "")
+				s.inFlightMu.Lock()
+				delete(s.inFlight, reqFile.ID)
+				s.inFlightMu.Unlock()
+				continue
+			}
+			fireAt, err := time.Parse(time.RFC3339, reqFile.AlarmTime)
+			if err != nil {
+				s.daemon.logError("IPC: recovery skipping alarm %s with bad time: %v", reqFile.ID, err)
+				s.inFlightMu.Lock()
+				delete(s.inFlight, reqFile.ID)
+				s.inFlightMu.Unlock()
+				continue
+			}
+			alarm := &Alarm{
+				ID:            reqFile.ID,
+				ContainerName: containerName,
+				Name:          reqFile.AlarmName,
+				Message:       reqFile.AlarmMessage,
+				FireAt:        fireAt,
+				CreatedAt:     reqFile.RequestedAt,
+			}
+			s.daemon.alarms.Add(alarm)
+			s.updateRequestFile(containerName, reqFile.ID, IPCRequestStatusFulfilled, "", "")
+			s.daemon.logInfo("IPC: recovered alarm %s (%s) from %s", reqFile.ID, reqFile.AlarmName, containerName)
+			s.inFlightMu.Lock()
+			delete(s.inFlight, reqFile.ID)
+			s.inFlightMu.Unlock()
+
+		case IPCActionAlarmList, IPCActionAlarmCancel:
+			// Alarm list/cancel are instant operations — mark fulfilled on recovery
+			s.updateRequestFile(containerName, reqFile.ID, IPCRequestStatusFulfilled, "", "")
+			s.inFlightMu.Lock()
+			delete(s.inFlight, reqFile.ID)
+			s.inFlightMu.Unlock()
 		}
 	}
 }
@@ -1360,6 +1406,134 @@ func (s *IPCServer) handleResourceRequest(w http.ResponseWriter, req IPCRequest)
 // UpdateRequestFile is a public wrapper around updateRequestFile for use by the daemon callback
 func (s *IPCServer) UpdateRequestFile(containerName, requestID string, status IPCRequestStatus, childContainer, errMsg string) {
 	s.updateRequestFile(containerName, requestID, status, childContainer, errMsg)
+}
+
+func (s *IPCServer) handleAlarmSet(w http.ResponseWriter, req IPCRequest) {
+	if req.AlarmName == "" {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "missing required field: alarm_name",
+		})
+		return
+	}
+	if req.AlarmTime == "" {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "missing required field: alarm_time",
+		})
+		return
+	}
+
+	fireAt, err := time.Parse(time.RFC3339, req.AlarmTime)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  fmt.Sprintf("invalid alarm_time (must be RFC3339): %v", err),
+		})
+		return
+	}
+
+	alarm := &Alarm{
+		ID:            req.ID,
+		ContainerName: req.Parent,
+		Name:          req.AlarmName,
+		Message:       req.AlarmMessage,
+		FireAt:        fireAt,
+		CreatedAt:     time.Now(),
+	}
+
+	// Persist to container filesystem first so the alarm survives a daemon crash
+	// between persist and in-memory add.
+	if err := persistAlarmToContainer(req.Parent, alarm); err != nil {
+		s.daemon.logError("IPC: failed to persist alarm %s in %s: %v", req.ID, req.Parent, err)
+	}
+
+	s.daemon.alarms.Add(alarm)
+
+	s.daemon.logInfo("IPC: alarm set by %s: %s fires at %s", req.Parent, req.AlarmName, req.AlarmTime)
+
+	writeJSON(w, http.StatusOK, IPCResponse{Status: "ok"})
+}
+
+func (s *IPCServer) handleAlarmList(w http.ResponseWriter, req IPCRequest) {
+	alarms := s.daemon.alarms.ListForContainer(req.Parent)
+
+	type alarmInfo struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Message string `json:"message,omitempty"`
+		FireAt  string `json:"fire_at"`
+	}
+
+	result := make([]alarmInfo, 0, len(alarms))
+	for _, a := range alarms {
+		result = append(result, alarmInfo{
+			ID:      a.ID,
+			Name:    a.Name,
+			Message: a.Message,
+			FireAt:  a.FireAt.Format(time.RFC3339),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"alarms": result,
+	})
+}
+
+func (s *IPCServer) handleAlarmCancel(w http.ResponseWriter, req IPCRequest) {
+	var cancelled bool
+	var alarmID string
+
+	if req.AlarmID != "" {
+		// Cancel by ID
+		alarmID = req.AlarmID
+		cancelled = s.daemon.alarms.Cancel(req.AlarmID)
+	} else if req.AlarmName != "" {
+		// Cancel by name — only the first matching alarm in this container is cancelled.
+		// We resolve the alarm by name here and then cancel by its ID to keep
+		// cancellation and file cleanup consistent even if duplicate names exist.
+		alarms := s.daemon.alarms.ListForContainer(req.Parent)
+		for _, a := range alarms {
+			if a.Name == req.AlarmName {
+				alarmID = a.ID
+				cancelled = s.daemon.alarms.Cancel(a.ID)
+				break
+			}
+		}
+	} else {
+		writeJSON(w, http.StatusBadRequest, IPCResponse{
+			Status: "error",
+			Error:  "missing required field: alarm_id or alarm_name",
+		})
+		return
+	}
+
+	if !cancelled {
+		writeJSON(w, http.StatusNotFound, IPCResponse{
+			Status: "error",
+			Error:  "alarm not found",
+		})
+		return
+	}
+
+	// Remove persisted alarm file
+	if alarmID != "" {
+		removeAlarmFromContainer(req.Parent, alarmID)
+	}
+
+	s.daemon.logInfo("IPC: alarm cancelled by %s: %s", req.Parent, alarmID)
+
+	// Include alarm_id in the response so the client can clean up local files,
+	// especially for cancel-by-name where the client doesn't know the ID.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "ok",
+		"alarm_id": alarmID,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

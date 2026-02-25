@@ -16,11 +16,11 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"text/tabwriter"
-	"os"
 
 	"github.com/spf13/cobra"
 )
@@ -192,6 +192,9 @@ func discoverPorts(containerName string) error {
 }
 
 // launchSidecar starts the alpine/socat sidecar container.
+// The sidecar runs on the default bridge network with a published port and
+// connects to the target container by its bridge IP. We can't use
+// --network container:X because Docker doesn't allow -p with that mode.
 func launchSidecar(containerName string, port, hostPort int) error {
 	sidecarName := sidecarName(containerName, port)
 
@@ -216,13 +219,19 @@ func launchSidecar(containerName string, port, hostPort int) error {
 		}
 	}
 
+	// Get the target container's IP on its Docker network so the sidecar can
+	// reach it. Try all attached networks and use the first non-empty IP.
+	targetIP, err := getContainerIP(containerName)
+	if err != nil {
+		return err
+	}
+
 	socatArg := fmt.Sprintf("TCP-LISTEN:%d,fork,reuseaddr", port)
-	connectArg := fmt.Sprintf("TCP-CONNECT:127.0.0.1:%d", port)
+	connectArg := fmt.Sprintf("TCP-CONNECT:%s:%d", targetIP, port)
 
 	runArgs := []string{
 		"run", "-d",
 		"--name", sidecarName,
-		"--network", "container:" + containerName,
 		"-p", fmt.Sprintf("%d:%d", hostPort, port),
 		"alpine/socat",
 		socatArg,
@@ -251,6 +260,23 @@ func launchSidecar(containerName string, port, hostPort int) error {
 
 	fmt.Printf("Forwarding %s:%d -> localhost:%d\n", containerName, port, hostPort)
 	return nil
+}
+
+// getContainerIP returns the container's IP address on its Docker network.
+func getContainerIP(containerName string) (string, error) {
+	out, err := exec.Command("docker", "inspect",
+		"--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+		containerName).Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get container IP: %w", err)
+	}
+
+	for _, ip := range strings.Fields(string(out)) {
+		if ip != "" {
+			return ip, nil
+		}
+	}
+	return "", fmt.Errorf("container %s has no IP address on any network", containerName)
 }
 
 // removeSidecar stops and removes a sidecar container.

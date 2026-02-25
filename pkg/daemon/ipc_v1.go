@@ -177,9 +177,11 @@ func (s *IPCServer) handleCleanupContainersV1(r *http.Request, req api.CleanupCo
 		}
 	}
 
-	// Force cache refresh after mutations
-	if _, _, err := s.daemon.containerCache.ForceRefresh(); err != nil {
-		log.Printf("[WARN] cache refresh after cleanup: %v", err)
+	// Force cache refresh after mutations (unless caller will refresh separately)
+	if !req.SkipRefresh {
+		if _, _, err := s.daemon.containerCache.ForceRefresh(); err != nil {
+			log.Printf("[WARN] cache refresh after cleanup: %v", err)
+		}
 	}
 
 	return api.CleanupContainersResponse{
@@ -195,12 +197,23 @@ func (s *IPCServer) handleGetStatusV1(r *http.Request, _ struct{}) (api.StatusRe
 		containers = []string{}
 	}
 
-	return api.StatusResponse{
+	resp := api.StatusResponse{
 		Running:    true,
 		PID:        os.Getpid(),
 		Containers: containers,
 		Uptime:     time.Since(s.daemon.startTime).Truncate(time.Second).String(),
-	}, nil
+	}
+
+	if result := s.daemon.UpdateStatus(); result != nil {
+		resp.Update = &api.UpdateInfo{
+			Available:      result.UpdateAvail,
+			CurrentVersion: result.CurrentVersion,
+			LatestVersion:  result.LatestVersion,
+			ReleaseURL:     result.ReleaseURL,
+		}
+	}
+
+	return resp, nil
 }
 
 func (s *IPCServer) handleGetPendingNotificationsV1(r *http.Request, _ struct{}) (api.ListPendingNotificationsResponse, error) {

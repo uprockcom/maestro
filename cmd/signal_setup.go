@@ -76,6 +76,18 @@ for the admin to share with the developer.`,
 	RunE: runSignalAddUser,
 }
 
+var signalResetKeyCmd = &cobra.Command{
+	Use:   "reset-key",
+	Short: "Regenerate the default API key and save it to config",
+	Long: `Regenerate the default API key for this machine's connection to the relay.
+Use this if your config is missing api_key or url (e.g. after migrating from
+an older config format), or if you need to rotate your key.
+
+The command replaces the 'default' entry in the relay's keys.json and saves
+the new key and relay URL to ~/.maestro/config.yml.`,
+	RunE: runSignalResetKey,
+}
+
 func init() {
 	rootCmd.AddCommand(signalCmd)
 	signalCmd.AddCommand(signalSetupCmd)
@@ -83,6 +95,7 @@ func init() {
 	signalCmd.AddCommand(signalRestoreCmd)
 	signalCmd.AddCommand(signalConnectCmd)
 	signalCmd.AddCommand(signalAddUserCmd)
+	signalCmd.AddCommand(signalResetKeyCmd)
 }
 
 func runSignalSetup(cmd *cobra.Command, args []string) error {
@@ -645,6 +658,106 @@ func runSignalAddContact(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runSignalResetKey(cmd *cobra.Command, args []string) error {
+	sigCfg := config.Daemon.Notifications.Providers.Signal
+
+	if !sigCfg.Enabled {
+		return fmt.Errorf("Signal is not enabled in config. Run 'maestro signal setup' first.")
+	}
+	if sigCfg.Number == "" {
+		return fmt.Errorf("signal.number is not set in config. Run 'maestro signal setup' first.")
+	}
+	if sigCfg.Recipient == "" {
+		return fmt.Errorf("signal.recipient is not set in config. Run 'maestro signal setup' first.")
+	}
+
+	// Derive URL from container_port if url is missing
+	relayURL := sigCfg.URL
+	if relayURL == "" {
+		port := viper.GetInt("daemon.notifications.providers.signal.container_port")
+		if port == 0 {
+			port = 8080
+		}
+		relayURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+		fmt.Printf("No URL in config; derived from container_port: %s\n", relayURL)
+	}
+
+	fmt.Println("Regenerating default API key...")
+
+	// Generate new key and replace (not append) the default entry in keys.json
+	apiKey, err := replaceDefaultKeyInVolume(sigCfg.Recipient)
+	if err != nil {
+		return fmt.Errorf("failed to update keys.json: %w", err)
+	}
+
+	// Save url and api_key to config
+	viper.Set("daemon.notifications.providers.signal.url", relayURL)
+	viper.Set("daemon.notifications.providers.signal.api_key", apiKey)
+
+	if err := viper.WriteConfig(); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	fmt.Println("API key regenerated and config saved.")
+	fmt.Printf("  url:     %s\n", relayURL)
+	fmt.Printf("  api_key: %s\n", apiKey)
+	fmt.Println()
+	fmt.Println("Restart the daemon to reconnect: maestro daemon stop && maestro daemon start")
+	return nil
+}
+
+// replaceDefaultKeyInVolume generates a new API key and replaces the 'default'
+// entry in the relay config volume's keys.json. Other entries are preserved.
+func replaceDefaultKeyInVolume(recipient string) (string, error) {
+	keyBytes := make([]byte, 32)
+	if _, err := cryptoRandRead(keyBytes); err != nil {
+		return "", fmt.Errorf("failed to generate random key: %w", err)
+	}
+	plaintext := hex.EncodeToString(keyBytes)
+	h := sha256.Sum256([]byte(plaintext))
+	keyHash := hex.EncodeToString(h[:])
+
+	volName := signal.RelayConfigVolume()
+	var kf signalKeysFile
+
+	// Read existing keys.json (ignore error — volume may be empty on first use)
+	readCmd := exec.Command("docker", "run", "--rm",
+		"-v", volName+":/config:ro",
+		"alpine", "cat", "/config/keys.json")
+	if data, err := readCmd.Output(); err == nil {
+		_ = json.Unmarshal(data, &kf)
+	}
+
+	// Replace the default entry; preserve all other entries
+	newEntry := signalAddUserEntry{Name: "default", KeyHash: keyHash, Recipient: recipient}
+	replaced := false
+	for i, u := range kf.Users {
+		if u.Name == "default" {
+			kf.Users[i] = newEntry
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		kf.Users = append(kf.Users, newEntry)
+	}
+
+	data, err := json.MarshalIndent(kf, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal keys file: %w", err)
+	}
+
+	writeCmd := exec.Command("docker", "run", "--rm",
+		"-v", volName+":/config",
+		"-i", "alpine", "sh", "-c", "cat > /config/keys.json")
+	writeCmd.Stdin = strings.NewReader(string(data))
+	if out, err := writeCmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to write keys.json: %w\n%s", err, string(out))
+	}
+
+	return plaintext, nil
+}
+
 // generateAndWriteKeysJSON generates an API key, writes the entry to keys.json
 // on the relay config volume, and returns the plaintext key.
 func generateAndWriteKeysJSON(name, recipient string) (string, error) {
@@ -762,4 +875,3 @@ func readCaptchaToken(reader *bufio.Reader) (string, error) {
 	fmt.Printf("Captcha token read (%d chars)\n", len(token))
 	return token, nil
 }
-

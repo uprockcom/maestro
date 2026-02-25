@@ -17,6 +17,14 @@ type CleanupResult struct {
 	Errors         []string
 }
 
+// CleanupOptions controls cleanup behavior.
+type CleanupOptions struct {
+	// SkipRefresh skips the daemon-side cache refresh after cleanup.
+	// Use this when making multiple sequential cleanup calls and refreshing
+	// once at the end via RefreshCache.
+	SkipRefresh bool
+}
+
 // ContainerService abstracts container operations. When the daemon is running,
 // operations go through the daemon's cache. When it's not, they fall back to
 // direct Docker calls.
@@ -24,7 +32,7 @@ type ContainerService interface {
 	ListAll(ctx context.Context) ([]container.Info, error)
 	ListRunning(ctx context.Context) ([]container.Info, error)
 	StopContainer(ctx context.Context, name string, stateHash string) error
-	CleanupContainers(ctx context.Context, names []string, stateHash string) (*CleanupResult, error)
+	CleanupContainers(ctx context.Context, names []string, stateHash string, opts *CleanupOptions) (*CleanupResult, error)
 	RefreshCache(ctx context.Context) error
 	IsDaemonConnected() bool
 	StateHash() string
@@ -106,10 +114,12 @@ func (s *daemonService) StopContainer(ctx context.Context, name string, stateHas
 	return err
 }
 
-func (s *daemonService) CleanupContainers(ctx context.Context, names []string, stateHash string) (*CleanupResult, error) {
+func (s *daemonService) CleanupContainers(ctx context.Context, names []string, stateHash string, opts *CleanupOptions) (*CleanupResult, error) {
+	skipRefresh := opts != nil && opts.SkipRefresh
 	resp, err := api.Call(ctx, s.client, api.CleanupContainers, &api.CleanupContainersRequest{
-		Names:     names,
-		StateHash: stateHash,
+		Names:       names,
+		StateHash:   stateHash,
+		SkipRefresh: skipRefresh,
 	})
 	if err != nil {
 		return nil, err

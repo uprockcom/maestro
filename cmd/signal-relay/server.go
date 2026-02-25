@@ -116,6 +116,9 @@ func (s *Server) handleReceive(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleWebhook receives incoming messages from signal-cli's webhook.
+// This endpoint is kept for backward compatibility but the relay now primarily
+// uses active polling (see poller.go) since signal-cli json-rpc mode webhooks
+// do not reliably deliver text messages.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	var msg ReceivedMessage
 	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {

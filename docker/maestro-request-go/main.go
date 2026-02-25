@@ -39,6 +39,7 @@ func main() {
 	root.AddCommand(waitCmd())
 	root.AddCommand(claudeCmd())
 	root.AddCommand(requestCmd())
+	root.AddCommand(alarmCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

@@ -67,6 +67,7 @@ run_suite "Post-Tool-Use"     "$SCRIPT_DIR/test-post-tool-use.sh"
 run_suite "Ask Hook"          "$SCRIPT_DIR/test-ask-hook.sh"
 run_suite "Host Display"      "$SCRIPT_DIR/test-host-display.sh"
 run_suite "Structured Logs"   "$SCRIPT_DIR/test-logs.sh"
+run_suite "Service (heartbeat)" "$SCRIPT_DIR/test-service.sh"
 
 # Final summary
 echo ""

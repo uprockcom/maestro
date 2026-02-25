@@ -23,7 +23,7 @@ import (
 type SignalCommandType int
 
 const (
-	CmdList      SignalCommandType = iota
+	CmdList SignalCommandType = iota
 	CmdSend
 	CmdBroadcast
 	CmdNew

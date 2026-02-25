@@ -15,14 +15,18 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/uprockcom/maestro/pkg/api"
 	"github.com/uprockcom/maestro/pkg/containerservice"
+	"github.com/uprockcom/maestro/pkg/paths"
+	"github.com/uprockcom/maestro/pkg/update"
 )
 
 // parseInt parses a string to int64
@@ -62,6 +66,55 @@ func showDaemonNag() {
 	fmt.Println("\n💡 Tip: Start the daemon for automatic token refresh and notifications:")
 	fmt.Println("   maestro daemon start")
 	fmt.Println("   (Disable this message: add 'show_nag: false' to daemon config)")
+}
+
+// showUpdateWarning queries the daemon for update status and displays a warning
+// if a newer version is available. Falls back to a direct cache file check if
+// the daemon is not running. If a pre-fetched daemon status is provided, it
+// uses that to avoid a duplicate /api/v1/status call.
+func showUpdateWarning(prefetched ...*api.StatusResponse) {
+	if !config.Daemon.UpdateCheck {
+		return
+	}
+
+	// Use pre-fetched status if provided
+	if len(prefetched) > 0 && prefetched[0] != nil {
+		showUpdateFromStatus(prefetched[0])
+		return
+	}
+
+	// Try the daemon API (own probe)
+	if running, info := isDaemonRunning(); running {
+		client := newDaemonClient(info)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		status, err := api.Call(ctx, client, api.GetStatus, nil)
+		if err == nil {
+			showUpdateFromStatus(status)
+			return
+		}
+		return
+	}
+
+	// Daemon not running — check the cache file directly
+	checker := update.NewChecker(paths.GetConfigDir(), 0, nil)
+	if result := checker.LoadCachedResult(); result != nil {
+		if msg := update.FormatUpdateWarning(result); msg != "" {
+			fmt.Print(msg)
+		}
+	}
+}
+
+// showUpdateFromStatus prints the update warning from a daemon status response.
+func showUpdateFromStatus(status *api.StatusResponse) {
+	if status.Update != nil && status.Update.Available {
+		fmt.Printf("\n⚠️  Update available: %s → %s\n", status.Update.CurrentVersion, status.Update.LatestVersion)
+		fmt.Println("   Run: brew upgrade maestro  (or download from GitHub)")
+		if status.Update.ReleaseURL != "" {
+			fmt.Printf("   %s\n", status.Update.ReleaseURL)
+		}
+	}
 }
 
 // generateTmuxConfig creates a tmux configuration string with true color support

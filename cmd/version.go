@@ -27,6 +27,7 @@ var versionCmd = &cobra.Command{
 	Long:  `Display version information including build details and container image.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println(version.Info())
+		showUpdateWarning()
 	},
 }
 

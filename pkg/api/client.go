@@ -50,7 +50,10 @@ func NewClientFromConfig(configDir string) (*Client, error) {
 		BaseURL: fmt.Sprintf("http://127.0.0.1:%d", info.Port),
 		Token:   info.Token,
 		HTTPClient: &http.Client{
-			Timeout: 10 * time.Second,
+			// Generous fallback timeout to prevent indefinite hangs if the
+			// daemon becomes unresponsive. Callers that need tighter control
+			// use per-call context deadlines (which take precedence).
+			Timeout: 5 * time.Minute,
 		},
 	}, nil
 }

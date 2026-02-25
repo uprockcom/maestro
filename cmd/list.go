@@ -15,9 +15,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/uprockcom/maestro/pkg/api"
 	"github.com/uprockcom/maestro/pkg/container"
 )
 
@@ -66,8 +69,22 @@ func runList(cmd *cobra.Command, args []string) error {
 	fmt.Println("  maestro stop <name>       - Stop container")
 	fmt.Println("  maestro cleanup           - Remove stopped containers")
 
-	// Show daemon nag if not running
-	showDaemonNag()
+	// Single daemon probe for both nag and update warning
+	var daemonStatus *api.StatusResponse
+	if running, info := isDaemonRunning(); running {
+		client := newDaemonClient(info)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		status, err := api.Call(ctx, client, api.GetStatus, nil)
+		cancel()
+		if err == nil {
+			daemonStatus = status
+		}
+	} else {
+		showDaemonNag()
+	}
+
+	// Show update warning (uses pre-fetched status if available)
+	showUpdateWarning(daemonStatus)
 
 	return nil
 }

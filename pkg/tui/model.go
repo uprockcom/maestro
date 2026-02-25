@@ -70,15 +70,19 @@ type Model struct {
 	operationSpinner    spinner.Model       // Spinner for operations in statusbar
 
 	// Container service (daemon-backed or direct Docker)
-	containerService     containerservice.ContainerService
+	containerService containerservice.ContainerService
+
+	// Daemon reconnection state
+	daemonDisconnected bool // True when daemon was previously connected but is now unreachable
+	reconnectActive    bool // True when a reconnect ticker is scheduled (avoids duplicates)
 
 	// Notification/question state
-	daemonClient         *DaemonClient
-	daemonConfigDir      string // Path to config dir for daemon reconnection
-	pendingQuestions     []notify.PendingQuestion
-	activeQuestionEvent  string   // Event ID of the question currently shown in a modal
-	questionIndex        int      // Current question index in a multi-question flow
-	questionAnswers      []string // Accumulated answers for multi-question (one per question)
+	daemonClient        *DaemonClient
+	daemonConfigDir     string // Path to config dir for daemon reconnection
+	pendingQuestions    []notify.PendingQuestion
+	activeQuestionEvent string   // Event ID of the question currently shown in a modal
+	questionIndex       int      // Current question index in a multi-question flow
+	questionAnswers     []string // Accumulated answers for multi-question (one per question)
 
 	// Wizard state
 	wizardMode        bool     // Whether we're in wizard/onboarding mode
@@ -457,6 +461,13 @@ func refreshTick() tea.Cmd {
 	})
 }
 
+// daemonReconnectTick creates a command that fires every 15 seconds to attempt daemon reconnection
+func daemonReconnectTick() tea.Cmd {
+	return tea.Tick(15*time.Second, func(t time.Time) tea.Msg {
+		return daemonReconnectTickMsg(t)
+	})
+}
+
 // GetState exports the current state for caching
 func (m Model) GetState() *CachedState {
 	if m.homeView == nil {
@@ -475,22 +486,24 @@ func (m Model) loadContainers() tea.Cmd {
 		ctx := context.Background()
 		containers, err := m.containerService.ListAll(ctx)
 		if err != nil {
-			// If daemon-backed, the error might just be Docker not running
-			if !m.containerService.IsDaemonConnected() {
-				// Direct Docker: check if Docker is responsive
-				dockerResponsive := container.IsDockerResponsive()
+			if m.containerService.IsDaemonConnected() {
+				// Daemon-backed service failed — daemon may have gone down.
+				// Report as disconnected so the TUI can start reconnection.
+				// Also check Docker since the daemon failure may not mean Docker is healthy.
 				return containersLoadedMsg{
 					containers:       []container.Info{},
 					err:              nil,
-					dockerResponsive: dockerResponsive,
+					dockerResponsive: container.IsDockerResponsive(),
 					daemonConnected:  false,
 				}
 			}
+			// Direct Docker fallback: check if Docker is responsive
+			dockerResponsive := container.IsDockerResponsive()
 			return containersLoadedMsg{
 				containers:       []container.Info{},
 				err:              nil,
-				dockerResponsive: true,
-				daemonConnected:  true,
+				dockerResponsive: dockerResponsive,
+				daemonConnected:  false,
 			}
 		}
 		return containersLoadedMsg{
@@ -543,6 +556,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Always poll for pending questions (even with modal open)
 		cmds = append(cmds, m.fetchPendingQuestions())
+		return m, tea.Batch(cmds...)
+
+	case daemonReconnectTickMsg:
+		// Attempt to reconnect to the daemon (fires every 15s while disconnected)
+		cmds := []tea.Cmd{alertCmd}
+
+		// Guard against stale ticks: if reconnect is no longer active
+		// (daemon already reconnected via a prior tick or containersLoadedMsg),
+		// discard this tick without rescheduling.
+		if !m.reconnectActive {
+			return m, tea.Batch(cmds...)
+		}
+
+		// Try creating a fresh daemon client
+		newClient, err := NewDaemonClient(m.daemonConfigDir)
+		if err != nil || newClient == nil {
+			// Daemon still not available — schedule another reconnect tick
+			cmds = append(cmds, daemonReconnectTick())
+			return m, tea.Batch(cmds...)
+		}
+
+		// Daemon client reconnected — try to get a daemon-backed ContainerService
+		newSvc, err := containerservice.New(m.daemonConfigDir, m.containerPrefix)
+		if err != nil || !newSvc.IsDaemonConnected() {
+			// Daemon reachable for IPC but service creation failed — retry
+			cmds = append(cmds, daemonReconnectTick())
+			return m, tea.Batch(cmds...)
+		}
+
+		// Successfully reconnected — close old service before replacing
+		if m.containerService != nil {
+			_ = m.containerService.Close()
+		}
+		m.daemonClient = newClient
+		m.containerService = newSvc
+		m.daemonRunning = true
+		m.daemonDisconnected = false
+		m.reconnectActive = false
+		m.operationStatus = "Syncing..."
+		m.updateStatusBar()
+
+		// Reload containers through daemon and fetch questions
+		cmds = append(cmds, m.loadContainers(), m.fetchPendingQuestions())
+		cmds = append(cmds, m.alert.NewAlertCmd("Success", "Daemon connection restored"))
 		return m, tea.Batch(cmds...)
 
 	case exitWizardMsg:
@@ -813,6 +870,48 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Update container count and Docker status
 		m.containerCount = len(msg.containers)
 		m.dockerResponsive = msg.dockerResponsive
+
+		// Detect daemon disconnection and manage reconnect polling
+		var reconnectCmd tea.Cmd
+		if !msg.daemonConnected {
+			// If we previously had the daemon running and now it's gone, mark as disconnected
+			if m.daemonRunning {
+				m.daemonRunning = false
+				m.daemonDisconnected = true
+				// Close old service to prevent resource leaks before replacing
+				if m.containerService != nil {
+					_ = m.containerService.Close()
+				}
+				// Fall back to direct Docker service
+				m.containerService = containerservice.NewDocker(m.containerPrefix)
+				m.daemonClient = nil
+				// Immediately reload containers using Docker so the UI stays populated.
+				// Only on the transition from daemon→Docker to avoid a reload loop
+				// (Docker fallback always returns daemonConnected=false).
+				if loadCmd := m.loadContainers(); loadCmd != nil {
+					reconnectCmd = loadCmd
+				}
+			}
+			// Start reconnect polling if not already active (covers both disconnect
+			// and startup-without-daemon so the TUI can auto-connect later)
+			if !m.reconnectActive {
+				m.reconnectActive = true
+				if reconnectCmd != nil {
+					reconnectCmd = tea.Batch(reconnectCmd, daemonReconnectTick())
+				} else {
+					reconnectCmd = daemonReconnectTick()
+				}
+			}
+		} else {
+			// Daemon is connected; mark it as running
+			m.daemonRunning = true
+			// If we were previously disconnected, clear the flags so the status
+			// bar updates and the reconnect ticker stops scheduling
+			if m.daemonDisconnected {
+				m.daemonDisconnected = false
+				m.reconnectActive = false
+			}
+		}
 		m.updateStatusBar()
 
 		// Only show toast for initial load, not background refreshes
@@ -825,6 +924,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			toastCmd = m.alert.NewAlertCmd("Success", fmt.Sprintf("Loaded %d containers", len(msg.containers)))
 			// Mark as ready now that initial load is complete
 			m.ready = true
+		}
+		if reconnectCmd != nil {
+			return m, tea.Batch(toastCmd, reconnectCmd)
 		}
 		return m, toastCmd
 
@@ -850,6 +952,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if client, err := NewDaemonClient(m.daemonConfigDir); err == nil && client != nil {
 				m.daemonClient = client
 				return m, m.fetchPendingQuestions()
+			}
+			// All reconnect attempts failed — mark daemon as disconnected,
+			// switch to Docker fallback, and start reconnect polling
+			var cmds []tea.Cmd
+			if m.daemonRunning {
+				m.daemonRunning = false
+				m.daemonDisconnected = true
+				m.daemonClient = nil
+				// Switch ContainerService to Docker fallback so user actions still work
+				if m.containerService != nil {
+					_ = m.containerService.Close()
+				}
+				m.containerService = containerservice.NewDocker(m.containerPrefix)
+				m.updateStatusBar()
+				// Immediately reload containers via Docker so the UI stays populated
+				cmds = append(cmds, m.loadContainers())
+			}
+			if !m.reconnectActive {
+				m.reconnectActive = true
+				cmds = append(cmds, daemonReconnectTick())
+			}
+			if len(cmds) > 0 {
+				return m, tea.Batch(cmds...)
 			}
 		}
 		return m, nil
@@ -1154,9 +1279,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Get old domains to compare
-		oldDomains := viper.GetStringSlice("firewall.allowed_domains")
-
 		// Update config with new domains
 		viper.Set("firewall.allowed_domains", newDomains)
 
@@ -1168,36 +1290,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// If "apply to running" is checked, add new domains to all running containers
-		if msg.applyToRunning {
-			// Find domains that are new (not in old list)
-			addedDomains := []string{}
-			for _, newDomain := range newDomains {
-				found := false
-				for _, oldDomain := range oldDomains {
-					if newDomain == oldDomain {
-						found = true
-						break
+		// If "apply to running" is checked, sync all domains to running containers.
+		// We apply the full list (not just the diff vs old config) because the user
+		// may have saved domains previously without applying, then reopened the modal
+		// to apply. AddDomainToContainer is idempotent (skips already-configured domains).
+		if msg.applyToRunning && len(newDomains) > 0 {
+			prefix := m.containerPrefix
+			domainsToApply := make([]string, len(newDomains))
+			copy(domainsToApply, newDomains)
+			go func() {
+				for _, domain := range domainsToApply {
+					if err := container.AddDomainToAllContainers(domain, prefix); err != nil {
+						fmt.Fprintf(os.Stderr, "TUI: failed to apply domain %s: %v\n", domain, err)
 					}
 				}
-				if !found {
-					addedDomains = append(addedDomains, newDomain)
-				}
-			}
-
-			// Apply new domains to running containers
-			if len(addedDomains) > 0 {
-				go func() {
-					for _, domain := range addedDomains {
-						// Call add-domain command for each new domain
-						// This will apply to all running containers
-						container.AddDomainToAllContainers(domain, m.containerPrefix)
-					}
-				}()
-				toastMsg := fmt.Sprintf("Firewall saved. Adding %d new domain(s) to running containers...", len(addedDomains))
-				toastCmd := m.alert.NewAlertCmd("Info", toastMsg)
-				return m, toastCmd
-			}
+			}()
+			toastMsg := fmt.Sprintf("Firewall saved. Applying %d domain(s) to running containers...", len(domainsToApply))
+			toastCmd := m.alert.NewAlertCmd("Info", toastMsg)
+			return m, toastCmd
 		}
 
 		toastCmd := m.alert.NewAlertCmd("Success", "Firewall configuration saved")
@@ -1860,7 +1970,7 @@ func createContainerCreateModal() *Modal {
 		textarea:     &ta,
 		textinputs:   []textinput.Model{ti, modelInput},
 		checkboxes:   []bool{defaultReturnToTUI, false, false}, // [0]=no-connect, [1]=exact, [2]=web
-		focusedField: 0,                                 // Start with textarea focused
+		focusedField: 0,                                        // Start with textarea focused
 		fieldLabels: []string{
 			"Task Description:",
 			"Branch Name:",
@@ -2063,7 +2173,7 @@ func createFirewallModal() *Modal {
 		Height:       30,
 		textarea:     &ta,
 		textinputs:   []textinput.Model{},
-		checkboxes:   []bool{false}, // Apply to running containers
+		checkboxes:   []bool{true}, // Apply to running containers (default: on)
 		focusedField: 0,
 		fieldLabels: []string{
 			"Allowed Domains (one per line):",
@@ -2249,7 +2359,7 @@ func (m Model) performDockerOperation(action container.OperationType, containerN
 		case container.OperationRestart:
 			err = container.RestartContainer(containerName)
 		case container.OperationDelete:
-			_, err = m.containerService.CleanupContainers(ctx, []string{containerName}, "")
+			_, err = m.containerService.CleanupContainers(ctx, []string{containerName}, "", nil)
 		case container.OperationRefreshTokens:
 			err = container.RefreshTokens(containerName)
 		default:
@@ -2770,7 +2880,14 @@ func (m *Model) updateStatusBar() {
 	// Column 3: Operation status / question badge (PurpleHaze background)
 	// Shows warning in red if Docker is unresponsive
 	var col3 string
-	if len(m.pendingQuestions) > 0 {
+	if m.daemonDisconnected {
+		// Daemon disconnected - show amber warning with retrying indicator
+		col3 = lipgloss.NewStyle().
+			Foreground(style.DeepSpace).
+			Background(style.SunsetGlow).
+			Bold(true).
+			Render(" Daemon disconnected, retrying... ")
+	} else if len(m.pendingQuestions) > 0 {
 		// Show question badge
 		qText := fmt.Sprintf("Q %d question", len(m.pendingQuestions))
 		if len(m.pendingQuestions) != 1 {

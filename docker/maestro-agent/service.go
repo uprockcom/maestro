@@ -118,8 +118,8 @@ func runService(cmd *cobra.Command, args []string) error {
 			select {
 			case <-heartbeatTimer.C:
 				currentState := ReadState()
-				if currentState == StateWaiting ||
-					(currentState == StateIdle && !manifest.Heartbeat.SuppressWhileActive) {
+				if currentState == StateWaiting || currentState == StateIdle ||
+					(currentState == StateActive && !manifest.Heartbeat.SuppressWhileActive) {
 					deliverHeartbeat(manifest)
 				}
 				heartbeatTimer.Reset(time.Duration(manifest.Heartbeat.Interval) * time.Second)

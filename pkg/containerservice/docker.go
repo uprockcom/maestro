@@ -27,7 +27,7 @@ func (s *dockerService) StopContainer(ctx context.Context, name string, stateHas
 	return container.StopContainer(name)
 }
 
-func (s *dockerService) CleanupContainers(ctx context.Context, names []string, stateHash string) (*CleanupResult, error) {
+func (s *dockerService) CleanupContainers(ctx context.Context, names []string, stateHash string, opts *CleanupOptions) (*CleanupResult, error) {
 	result := &CleanupResult{}
 
 	for _, name := range names {
@@ -56,5 +56,5 @@ func (s *dockerService) RefreshCache(ctx context.Context) error {
 }
 
 func (s *dockerService) IsDaemonConnected() bool { return false }
-func (s *dockerService) StateHash() string        { return "" }
-func (s *dockerService) Close() error              { return nil }
+func (s *dockerService) StateHash() string       { return "" }
+func (s *dockerService) Close() error            { return nil }

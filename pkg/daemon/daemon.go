@@ -34,19 +34,23 @@ import (
 	"github.com/uprockcom/maestro/pkg/api"
 	"github.com/uprockcom/maestro/pkg/container"
 	"github.com/uprockcom/maestro/pkg/notify"
+	"github.com/uprockcom/maestro/pkg/paths"
+	"github.com/uprockcom/maestro/pkg/update"
 )
 
 // Config holds daemon configuration
 type Config struct {
-	CheckInterval      time.Duration
-	TokenThreshold     time.Duration
-	NotificationsOn    bool
-	AttentionThreshold time.Duration
-	NotifyOn           []string
-	QuietHoursStart    string
-	QuietHoursEnd      string
-	ContainerPrefix    string
-	CreateContainer    func(opts CreateContainerOpts) (string, error) // Callback for IPC child creation
+	CheckInterval       time.Duration
+	TokenThreshold      time.Duration
+	NotificationsOn     bool
+	AttentionThreshold  time.Duration
+	NotifyOn            []string
+	QuietHoursStart     string
+	QuietHoursEnd       string
+	ContainerPrefix     string
+	CreateContainer     func(opts CreateContainerOpts) (string, error) // Callback for IPC child creation
+	UpdateCheckEnabled  bool                                           // Whether to check for updates periodically
+	UpdateCheckInterval time.Duration                                  // How often to check (default: 6h)
 }
 
 // CreateContainerOpts holds parameters for creating a child container via the daemon callback.
@@ -90,6 +94,8 @@ type Daemon struct {
 	pendingApprovalsMu  sync.Mutex
 	lastTokenSync       time.Time
 	containerCache      *ContainerCache // lazy cache for API v1 endpoints
+	alarms              *AlarmStore
+	updateChecker       *update.Checker
 }
 
 // ContainerState tracks container monitoring state
@@ -112,6 +118,7 @@ type ContainerState struct {
 	TokenExpiryNotified    bool   // Whether we've sent a token_expiring notification for current expiry
 	LastTokenExpiry        int64  // ExpiresAt millis — detect token refresh
 	WasClaudeRunning       bool   // Whether Claude was running in the last check cycle
+	AlarmsLoaded           bool   // Whether we've loaded alarms from this container
 }
 
 // New creates a new daemon instance
@@ -147,6 +154,7 @@ func New(config Config, configDir string, iconData []byte) (*Daemon, error) {
 		containerOps:     &dockerContainerOps{},
 		pendingApprovals: make(map[string]*pendingApproval),
 		containerCache:   NewContainerCache(prefix),
+		alarms:           NewAlarmStore(),
 	}
 
 	// Check for terminal-notifier on macOS
@@ -160,7 +168,7 @@ func New(config Config, configDir string, iconData []byte) (*Daemon, error) {
 	// Cache icon to temp location for platforms that support it
 	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
 		if len(iconData) > 0 {
-			iconPath := filepath.Join(configDir,"notification-icon.png")
+			iconPath := filepath.Join(configDir, "notification-icon.png")
 			if err := os.WriteFile(iconPath, iconData, 0644); err == nil {
 				// Ensure path is absolute
 				if absPath, err := filepath.Abs(iconPath); err == nil {
@@ -309,6 +317,13 @@ func (d *Daemon) Start() error {
 	}
 	d.logInfo("IPC info written to %s (port %d, bridge_port %d)", ipcFilePath, ipcInfo.Port, ipcInfo.BridgePort)
 
+	// Start update checker if enabled
+	if d.config.UpdateCheckEnabled {
+		d.updateChecker = update.NewChecker(paths.GetConfigDir(), d.config.UpdateCheckInterval, d.logInfo)
+		d.StartBackgroundTask(d.updateChecker.Run)
+		d.logInfo("Update checker started (interval: %s)", d.config.UpdateCheckInterval)
+	}
+
 	// Handle OS signals for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -357,6 +372,20 @@ func (d *Daemon) check() {
 	for _, container := range containers {
 		state := d.getOrCreateContainerState(container)
 
+		// Load alarms from container on first discovery (daemon restart recovery).
+		// The read-then-write on AlarmsLoaded is safe from TOCTOU because check()
+		// runs in a single-threaded daemon loop — no concurrent goroutine can race
+		// on the same ContainerState here.
+		state.mu.Lock()
+		alarmsLoaded := state.AlarmsLoaded
+		state.mu.Unlock()
+		if !alarmsLoaded {
+			d.loadAlarmsFromContainer(container)
+			state.mu.Lock()
+			state.AlarmsLoaded = true
+			state.mu.Unlock()
+		}
+
 		// Check dormant state (Claude process exited)
 		claudeRunning := d.isClaudeRunning(container)
 		state.mu.Lock()
@@ -399,6 +428,9 @@ func (d *Daemon) check() {
 			d.ipcServer.checkPendingRequests(container, state)
 		}
 	}
+
+	// Fire any due alarms
+	d.fireAlarms()
 
 	// Notify parents of stopped child containers
 	if d.ipcServer != nil {
@@ -969,6 +1001,10 @@ func (d *Daemon) cleanupStates(activeContainers []string) {
 	for name := range d.containerStates {
 		if !active[name] {
 			delete(d.containerStates, name)
+			// Clean up alarms for removed containers
+			if d.alarms != nil {
+				d.alarms.CleanupContainer(name)
+			}
 		}
 	}
 }
@@ -1036,6 +1072,14 @@ func (d *Daemon) StartBackgroundTask(fn func(stopChan <-chan bool)) {
 		defer d.wg.Done()
 		fn(d.stopChan)
 	}()
+}
+
+// UpdateStatus returns the latest update check result, or nil if not available.
+func (d *Daemon) UpdateStatus() *update.Result {
+	if d.updateChecker == nil {
+		return nil
+	}
+	return d.updateChecker.Latest()
 }
 
 // RegisterApproval stores a pending approval keyed by event ID

@@ -20,10 +20,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -184,9 +186,15 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
 
-	// Poll for daemon to be ready (up to 3 seconds)
-	for i := 0; i < 30; i++ {
-		time.Sleep(100 * time.Millisecond)
+	// Poll for daemon to be ready.
+	// Fast phase (3s): covers simple startups without signal containers.
+	// Slow phase (42s): covers signal container creation + health check (~30s).
+	for i := 0; i < 72; i++ {
+		if i < 30 {
+			time.Sleep(100 * time.Millisecond) // 30 × 100ms = 3s
+		} else {
+			time.Sleep(1 * time.Second) // 42 × 1s = 42s
+		}
 		if running, info := isDaemonRunning(); running {
 			fmt.Printf("✅ Daemon started successfully (PID %d, port %d)\n", info.PID, info.Port)
 			if config.Daemon.Notifications.Enabled {
@@ -277,6 +285,19 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Status: Running (PID %d, port %d)\n", info.PID, info.Port)
 		}
 
+		// Show update status
+		if status.Update != nil {
+			if status.Update.Available {
+				fmt.Printf("\n⚠️  Update available: %s → %s\n", status.Update.CurrentVersion, status.Update.LatestVersion)
+				fmt.Println("   Run: brew upgrade maestro  (or download from GitHub)")
+				if status.Update.ReleaseURL != "" {
+					fmt.Printf("   %s\n", status.Update.ReleaseURL)
+				}
+			} else {
+				fmt.Printf("\nVersion %s is up to date\n", status.Update.CurrentVersion)
+			}
+		}
+
 		// Show config
 		fmt.Printf("\nConfiguration:\n")
 		fmt.Printf("  Check interval: %s\n", config.Daemon.CheckInterval)
@@ -285,6 +306,7 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 		if config.Daemon.Notifications.Enabled {
 			fmt.Printf("  Attention threshold: %s\n", config.Daemon.Notifications.AttentionThreshold)
 		}
+		fmt.Printf("  Update check: %v\n", config.Daemon.UpdateCheck)
 	} else {
 		fmt.Println("Status: Not running")
 	}
@@ -349,15 +371,17 @@ func runDaemonBackground(cmd *cobra.Command, args []string) error {
 
 	// Parse config
 	daemonConfig := daemon.Config{
-		CheckInterval:      parseDuration(config.Daemon.CheckInterval, 30*time.Minute),
-		TokenThreshold:     parseDuration(config.Daemon.TokenRefresh.Threshold, 30*time.Minute),
-		NotificationsOn:    config.Daemon.Notifications.Enabled,
-		AttentionThreshold: parseDuration(config.Daemon.Notifications.AttentionThreshold, 5*time.Minute),
-		NotifyOn:           config.Daemon.Notifications.NotifyOn,
-		QuietHoursStart:    config.Daemon.Notifications.QuietHours.Start,
-		QuietHoursEnd:      config.Daemon.Notifications.QuietHours.End,
-		ContainerPrefix:    config.Containers.Prefix,
-		CreateContainer:    createContainerFromDaemonOpts,
+		CheckInterval:       parseDuration(config.Daemon.CheckInterval, 30*time.Minute),
+		TokenThreshold:      parseDuration(config.Daemon.TokenRefresh.Threshold, 30*time.Minute),
+		NotificationsOn:     config.Daemon.Notifications.Enabled,
+		AttentionThreshold:  parseDuration(config.Daemon.Notifications.AttentionThreshold, 5*time.Minute),
+		NotifyOn:            config.Daemon.Notifications.NotifyOn,
+		QuietHoursStart:     config.Daemon.Notifications.QuietHours.Start,
+		QuietHoursEnd:       config.Daemon.Notifications.QuietHours.End,
+		ContainerPrefix:     config.Containers.Prefix,
+		CreateContainer:     createContainerFromDaemonOpts,
+		UpdateCheckEnabled:  config.Daemon.UpdateCheck,
+		UpdateCheckInterval: parseDuration(config.Daemon.UpdateCheckInterval, 6*time.Hour),
 	}
 
 	// Create and start daemon with embedded icon
@@ -381,6 +405,27 @@ func runDaemonBackground(cmd *cobra.Command, args []string) error {
 	}
 
 	if config.Daemon.Notifications.Providers.Signal.Enabled {
+		// Ensure signal-cli and signal-relay containers are running before the
+		// provider tries to connect. EnsureRunning is idempotent — it does nothing
+		// if both containers are already up.
+		sigCfg := config.Daemon.Notifications.Providers.Signal
+		switch {
+		case sigCfg.URL == "":
+			d.LogInfo("Signal: relay URL not configured — run 'maestro signal reset-key' to fix")
+		case sigCfg.APIKey == "":
+			d.LogInfo("Signal: api_key not configured — run 'maestro signal reset-key' to fix")
+		default:
+			relayPort := 8080
+			if u, err := url.Parse(sigCfg.URL); err == nil {
+				if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+					relayPort = p
+				}
+			}
+			if err := signal.EnsureRunning(relayPort, sigCfg.Number, d.LogInfo); err != nil {
+				d.LogInfo("Warning: could not ensure signal containers running: %v", err)
+			}
+		}
+
 		signalProvider := signal.New(signal.Config{
 			Number:    config.Daemon.Notifications.Providers.Signal.Number,
 			Recipient: config.Daemon.Notifications.Providers.Signal.Recipient,

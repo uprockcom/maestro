@@ -149,7 +149,7 @@ func TestDaemonService_CleanupContainers(t *testing.T) {
 	svc, ts := newTestDaemonService(t, mux)
 	defer ts.Close()
 
-	result, err := svc.CleanupContainers(context.Background(), []string{"a", "b"}, "hash")
+	result, err := svc.CleanupContainers(context.Background(), []string{"a", "b"}, "hash", nil)
 	if err != nil {
 		t.Fatalf("CleanupContainers failed: %v", err)
 	}

@@ -18,7 +18,14 @@ You can communicate with the host system using `maestro-request`. All commands a
 ```bash
 maestro-request new "task description"
 maestro-request new "task description" --branch main   # start from a specific branch
+maestro-request new "task description" --model haiku   # use a specific model
+maestro-request new "task description" -w              # enable browser support
 ```
+
+**Flags:**
+- `--branch <name>` — start the child from a specific git branch instead of the current one
+- `--model <name>` — Claude model to use: `opus`, `sonnet`, or `haiku`
+- `--web` / `-w` — enable browser support (Playwright + headless Chromium via MCP)
 
 Creates a new container with its own Claude agent to work on a separate task in parallel. Your prompt is passed directly to the child agent. Use this for:
 - Delegating subtasks (e.g., "write tests for the auth module")
@@ -50,6 +57,40 @@ maestro-request status
 ```
 
 Returns daemon connectivity info. Useful to verify the IPC channel is working.
+
+### Set a timed alarm
+
+```bash
+maestro-request alarm set "+2h" "check-build" -m "Check if the build finished"
+maestro-request alarm set "2026-02-26T09:00:00Z" "morning-review"
+maestro-request alarm set "+30m" "follow-up" -m "Re-check test results"
+```
+
+Sets an alarm that fires at the specified time, delivering a trigger message to your pending-messages queue. If you are idle, this wakes you up automatically.
+
+**Time formats:**
+- Relative: `+30m`, `+2h`, `+1h30m`, `+1d` (from now)
+- RFC3339: `2026-02-25T15:30:00Z`
+- Date+time: `2026-02-25 15:30` (interpreted as UTC)
+
+Use alarms when you need to wait for something time-based — checking back on builds, revisiting tasks after a delay, or scheduling work for a specific time. The alarm survives daemon restarts.
+
+### List pending alarms
+
+```bash
+maestro-request alarm list
+```
+
+Shows all pending (unfired) alarms for this container.
+
+### Cancel an alarm
+
+```bash
+maestro-request alarm cancel <alarm-id>
+maestro-request alarm cancel --name "check-build"
+```
+
+Cancels a pending alarm by ID or name.
 
 ## Wait Commands
 
@@ -226,6 +267,10 @@ Status lifecycle:
 - **Never go silent.** If you are working for an extended period without task updates, your parent may assume you are stuck and intervene. Keep your task list current.
 
 A parent agent watching your container sees your task list as the primary signal of your progress. Think of it as your public status board.
+
+## Hooks
+
+Maestro pre-configures system hooks that manage your lifecycle (message delivery, idle detection, etc.). If you need to set up your own hooks — for example, to react to context compaction or log tool usage — see `/home/node/.maestro/docs/hooks-guide.md` for how to configure project-level hooks in `.claude/settings.json`.
 
 ## Guidelines
 

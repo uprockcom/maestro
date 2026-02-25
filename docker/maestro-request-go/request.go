@@ -33,29 +33,32 @@ type Message struct {
 
 // RequestFile mirrors the daemon's IPCRequestFile structure.
 type RequestFile struct {
-	ID              string           `json:"id"`
-	Action          string           `json:"action"`
-	Task            string           `json:"task,omitempty"`
-	Title           string           `json:"title,omitempty"`
-	Message         string           `json:"message,omitempty"`
-	Parent          string           `json:"parent"`
-	Branch          string           `json:"branch,omitempty"`
-	Model           string           `json:"model,omitempty"`
-	Web             bool             `json:"web,omitempty"`
-	Status          string           `json:"status"`
-	RequestedAt     string           `json:"requested_at"`
-	ChildContainer  *string          `json:"child_container"`
-	ChildExitedAt   *string          `json:"child_exited_at,omitempty"`
-	FulfilledAt     *string          `json:"fulfilled_at"`
-	Error           *string          `json:"error"`
-	TargetRequestID string           `json:"target_request_id,omitempty"`
-	Messages        []Message        `json:"messages,omitempty"`
-	PendingQuestion json.RawMessage  `json:"pending_question,omitempty"`
-	Count           int              `json:"count,omitempty"`
-	Timeout         int              `json:"timeout,omitempty"`
-	Selections      []string         `json:"selections,omitempty"`
-	RequestType     string           `json:"request_type,omitempty"`
-	RequestValue    string           `json:"request_value,omitempty"`
+	ID              string          `json:"id"`
+	Action          string          `json:"action"`
+	Task            string          `json:"task,omitempty"`
+	Title           string          `json:"title,omitempty"`
+	Message         string          `json:"message,omitempty"`
+	Parent          string          `json:"parent"`
+	Branch          string          `json:"branch,omitempty"`
+	Model           string          `json:"model,omitempty"`
+	Web             bool            `json:"web,omitempty"`
+	Status          string          `json:"status"`
+	RequestedAt     string          `json:"requested_at"`
+	ChildContainer  *string         `json:"child_container"`
+	ChildExitedAt   *string         `json:"child_exited_at,omitempty"`
+	FulfilledAt     *string         `json:"fulfilled_at"`
+	Error           *string         `json:"error"`
+	TargetRequestID string          `json:"target_request_id,omitempty"`
+	Messages        []Message       `json:"messages,omitempty"`
+	PendingQuestion json.RawMessage `json:"pending_question,omitempty"`
+	Count           int             `json:"count,omitempty"`
+	Timeout         int             `json:"timeout,omitempty"`
+	Selections      []string        `json:"selections,omitempty"`
+	RequestType     string          `json:"request_type,omitempty"`
+	RequestValue    string          `json:"request_value,omitempty"`
+	AlarmTime       string          `json:"alarm_time,omitempty"`
+	AlarmName       string          `json:"alarm_name,omitempty"`
+	AlarmMessage    string          `json:"alarm_message,omitempty"`
 }
 
 // requestFilePath returns the path to a request file by ID.

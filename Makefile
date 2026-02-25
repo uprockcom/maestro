@@ -142,7 +142,7 @@ docker-relay:
 	docker build -t maestro-signal-relay:latest -f deploy/signal-relay/Dockerfile .
 
 # Build everything
-all: build docker docker-web
+all: build docker docker-web docker-relay
 
 # Release targets
 release-preflight:

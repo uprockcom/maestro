@@ -15,11 +15,11 @@ type mockScopedProvider struct {
 	sent      []Event
 }
 
-func (m *mockScopedProvider) Name() string                 { return m.name }
-func (m *mockScopedProvider) Available() bool               { return m.available }
-func (m *mockScopedProvider) Close() error                  { return nil }
-func (m *mockScopedProvider) IsDefault() bool               { return m.isDefault }
-func (m *mockScopedProvider) MatchesEvent(e Event) bool     { return m.matchFn(e) }
+func (m *mockScopedProvider) Name() string              { return m.name }
+func (m *mockScopedProvider) Available() bool           { return m.available }
+func (m *mockScopedProvider) Close() error              { return nil }
+func (m *mockScopedProvider) IsDefault() bool           { return m.isDefault }
+func (m *mockScopedProvider) MatchesEvent(e Event) bool { return m.matchFn(e) }
 
 func (m *mockScopedProvider) Send(_ context.Context, e Event) error {
 	m.sent = append(m.sent, e)
@@ -37,9 +37,9 @@ type mockPlainProvider struct {
 	sent      []Event
 }
 
-func (m *mockPlainProvider) Name() string                 { return m.name }
-func (m *mockPlainProvider) Available() bool               { return m.available }
-func (m *mockPlainProvider) Close() error                  { return nil }
+func (m *mockPlainProvider) Name() string    { return m.name }
+func (m *mockPlainProvider) Available() bool { return m.available }
+func (m *mockPlainProvider) Close() error    { return nil }
 
 func (m *mockPlainProvider) Send(_ context.Context, e Event) error {
 	m.sent = append(m.sent, e)

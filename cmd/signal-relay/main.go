@@ -60,6 +60,9 @@ func main() {
 
 	// Create server
 	srv := NewServer(signalAPI, botNumber, router, keyStore)
+
+	// Start polling signal-cli for incoming messages
+	go srv.StartPolling(ctx)
 	handler := srv.Handler()
 
 	// Handle graceful shutdown
